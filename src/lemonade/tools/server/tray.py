@@ -16,6 +16,14 @@ from lemonade_server.pydantic_models import DEFAULT_CTX_SIZE
 from lemonade.version import __version__
 from lemonade.tools.server.utils.system_tray import SystemTray, Menu, MenuItem
 
+# adding environemnt variable support
+from dotenv import load_dotenv
+import os
+
+load_dotenv()  # Loads variables from .env into os.environ
+
+LEMONADE_ENV = os.getenv("LEMONADE_ENV", "Production")
+
 
 class OutputDuplicator:
     """
@@ -565,7 +573,8 @@ class LemonadeTray(SystemTray):
         items.append(MenuItem("Model Manager", self.open_model_manager))
         items.append(MenuItem("Logs", None, submenu=logs_submenu))
         items.append(Menu.SEPARATOR)
-        items.append(MenuItem("Restart Lemonade", self.restart_server))
+        if LEMONADE_ENV == "Developer":
+            items.append(MenuItem("Restart Lemonade", self.restart_server))
         items.append(MenuItem("Quit Lemonade", self.exit_app))
         return Menu(*items)
 
