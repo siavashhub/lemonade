@@ -10,6 +10,7 @@
     window.SERVER_PORT = {{SERVER_PORT}};
     </script>
     {{SERVER_MODELS_JS}}
+    {{PLATFORM_JS}}
 </head>
 <body>
     <nav class="navbar" id="navbar">
@@ -191,44 +192,49 @@
                                             <input type="text" id="register-model-name" name="model_name" placeholder="Gemma-3-12b-it-GGUF" required autocomplete="off">
                                         </div>
                                     </div>
-                                    <div class="register-form-row">
-                                        <label class="register-label">
-                                            Checkpoint
-                                            <span class="tooltip-icon" data-tooltip="Specify the model checkpoint path from Hugging Face (e.g., org-name/model-name:variant).">ⓘ</span>
-                                        </label>
-                                        <input type="text" id="register-checkpoint" name="checkpoint" placeholder="unsloth/gemma-3-12b-it-GGUF:Q4_0" class="register-textbox" autocomplete="off">
-                                    </div>
-                                    <div class="register-form-row">
-                                        <label class="register-label">
-                                            Recipe
-                                            <span class="tooltip-icon" data-tooltip="Select the Lemonade recipe corresponding to the inference engine and device Lemonade Server should use for the model. Use llamacpp for GGUF models. For OGA/ONNX models, click the More Info button to learn about the oga-* recipes.">ⓘ</span>
-                                        </label>
-                                        <select id="register-recipe" name="recipe" required>
-                                            <option value="llamacpp">llamacpp</option>
-                                            <option value="oga-npu">oga-npu</option>
-                                            <option value="oga-hybrid">oga-hybrid</option>
-                                            <option value="oga-cpu">oga-cpu</option>
-                                        </select>
-                                        <a href="https://lemonade-server.ai/docs/lemonade_api/" target="_blank" class="register-doc-link">More info</a>
-                                    </div>
-                                    <div class="register-form-row register-form-row-tight">
-                                        <label class="register-label">
-                                            mmproj file
-                                            <span class="tooltip-icon" data-tooltip="Specify an mmproj file from the same Hugging Face checkpoint as the model. This is used for multimodal models, such as VLMs. Leave empty if not needed.">ⓘ</span>
-                                        </label>
-                                        <input type="text" id="register-mmproj" name="mmproj" placeholder="(Optional) mmproj-F16.gguf" autocomplete="off">
-                                        <label class="register-label reasoning-inline">
-                                            <input type="checkbox" id="register-reasoning" name="reasoning">
-                                            Reasoning
-                                            <span class="tooltip-icon" data-tooltip="Enable to inform Lemonade Server that the model has reasoning capabilities that will use thinking tokens.">ⓘ</span>
-                                        </label>
-                                    </div>
-                                    <div class="register-form-row register-form-row-tight">
-                                        <button type="submit" id="register-submit">Install</button>
-                                        <span id="register-model-status" class="register-status"></span>
-                                    </div>
-                                </form>
-                            </div>
+                                </div>
+                                <div class="register-form-row">
+                                    <label class="register-label">
+                                        Checkpoint
+                                        <span class="tooltip-icon" data-tooltip="Specify the model checkpoint path from Hugging Face (e.g., org-name/model-name:variant).">ⓘ</span>
+                                    </label>
+                                    <input type="text" id="register-checkpoint" name="checkpoint" placeholder="unsloth/gemma-3-12b-it-GGUF:Q4_0" class="register-textbox" autocomplete="off">
+                                </div>
+                                <div class="register-form-row">
+                                    <label class="register-label">
+                                        Recipe
+                                        <span class="tooltip-icon" data-tooltip="Select the Lemonade recipe corresponding to the inference engine and device Lemonade Server should use for the model. Use llamacpp for GGUF models. For OGA/ONNX models, click the More Info button to learn about the oga-* recipes.">ⓘ</span>
+                                    </label>
+                                    <select id="register-recipe" name="recipe" required>
+                                        <option value="llamacpp">llamacpp</option>
+                                        <option value="oga-npu">oga-npu</option>
+                                        <option value="oga-hybrid">oga-hybrid</option>
+                                        <option value="oga-cpu">oga-cpu</option>
+                                    </select>
+                                    <a href="https://lemonade-server.ai/docs/lemonade_api/" target="_blank" class="register-doc-link">More info</a>
+                                </div>
+                                <div class="register-form-row register-form-row-tight">
+                                    <label class="register-label">
+                                        mmproj file
+                                        <span class="tooltip-icon" data-tooltip="Specify an mmproj file from the same Hugging Face checkpoint as the model. This is used for multimodal models, such as VLMs. Leave empty if not needed.">ⓘ</span>
+                                    </label>
+                                    <input type="text" id="register-mmproj" name="mmproj" placeholder="(Optional) mmproj-F16.gguf" autocomplete="off">
+                                    <label class="register-label reasoning-inline">
+                                        <input type="checkbox" id="register-reasoning" name="reasoning">
+                                        Reasoning
+                                        <span class="tooltip-icon" data-tooltip="Enable to inform Lemonade Server that the model has reasoning capabilities that will use thinking tokens.">ⓘ</span>
+                                    </label>
+                                    <label class="register-label reasoning-inline">
+                                        <input type="checkbox" id="register-vision" name="vision">
+                                        Vision
+                                        <span class="tooltip-icon" data-tooltip="Enable to inform Lemonade Server that the model has vision capabilities for processing images.">ⓘ</span>
+                                    </label>
+                                </div>
+                                <div class="register-form-row register-form-row-tight">
+                                    <button type="submit" id="register-submit">Install</button>
+                                    <span id="register-model-status" class="register-status"></span>
+                                </div>
+                            </form>
                         </div>
                     </div>
                 </div> 
