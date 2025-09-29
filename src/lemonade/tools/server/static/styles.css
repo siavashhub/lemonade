@@ -431,7 +431,7 @@ button:disabled {
      Constrain the resize with min/max heights so it stays usable and doesn't overflow the viewport. */
   resize: vertical;
   height: var(--chat-height);
-  min-height: 120px;
+  min-height: 240px;
   max-height: calc(100vh - 120px);
   overflow: hidden; /* hide overflow at container level; chat-history will scroll */
 }
