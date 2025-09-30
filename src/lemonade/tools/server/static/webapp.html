@@ -15,8 +15,19 @@
 <body>
     <nav class="navbar" id="navbar">
         <div class="navbar-brand">
-            <span class="brand-title"><a href="https://lemonade-server.ai">🍋 Lemonade Server</a></span>
-        </div>
+            <span class="brand-title">
+                <a href="https://lemonade-server.ai">🍋 Lemonade Server</a>
+            </span>
+            <!-- Dropdown -->
+            <div class="dropdown" style="display:inline-block; margin-left: 10px;">
+                <button class="dropbtn" aria-label="Logs" style="font-size:16px; background:none; border:none; cursor:pointer;">
+                    🍃
+                </button>
+                <div class="dropdown-content">
+                    <a href="/static/logs.html" target="_blank">View Logs</a>
+                </div>
+            </div>
+        </div>  
         <div class="navbar-links">
             <a href="https://github.com/lemonade-sdk/lemonade" target="_blank">GitHub</a>
             <a href="https://lemonade-server.ai/docs/" target="_blank">Docs</a>

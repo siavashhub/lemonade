@@ -10,6 +10,7 @@ import traceback
 from typing import Optional, Union
 import json
 from pathlib import Path
+import os
 
 from fastapi import FastAPI, HTTPException, status, Request
 from fastapi.responses import StreamingResponse
@@ -44,6 +45,7 @@ from openai.types.responses import (
     ResponseTextDeltaEvent,
     ResponseCompletedEvent,
 )
+from fastapi import WebSocket
 
 import lemonade.api as lemonade_api
 from lemonade.tools.server.wrapped_server import WrappedServer
@@ -78,6 +80,24 @@ DEFAULT_MAX_NEW_TOKENS = 1500
 if platform.system() in ["Windows", "Darwin"]:
     # pylint: disable=ungrouped-imports
     from lemonade.tools.server.tray import LemonadeTray, OutputDuplicator
+
+
+async def log_streamer(websocket: WebSocket, path: str, interval: float = 1.0):
+    await websocket.accept()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            # Jump to end of file
+            f.seek(0, os.SEEK_END)
+            while True:
+                line = f.readline()
+                if line:
+                    await websocket.send_text(line)
+                else:
+                    await asyncio.sleep(interval)
+    except Exception as e:
+        await websocket.send_text(f"[ERROR] {str(e)}")
+    finally:
+        await websocket.close()
 
 
 class ServerModel(Model):
@@ -270,6 +290,7 @@ class Server:
             self.app.post(f"{prefix}/completions")(self.completions)
             self.app.post(f"{prefix}/responses")(self.responses)
             self.app.post(f"{prefix}/log-level")(self.set_log_level)
+            self.app.websocket(f"{prefix}/logs/ws")(self.logs_ws)
 
             # OpenAI-compatible routes
             self.app.post(f"{prefix}/chat/completions")(self.chat_completions)
@@ -1708,6 +1729,12 @@ class Server:
                 if self.debug_logging_enabled:
                     logging.debug(f"Total request time: {request_time:.4f} seconds")
             return response
+
+    async def logs_ws(self, websocket: WebSocket):
+        if not self.log_file or not os.path.exists(self.log_file):
+            await websocket.close(code=4000)
+            return
+        await log_streamer(websocket, self.log_file)
 
 
 # This file was originally licensed under Apache 2.0. It has been modified.
