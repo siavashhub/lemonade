@@ -82,6 +82,12 @@ if platform.system() in ["Windows", "Darwin"]:
     from lemonade.tools.server.tray import LemonadeTray, OutputDuplicator
 
 
+class WebsocketTextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Only allow logs that don't include "> TEXT"
+        return "> TEXT" not in record.getMessage()
+
+
 async def log_streamer(websocket: WebSocket, path: str, interval: float = 1.0):
     logger = logging.getLogger()
     await websocket.accept()
@@ -93,10 +99,6 @@ async def log_streamer(websocket: WebSocket, path: str, interval: float = 1.0):
                 line = f.readline()
                 if not line:
                     await asyncio.sleep(interval)
-                    continue
-
-                # Skip uvicorn frame logs
-                if "> TEXT" in line:
                     continue
 
                 # Send defensively: if disconnected, bail out
@@ -451,11 +453,13 @@ class Server:
             )
             file_handler.setLevel(logging_level)
             file_handler.setFormatter(uvicorn_formatter)
+            file_handler.addFilter(WebsocketTextFilter())
 
             # Set up console handler
             console_handler = logging.StreamHandler()
             console_handler.setLevel(logging_level)
             console_handler.setFormatter(uvicorn_formatter)
+            console_handler.addFilter(WebsocketTextFilter())
 
             # Configure root logger with both handlers
             logging.basicConfig(
