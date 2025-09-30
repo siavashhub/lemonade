@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 import os
 
-from fastapi import FastAPI, HTTPException, status, Request
+from fastapi import FastAPI, HTTPException, status, Request, WebSocket
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -45,7 +45,6 @@ from openai.types.responses import (
     ResponseTextDeltaEvent,
     ResponseCompletedEvent,
 )
-from fastapi import WebSocket
 
 import lemonade.api as lemonade_api
 from lemonade.tools.server.wrapped_server import WrappedServer
@@ -94,7 +93,7 @@ async def log_streamer(websocket: WebSocket, path: str, interval: float = 1.0):
                     await websocket.send_text(line)
                 else:
                     await asyncio.sleep(interval)
-    except Exception as e:
+    except Exception as e:  # pylint: disable=broad-except
         await websocket.send_text(f"[ERROR] {str(e)}")
     finally:
         await websocket.close()
