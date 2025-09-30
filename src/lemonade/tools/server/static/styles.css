@@ -426,12 +426,17 @@ button:disabled {
   background: #fff;
   /* Use a semi-fixed chat 'window' height so streaming content never expands the page.
      The chat-history area inside will scroll. The CSS variable allows easy tuning. */
-  --chat-height: 520px;
+  /* --chat-height: 520px; */
   /* Allow vertical resizing by the user while keeping horizontal size fixed.
      Constrain the resize with min/max heights so it stays usable and doesn't overflow the viewport. */
   resize: vertical;
   height: var(--chat-height);
-  min-height: 240px;
+  /* height: calc(100vh - 110px);  */
+  /* height: min(var(--chat-height), calc(100vh - 180px)); */
+  /* height: auto; */
+
+
+  /* min-height: 240px; */
   max-height: calc(100vh - 120px);
   overflow: hidden; /* hide overflow at container level; chat-history will scroll */
 }
