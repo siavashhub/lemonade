@@ -16,15 +16,6 @@
     <nav class="navbar" id="navbar">
         <div class="navbar-brand">
             <span class="brand-title"><a href="https://lemonade-server.ai"><img src="/static/favicon.ico" alt="🍋" class="brand-icon"> Lemonade Server</a></span>
-            <!-- Dropdown -->
-            <div class="dropdown" style="display:inline-block; margin-left: 10px;">
-                <button class="dropbtn" aria-label="Logs" style="font-size:16px; background:none; border:none; cursor:pointer;">
-                    🍃
-                </button>
-                <div class="dropdown-content">
-                    <a href="/static/logs.html" target="_blank">View Logs</a>
-                </div>
-            </div>
         </div>  
         <div class="navbar-links">
             <a href="https://github.com/lemonade-sdk/lemonade" target="_blank">GitHub</a>
@@ -53,6 +44,13 @@
 						<option value="">Pick a model</option>
 					</select>
 					<button class="model-action-btn" id="model-unload-btn" title="Unload model" style="display: flex;">⏏</button>
+                    <!-- Dropdown -->
+                    <div class="dropdown">
+                        <button class="dropbtn" aria-label="Dropdown" style="display: flex;">🛠️</button>
+                        <div class="dropdown-content">
+                            <a href="/static/logs.html" target="_blank">View Logs</a>
+                        </div>
+                    </div>
 				</div>
 			</div>
             <div class="tab-content active" id="content-chat">
