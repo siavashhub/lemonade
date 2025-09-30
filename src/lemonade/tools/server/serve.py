@@ -119,7 +119,7 @@ async def log_streamer(websocket: WebSocket, path: str, interval: float = 1.0):
     except WebSocketDisconnect:
         # Client closed the socket; do not try to send or close again
         pass
-    except Exception as e:
+    except Exception as e:  # pylint: disable=broad-except
         # Log server-side; do not attempt to send error over a possibly closed socket
         logger.exception("Error in log_streamer: %s", e)
     finally:
@@ -128,7 +128,7 @@ async def log_streamer(websocket: WebSocket, path: str, interval: float = 1.0):
         try:
             if websocket.application_state == WebSocketState.CONNECTED:
                 await websocket.close()
-        except Exception:
+        except Exception:  # pylint: disable=broad-except
             # If close itself races, swallow — we're shutting down anyway.
             pass
 
