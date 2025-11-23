@@ -29,6 +29,11 @@
         <span id="error-banner-msg"></span>
         <button class="close-btn" onclick="hideErrorBanner()">&times;</button>
     </div>
+    <div id="migration-banner" class="migration-banner" style="display:none;">
+        <span id="migration-banner-msg"></span>
+        <button class="migration-action-btn" onclick="showMigrationModal()">Clean Up Now</button>
+        <button class="close-btn" onclick="hideMigrationBanner()">&times;</button>
+    </div>
     <main class="main">
         <div class="tab-content-wrapper">
         <div class="tab-container"> 
@@ -135,6 +140,12 @@
                             <input type="number" id="setting-repeat-penalty" min="0.5" max="2" step="0.05" placeholder="default" />
                             <span class="setting-description">Penalty for repeating tokens (1 = no penalty, >1 = less repetition)</span>
                         </div>
+                       <div class="setting-field">
+                         <label for="enable-thinking">Enable Thinking:</label> 
+                         <input type="checkbox" id="enable-thinking"> 
+                         <br>
+                            <span class="setting-description">Determines whether hybrid reasoning models, such as Qwen3, will use thinking.</span> 
+                        </div>
                         <div class="setting-actions">
                             <button id="reset-settings-btn" class="reset-btn">Reset to Defaults</button>
                         </div>
@@ -207,7 +218,11 @@
                                         Checkpoint
                                         <span class="tooltip-icon" data-tooltip="Specify the model checkpoint path from Hugging Face (e.g., org-name/model-name:variant).">ⓘ</span>
                                     </label>
+                                    <div class="checkpoint-input-group">
                                     <input type="text" id="register-checkpoint" name="checkpoint" placeholder="unsloth/gemma-3-12b-it-GGUF:Q4_0" class="register-textbox" autocomplete="off">
+                                    <button type="button" id="select-folder-btn" class="folder-select-btn" title="Select local folder">📁</button>
+                                    </div>
+                                    <input type="file" id="folder-input" webkitdirectory directory style="display: none;">
                                 </div>
                                 <div class="register-form-row">
                                     <label class="register-label">
@@ -229,6 +244,8 @@
                                         <span class="tooltip-icon" data-tooltip="Specify an mmproj file from the same Hugging Face checkpoint as the model. This is used for multimodal models, such as VLMs. Leave empty if not needed.">ⓘ</span>
                                     </label>
                                     <input type="text" id="register-mmproj" name="mmproj" placeholder="(Optional) mmproj-F16.gguf" autocomplete="off">
+                                </div>
+                                <div class="register-form-row register-form-row-tight register-checkboxes-row">
                                     <label class="register-label reasoning-inline">
                                         <input type="checkbox" id="register-reasoning" name="reasoning">
                                         Reasoning
@@ -238,6 +255,16 @@
                                         <input type="checkbox" id="register-vision" name="vision">
                                         Vision
                                         <span class="tooltip-icon" data-tooltip="Enable to inform Lemonade Server that the model has vision capabilities for processing images.">ⓘ</span>
+                                    </label>
+                                    <label class="register-label reasoning-inline">
+                                        <input type="checkbox" id="register-embedding" name="embedding">
+                                        Embedding
+                                        <span class="tooltip-icon" data-tooltip="Enable to inform Lemonade Server that the model is an embedding model for use with the /api/v1/embeddings endpoint.">ⓘ</span>
+                                    </label>
+                                    <label class="register-label reasoning-inline">
+                                        <input type="checkbox" id="register-reranking" name="reranking">
+                                        Reranking
+                                        <span class="tooltip-icon" data-tooltip="Enable to inform Lemonade Server that the model is a reranking model for use with the /api/v1/reranking endpoint.">ⓘ</span>
                                     </label>
                                 </div>
                                 <div class="register-form-row register-form-row-tight">
@@ -258,10 +285,33 @@
     </footer>
     
     <!-- External libraries -->
-    <script src="https://cdn.jsdelivr.net/npm/openai@4.21.0/dist/openai.min.js"></script> 
+    <script src="https://cdn.jsdelivr.net/npm/openai@6.7.0/dist/openai.min.js"></script> 
     <script src="https://cdn.jsdelivr.net/npm/marked@9.1.0/marked.min.js"></script>
     <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     
+    <!-- Migration Cleanup Modal -->
+    <div id="migration-modal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Clean Up Incompatible Models</h2>
+                <button class="modal-close" onclick="hideMigrationModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p>The following RyzenAI models are incompatible with RyzenAI 1.6 and can be safely deleted:</p>
+                <p class="migration-instructions">
+                    After deleting, you can re-download compatible Ryzen AI 1.6 models from the <em>OGA NPU</em> and <em>OGA Hybrid</em> tabs.</p>
+                <div id="migration-model-list" class="migration-model-list"></div>
+                <div class="migration-summary">
+                    <strong>Total space to free: <span id="migration-total-size"></span></strong>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="cancel-btn" onclick="hideMigrationModal()">Cancel</button>
+                <button class="delete-btn" onclick="deleteIncompatibleModels()">Delete All</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Application JavaScript -->
     <script src="/static/js/shared.js"></script>
     <script src="/static/js/models.js"></script>

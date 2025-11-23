@@ -42,13 +42,14 @@ setup(
         "zstandard",
         "fastapi",
         "uvicorn[standard]",
-        "openai>=1.81.0,<1.97.1",
+        "openai>=2.0.0,<3.0.0",
         "transformers<=4.53.2",
         "jinja2",
         "tabulate",
         "sentencepiece",
         "huggingface-hub[hf_xet]==0.33.0",
         "python-dotenv",
+        "python-multipart",
         # macOS-specific dependencies
         "rumps>=0.4.0; sys_platform == 'darwin'",
     ],
@@ -57,11 +58,11 @@ setup(
         # applications, without including developer-focused tools
         # Primary NPU extra using unified PyPI package
         "oga-ryzenai": [
-            "onnxruntime-genai-directml-ryzenai==0.7.0.2.1",
+            "onnxruntime-genai-directml-ryzenai==0.9.2.1",
             "protobuf>=6.30.1",
         ],
         "oga-cpu": [
-            "onnxruntime-genai==0.8.2",
+            "onnxruntime-genai==0.9.2",
             "onnxruntime >=1.22.0",
         ],
         # Developer-focused tools for benchmarking, accuracy testing, and
