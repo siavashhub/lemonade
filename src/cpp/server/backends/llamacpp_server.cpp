@@ -69,29 +69,29 @@ static std::string get_llamacpp_version(const std::string& backend) {
     }
 }
 
-// Helper to load cpuFallback flag from configuration file
-static bool get_cpu_fallback_enabled() {
+// Helper to load cpuParameters flag from configuration file
+static bool get_cpu_param_enabled() {
     std::string config_path = utils::get_resource_path("resources/backend_versions.json");
 
     try {
         json config = utils::JsonUtils::load_from_file(config_path);
 
-        if (!config.contains("cpuFallback") || !config["cpuFallback"].is_boolean()) {
-            throw std::runtime_error("backend_versions.json is missing boolean 'cpuFallback' field");
+        if (!config.contains("cpuParameters") || !config["cpuParameters"].is_boolean()) {
+            throw std::runtime_error("backend_versions.json is missing boolean 'cpuParameters' field");
         }
 
-        bool enabled = config["cpuFallback"].get<bool>();
-        std::cout << "[Config] cpuFallback = " << std::boolalpha << enabled << std::endl;
+        bool enabled = config["cpuParameters"].get<bool>();
+        std::cout << "[Config] cpuParameters = " << std::boolalpha << enabled << std::endl;
         return enabled;
 
     } catch (const std::exception& e) {
         std::cerr << "\n" << std::string(70, '=') << std::endl;
-        std::cerr << "ERROR: Failed to load cpuFallback from configuration" << std::endl;
+        std::cerr << "ERROR: Failed to load cpuParameters from configuration" << std::endl;
         std::cerr << std::string(70, '=') << std::endl;
         std::cerr << "\nConfig file: " << config_path << std::endl;
         std::cerr << "Error: " << e.what() << std::endl;
         std::cerr << "\nThe backend_versions.json file must contain:" << std::endl;
-        std::cerr << "  \"cpuFallback\": true/false" << std::endl;
+        std::cerr << "  \"cpuParameters\": true/false" << std::endl;
         std::cerr << std::string(70, '=') << std::endl << std::endl;
         throw;
     }
@@ -594,10 +594,10 @@ void LlamaCppServer::load(const std::string& model_name,
     bool use_gpu = true;  // default
 
     try {
-        use_gpu = !get_cpu_fallback_enabled();
+        use_gpu = !get_cpu_param_enabled();
     } catch (...) {
         // keep default (GPU enabled)
-        std::cerr << "[Config] cpuFallback not found or invalid, defaulting to use_gpu = true" << std::endl;
+        std::cerr << "[Config] cpuParameters not found or invalid, defaulting to use_gpu = true" << std::endl;
     }
 
     std::cout << "[LlamaCpp] Using backend: " << backend_ << "\n"
