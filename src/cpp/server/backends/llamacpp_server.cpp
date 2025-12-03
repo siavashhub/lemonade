@@ -69,34 +69,6 @@ static std::string get_llamacpp_version(const std::string& backend) {
     }
 }
 
-// Helper to load cpuParameters flag from configuration file
-static bool get_cpu_param_enabled() {
-    std::string config_path = utils::get_resource_path("resources/backend_versions.json");
-
-    try {
-        json config = utils::JsonUtils::load_from_file(config_path);
-
-        if (!config.contains("cpuParameters") || !config["cpuParameters"].is_boolean()) {
-            throw std::runtime_error("backend_versions.json is missing boolean 'cpuParameters' field");
-        }
-
-        bool enabled = config["cpuParameters"].get<bool>();
-        std::cout << "[Config] cpuParameters = " << std::boolalpha << enabled << std::endl;
-        return enabled;
-
-    } catch (const std::exception& e) {
-        std::cerr << "\n" << std::string(70, '=') << std::endl;
-        std::cerr << "ERROR: Failed to load cpuParameters from configuration" << std::endl;
-        std::cerr << std::string(70, '=') << std::endl;
-        std::cerr << "\nConfig file: " << config_path << std::endl;
-        std::cerr << "Error: " << e.what() << std::endl;
-        std::cerr << "\nThe backend_versions.json file must contain:" << std::endl;
-        std::cerr << "  \"cpuParameters\": true/false" << std::endl;
-        std::cerr << std::string(70, '=') << std::endl << std::endl;
-        throw;
-    }
-}
-
 // Helper to add a flag-only argument (e.g., --jinja, --embeddings)
 static void push_arg(std::vector<std::string>& args, 
                     std::set<std::string>& reserved,
@@ -387,6 +359,18 @@ void LlamaCppServer::install(const std::string& backend) {
 #else
             throw std::runtime_error("Metal llamacpp only supported on macOS");
 #endif
+
+        } else if (backend_ == "cpu") {
+            // CPU-only builds from ggml-org/llama.cpp
+            repo = "ggml-org/llama.cpp";
+
+#ifdef _WIN32
+            filename = "llama-" + expected_version + "-bin-win-cpu-x64.zip";
+#elif defined(__linux__)
+            filename = "llama-" + expected_version + "-bin-ubuntu-x64.zip";
+#else
+            throw std::runtime_error("CPU llamacpp not supported on this platform");
+#endif
             
         } else {  // vulkan
             // Vulkan support from ggml-org/llama.cpp
@@ -501,6 +485,22 @@ void LlamaCppServer::load(const std::string& model_name,
                          bool do_not_upgrade) {
     
     std::cout << "[LlamaCpp] Loading model: " << model_name << std::endl;
+
+    
+    // Check environment variables for backend configuration
+    bool use_gpu = true;  // default
+    const char* env_backend = std::getenv("LEMONADE_LLAMACPP_BACKEND");
+
+
+    if (env_backend && std::string(env_backend) == "cpu" || backend_ == "cpu") {
+        use_gpu = false;
+        backend_ = "cpu";
+    }
+
+    // Llamacpp Backend logging
+    std::cout << "[LlamaCpp] Using backend: " << backend_ << "\n"
+            << "[LlamaCpp] Use GPU: " << (use_gpu ? "true" : "false")
+            << std::endl;    
     
     // Install llama-server if needed
     install(backend_);
@@ -589,16 +589,6 @@ void LlamaCppServer::load(const std::string& model_name,
     push_arg(args, reserved_flags, "--ctx-size", std::to_string(ctx_size));
     push_arg(args, reserved_flags, "--port", std::to_string(port_));
     push_arg(args, reserved_flags, "--jinja");
-
-    // Get cpu fall back value from config file
-    bool use_gpu = true;  // default
-
-    try {
-        use_gpu = !get_cpu_param_enabled();
-    } catch (...) {
-        // keep default (GPU enabled)
-        std::cerr << "[Config] cpuParameters not found or invalid, defaulting to use_gpu = true" << std::endl;
-    }
 
     std::cout << "[LlamaCpp] Using backend: " << backend_ << "\n"
             << "[LlamaCpp] Use GPU: " << (use_gpu ? "true" : "false") << std::endl;
