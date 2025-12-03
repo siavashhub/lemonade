@@ -205,30 +205,34 @@ static std::string identify_rocm_arch_from_name(const std::string& device_name) 
 
 // Helper to identify ROCm architecture from system
 static std::string identify_rocm_arch() {
-    auto system_info = lemon::create_system_info();
-    
-    // Check iGPU
-    auto igpu = system_info->get_amd_igpu_device();
-    if (igpu.available && !igpu.name.empty()) {
-        std::string arch = identify_rocm_arch_from_name(igpu.name);
-        if (!arch.empty()) {
-            return arch;
-        }
-    }
-    
-    // Check dGPUs
-    auto dgpus = system_info->get_amd_dgpu_devices();
-    for (const auto& gpu : dgpus) {
-        if (gpu.available && !gpu.name.empty()) {
-            std::string arch = identify_rocm_arch_from_name(gpu.name);
+    // Try to detect GPU architecture, default to gfx110X on any failure
+    try {
+        auto system_info = lemon::create_system_info();
+        
+        // Check iGPU first
+        auto igpu = system_info->get_amd_igpu_device();
+        if (igpu.available && !igpu.name.empty()) {
+            std::string arch = identify_rocm_arch_from_name(igpu.name);
             if (!arch.empty()) {
                 return arch;
             }
         }
+        
+        // Check dGPUs
+        auto dgpus = system_info->get_amd_dgpu_devices();
+        for (const auto& gpu : dgpus) {
+            if (gpu.available && !gpu.name.empty()) {
+                std::string arch = identify_rocm_arch_from_name(gpu.name);
+                if (!arch.empty()) {
+                    return arch;
+                }
+            }
+        }
+    } catch (...) {
+        // Detection failed - use default
     }
     
-    // Default to gfx110X if no specific arch detected
-    return "gfx110X";
+    return "gfx110X";  // Default architecture
 }
 
 // Helper to get the directory where llama binaries should be installed
@@ -386,15 +390,14 @@ void LlamaCppServer::install(const std::string& backend) {
         std::cout << "[LlamaCpp] Downloading from: " << url << std::endl;
         std::cout << "[LlamaCpp] Downloading to: " << zip_path << std::endl;
         
-        // Download the file with throttled progress updates (once per second)
-        bool download_success = utils::HttpClient::download_file(
+        auto result = utils::HttpClient::download_file(
             url, 
             zip_path, 
             utils::create_throttled_progress_callback()
         );
         
-        if (!download_success) {
-            throw std::runtime_error("Failed to download llama-server from: " + url);
+        if (!result.success) {
+            throw std::runtime_error("Failed to download llama-server: " + result.error_message);
         }
         
         std::cout << std::endl << "[LlamaCpp] Download complete!" << std::endl;
@@ -470,11 +473,20 @@ std::string LlamaCppServer::download_model(const std::string& checkpoint,
 void LlamaCppServer::load(const std::string& model_name,
                          const ModelInfo& model_info,
                          int ctx_size,
-                         bool do_not_upgrade) {
+                         bool do_not_upgrade,
+                         const std::string& llamacpp_backend,
+                         const std::string& llamacpp_args) {
     
     std::cout << "[LlamaCpp] Loading model: " << model_name << std::endl;
+    std::cout << "[LlamaCpp] Per-model settings: backend=" << llamacpp_backend 
+              << ", ctx_size=" << ctx_size 
+              << ", args=" << (llamacpp_args.empty() ? "(none)" : llamacpp_args) << std::endl;
     
-    // Install llama-server if needed
+    // Update backend and custom args with per-model settings
+    backend_ = llamacpp_backend;
+    custom_args_ = llamacpp_args;
+    
+    // Install llama-server if needed (use per-model backend)
     install(backend_);
     
     // Use pre-resolved GGUF path
@@ -542,9 +554,9 @@ void LlamaCppServer::load(const std::string& model_name,
     // Get executable path
     std::string executable = get_llama_server_path();
     
-    // Check for embeddings and reranking support based on labels
-    bool supports_embeddings = std::find(model_info.labels.begin(), model_info.labels.end(), "embeddings") != model_info.labels.end();
-    bool supports_reranking = std::find(model_info.labels.begin(), model_info.labels.end(), "reranking") != model_info.labels.end();
+    // Check for embeddings and reranking support based on model type
+    bool supports_embeddings = (model_info.type == ModelType::EMBEDDING);
+    bool supports_reranking = (model_info.type == ModelType::RERANKING);
     
     // For embedding models, use a larger context size to support longer individual
     // strings. Embedding requests can include multiple strings in a batch, and each
@@ -584,18 +596,7 @@ void LlamaCppServer::load(const std::string& model_name,
     // Add embeddings support if the model supports it
     if (supports_embeddings) {
         std::cout << "[LlamaCpp] Model supports embeddings, adding --embeddings flag" << std::endl;
-        // For embedding models, set batch sizes to handle multiple documents in a single request
-        // batch-size: logical batch size (total tokens across all sequences)
-        // ubatch-size: physical batch size (tokens processed in a single forward pass)
         push_arg(args, reserved_flags, "--embeddings");
-        push_arg(args, reserved_flags, "--batch-size", std::to_string(EMBEDDING_BATCH_SIZE));
-        
-        // Only set ubatch-size for nomic models (case insensitive check)
-        std::string gguf_path_lower = gguf_path;
-        std::transform(gguf_path_lower.begin(), gguf_path_lower.end(), gguf_path_lower.begin(), ::tolower);
-        if (gguf_path_lower.find("nomic") != std::string::npos) {
-            push_arg(args, reserved_flags, "--ubatch-size", std::to_string(EMBEDDING_UBATCH_SIZE));
-        }
     }
     
     // Add reranking support if the model supports it
@@ -639,6 +640,16 @@ void LlamaCppServer::load(const std::string& model_name,
         
         env_vars.push_back({"LD_LIBRARY_PATH", lib_path});
         std::cout << "[LlamaCpp] Setting LD_LIBRARY_PATH=" << lib_path << std::endl;
+    }
+#else
+    // For ROCm on Windows with gfx1151, set OCL_SET_SVMSIZE
+    // This is a patch to enable loading larger models
+    if (backend_ == "rocm") {
+        std::string arch = identify_rocm_arch();
+        if (arch == "gfx1151") {
+            env_vars.push_back({"OCL_SET_SVM_SIZE", "262144"});
+            std::cout << "[LlamaCpp] Setting OCL_SET_SVM_SIZE=262144 for gfx1151 (enables loading larger models)" << std::endl;
+        }
     }
 #endif
     
