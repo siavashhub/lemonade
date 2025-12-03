@@ -75,6 +75,24 @@ lemonade-server pull Gemma-3-4b-it-GGUF
 </details>
 
 <details>
+<summary>Qwen3-Next-80B-A3B-Instruct-GGUF</summary>
+
+```bash
+lemonade-server pull Qwen3-Next-80B-A3B-Instruct-GGUF
+```
+
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td>Checkpoint</td><td><a href="https://huggingface.co/unsloth/Qwen3-Next-80B-A3B-Instruct-GGUF">unsloth/Qwen3-Next-80B-A3B-Instruct-GGUF</a></td></tr>
+<tr><td>GGUF Variant</td><td>Qwen3-Next-80B-A3B-Instruct-UD-Q4_K_XL.gguf</td></tr>
+<tr><td>Recipe</td><td>llamacpp</td></tr>
+<tr><td>Labels</td><td>hot</td></tr>
+<tr><td>Size (GB)</td><td>45.1</td></tr>
+</table>
+
+</details>
+
+<details>
 <summary>gpt-oss-120b-mxfp-GGUF</summary>
 
 ```bash
@@ -127,18 +145,18 @@ lemonade-server pull Gemma3-4b-it-FLM
 </details>
 
 <details>
-<summary>Qwen3-4B-Instruct-2507-FLM</summary>
+<summary>Qwen3-4B-VL-FLM</summary>
 
 ```bash
-lemonade-server pull Qwen3-4B-Instruct-2507-FLM
+lemonade-server pull Qwen3-4B-VL-FLM
 ```
 
 <table>
 <tr><th>Key</th><th>Value</th></tr>
-<tr><td>Checkpoint</td><td>qwen3-it:4b</td></tr>
+<tr><td>Checkpoint</td><td>qwen3vl-it:4b</td></tr>
 <tr><td>Recipe</td><td>flm</td></tr>
-<tr><td>Labels</td><td>hot</td></tr>
-<tr><td>Size (GB)</td><td>3.07</td></tr>
+<tr><td>Labels</td><td>hot, vision</td></tr>
+<tr><td>Size (GB)</td><td>3.85</td></tr>
 </table>
 
 </details>
@@ -364,6 +382,62 @@ lemonade-server pull Qwen2.5-VL-7B-Instruct-GGUF
 </details>
 
 <details>
+<summary>Qwen3-VL-4B-Instruct-GGUF</summary>
+
+```bash
+lemonade-server pull Qwen3-VL-4B-Instruct-GGUF
+```
+
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td>Checkpoint</td><td><a href="https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF">Qwen/Qwen3-VL-4B-Instruct-GGUF</a></td></tr>
+<tr><td>GGUF Variant</td><td>Q4_K_M</td></tr>
+<tr><td>Mmproj</td><td>mmproj-Qwen3VL-4B-Instruct-F16.gguf</td></tr>
+<tr><td>Recipe</td><td>llamacpp</td></tr>
+<tr><td>Labels</td><td>vision</td></tr>
+<tr><td>Size (GB)</td><td>3.33</td></tr>
+</table>
+
+</details>
+
+<details>
+<summary>Qwen3-VL-8B-Instruct-GGUF</summary>
+
+```bash
+lemonade-server pull Qwen3-VL-8B-Instruct-GGUF
+```
+
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td>Checkpoint</td><td><a href="https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF">Qwen/Qwen3-VL-8B-Instruct-GGUF</a></td></tr>
+<tr><td>GGUF Variant</td><td>Q4_K_M</td></tr>
+<tr><td>Mmproj</td><td>mmproj-Qwen3VL-8B-Instruct-F16.gguf</td></tr>
+<tr><td>Recipe</td><td>llamacpp</td></tr>
+<tr><td>Labels</td><td>vision</td></tr>
+<tr><td>Size (GB)</td><td>6.19</td></tr>
+</table>
+
+</details>
+
+<details>
+<summary>Qwen3-Next-80B-A3B-Instruct-GGUF</summary>
+
+```bash
+lemonade-server pull Qwen3-Next-80B-A3B-Instruct-GGUF
+```
+
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td>Checkpoint</td><td><a href="https://huggingface.co/unsloth/Qwen3-Next-80B-A3B-Instruct-GGUF">unsloth/Qwen3-Next-80B-A3B-Instruct-GGUF</a></td></tr>
+<tr><td>GGUF Variant</td><td>Qwen3-Next-80B-A3B-Instruct-UD-Q4_K_XL.gguf</td></tr>
+<tr><td>Recipe</td><td>llamacpp</td></tr>
+<tr><td>Labels</td><td>hot</td></tr>
+<tr><td>Size (GB)</td><td>45.1</td></tr>
+</table>
+
+</details>
+
+<details>
 <summary>Llama-4-Scout-17B-16E-Instruct-GGUF</summary>
 
 ```bash
@@ -574,6 +648,41 @@ lemonade-server pull GLM-4.5-Air-UD-Q4K-XL-GGUF
 <tr><td>Recipe</td><td>llamacpp</td></tr>
 <tr><td>Labels</td><td>reasoning</td></tr>
 <tr><td>Size (GB)</td><td>73.1</td></tr>
+</table>
+
+</details>
+
+<details>
+<summary>granite-4.0-h-tiny-GGUF</summary>
+
+```bash
+lemonade-server pull granite-4.0-h-tiny-GGUF
+```
+
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td>Checkpoint</td><td><a href="https://huggingface.co/unsloth/granite-4.0-h-tiny-GGUF">unsloth/granite-4.0-h-tiny-GGUF</a></td></tr>
+<tr><td>GGUF Variant</td><td>Q4_K_M</td></tr>
+<tr><td>Recipe</td><td>llamacpp</td></tr>
+<tr><td>Labels</td><td>tool-calling</td></tr>
+<tr><td>Size (GB)</td><td>4.25</td></tr>
+</table>
+
+</details>
+
+<details>
+<summary>LFM2-8B-A1B-GGUF</summary>
+
+```bash
+lemonade-server pull LFM2-8B-A1B-GGUF
+```
+
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td>Checkpoint</td><td><a href="https://huggingface.co/LiquidAI/LFM2-8B-A1B-GGUF">LiquidAI/LFM2-8B-A1B-GGUF</a></td></tr>
+<tr><td>GGUF Variant</td><td>Q4_K_M</td></tr>
+<tr><td>Recipe</td><td>llamacpp</td></tr>
+<tr><td>Size (GB)</td><td>4.8</td></tr>
 </table>
 
 </details>
@@ -946,6 +1055,23 @@ lemonade-server pull Gemma3-4b-it-FLM
 </details>
 
 <details>
+<summary>Qwen3-4B-VL-FLM</summary>
+
+```bash
+lemonade-server pull Qwen3-4B-VL-FLM
+```
+
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td>Checkpoint</td><td>qwen3vl-it:4b</td></tr>
+<tr><td>Recipe</td><td>flm</td></tr>
+<tr><td>Labels</td><td>hot, vision</td></tr>
+<tr><td>Size (GB)</td><td>3.85</td></tr>
+</table>
+
+</details>
+
+<details>
 <summary>Qwen3-0.6b-FLM</summary>
 
 ```bash
@@ -973,7 +1099,6 @@ lemonade-server pull Qwen3-4B-Instruct-2507-FLM
 <tr><th>Key</th><th>Value</th></tr>
 <tr><td>Checkpoint</td><td>qwen3-it:4b</td></tr>
 <tr><td>Recipe</td><td>flm</td></tr>
-<tr><td>Labels</td><td>hot</td></tr>
 <tr><td>Size (GB)</td><td>3.07</td></tr>
 </table>
 

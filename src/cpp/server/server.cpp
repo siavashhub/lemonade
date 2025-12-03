@@ -27,7 +27,8 @@ namespace lemon {
 
 Server::Server(int port, const std::string& host, const std::string& log_level,
                int ctx_size, bool tray, const std::string& llamacpp_backend,
-               const std::string& llamacpp_args)
+               const std::string& llamacpp_args, int max_llm_models,
+               int max_embedding_models, int max_reranking_models)
     : port_(port), host_(host), log_level_(log_level), ctx_size_(ctx_size),
       tray_(tray), llamacpp_backend_(llamacpp_backend), llamacpp_args_(llamacpp_args),
       running_(false) {
@@ -55,7 +56,9 @@ Server::Server(int port, const std::string& host, const std::string& log_level,
     std::cout << "[Server] HTTP server initialized with thread pool (8 threads)" << std::endl;
     
     model_manager_ = std::make_unique<ModelManager>();
-    router_ = std::make_unique<Router>(ctx_size, llamacpp_backend, log_level, llamacpp_args, model_manager_.get());
+    router_ = std::make_unique<Router>(ctx_size, llamacpp_backend, log_level, llamacpp_args, 
+                                       model_manager_.get(), max_llm_models, 
+                                       max_embedding_models, max_reranking_models);
     
     if (log_level_ == "debug" || log_level_ == "trace") {
         std::cout << "[Server] Debug logging enabled - subprocess output will be visible" << std::endl;
@@ -295,6 +298,20 @@ void Server::setup_static_files() {
         res.set_content(html_template, "text/html");
     });
     
+    // Serve favicon.ico from root as expected by most browsers
+    http_server_->Get("/favicon.ico", [static_dir](const httplib::Request& req, httplib::Response& res) {
+        std::ifstream ifs(static_dir + "/favicon.ico", std::ios::binary);
+        if (ifs) {
+            // Read favicon bytes to string to pass to response
+            std::string content((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
+            res.set_content(content, "image/x-icon");
+            res.status = 200;
+        } else {
+            res.set_content("Favicon not found.", "text/plain");
+            res.status = 404;
+        }
+    });
+
     // Mount static files directory for other files (CSS, JS, images)
     // Use /static prefix to avoid conflicts with webapp.html
     if (!http_server_->set_mount_point("/static", static_dir)) {
@@ -407,20 +424,14 @@ bool Server::is_running() const {
 //
 // Note: Only the /pull endpoint checks HuggingFace for updates (do_not_upgrade=false)
 void Server::auto_load_model_if_needed(const std::string& requested_model) {
-    std::string loaded_model = router_->get_loaded_model();
-    
-    // Early return if already loaded
-    if (loaded_model == requested_model) {
+    // Check if this specific model is already loaded (multi-model aware)
+    if (router_->is_model_loaded(requested_model)) {
         std::cout << "[Server] Model already loaded: " << requested_model << std::endl;
         return;
     }
     
     // Log the auto-loading action
-    if (!loaded_model.empty()) {
-        std::cout << "[Server] Switching from '" << loaded_model << "' to '" << requested_model << "'" << std::endl;
-    } else {
-        std::cout << "[Server] No model loaded, auto-loading: " << requested_model << std::endl;
-    }
+    std::cout << "[Server] Auto-loading model: " << requested_model << std::endl;
     
     // Get model info
     if (!model_manager_->model_exists(requested_model)) {
@@ -460,18 +471,17 @@ void Server::handle_health(const httplib::Request& req, httplib::Response& res) 
         return;
     }
     
-    auto thread_id = std::this_thread::get_id();
-    std::cout << "[Server DEBUG] ===== HEALTH ENDPOINT ENTERED (Thread: " << thread_id << ") =====" << std::endl;
-    std::cout.flush();
-    
     nlohmann::json response = {{"status", "ok"}};
     
-    // Add model loaded information like Python implementation
+    // Add model loaded information (most recent for backward compatibility)
     std::string loaded_checkpoint = router_->get_loaded_checkpoint();
     std::string loaded_model = router_->get_loaded_model();
     
     response["checkpoint_loaded"] = loaded_checkpoint.empty() ? nlohmann::json(nullptr) : nlohmann::json(loaded_checkpoint);
     response["model_loaded"] = loaded_model.empty() ? nlohmann::json(nullptr) : nlohmann::json(loaded_model);
+    
+    // Multi-model support: Add all loaded models
+    response["all_models_loaded"] = router_->get_all_loaded_models();
     
     // Add context size
     response["context_size"] = router_->get_ctx_size();
@@ -483,8 +493,6 @@ void Server::handle_health(const httplib::Request& req, httplib::Response& res) 
     };
     
     res.set_content(response.dump(), "application/json");
-    std::cout << "[Server DEBUG] ===== HEALTH ENDPOINT RETURNING (Thread: " << thread_id << ") =====" << std::endl;
-    std::cout.flush();
 }
 
 void Server::handle_models(const httplib::Request& req, httplib::Response& res) {
@@ -493,9 +501,6 @@ void Server::handle_models(const httplib::Request& req, httplib::Response& res) 
         res.status = 200;
         return;
     }
-    
-    std::cout << "[Server DEBUG] ===== MODELS ENDPOINT ENTERED =====" << std::endl;
-    std::cout.flush();
     
     // Check if we should show all models (for CLI list command) or only downloaded (OpenAI API behavior)
     bool show_all = req.has_param("show_all") && req.get_param_value("show_all") == "true";
@@ -514,34 +519,31 @@ void Server::handle_models(const httplib::Request& req, httplib::Response& res) 
     response["object"] = "list";
     
     for (const auto& [model_id, model_info] : models) {
-        
-        nlohmann::json model_json = {
-            {"id", model_id},
-            {"object", "model"},
-            {"created", 1234567890},
-            {"owned_by", "lemonade"},
-            {"checkpoint", model_info.checkpoint},
-            {"recipe", model_info.recipe}
-        };
-        
-        // Add size if available
-        if (model_info.size > 0.0) {
-            model_json["size"] = model_info.size;
-        }
-        
-        // Add extra fields when showing all models (for CLI list command)
-        if (show_all) {
-            model_json["name"] = model_info.model_name;
-            model_json["downloaded"] = model_info.downloaded;
-            model_json["labels"] = model_info.labels;
-        }
-        
-        response["data"].push_back(model_json);
+        response["data"].push_back(model_info_to_json(model_id, model_info));
     }
     
     res.set_content(response.dump(), "application/json");
-    std::cout << "[Server DEBUG] ===== MODELS ENDPOINT RETURNING =====" << std::endl;
-    std::cout.flush();
+}
+
+nlohmann::json Server::model_info_to_json(const std::string& model_id, const ModelInfo& info) {
+    nlohmann::json model_json = {
+        {"id", model_id},
+        {"object", "model"},
+        {"created", 1234567890},
+        {"owned_by", "lemonade"},
+        {"checkpoint", info.checkpoint},
+        {"recipe", info.recipe},
+        {"downloaded", info.downloaded},
+        {"suggested", info.suggested},
+        {"labels", info.labels}
+    };
+    
+    // Add size if available
+    if (info.size > 0.0) {
+        model_json["size"] = info.size;
+    }
+    
+    return model_json;
 }
 
 void Server::handle_model_by_id(const httplib::Request& req, httplib::Response& res) {
@@ -549,19 +551,7 @@ void Server::handle_model_by_id(const httplib::Request& req, httplib::Response& 
     
     if (model_manager_->model_exists(model_id)) {
         auto info = model_manager_->get_model_info(model_id);
-        nlohmann::json response = {
-            {"id", model_id},
-            {"name", info.model_name},
-            {"checkpoint", info.checkpoint},
-            {"recipe", info.recipe}
-        };
-        
-        // Add size if available
-        if (info.size > 0.0) {
-            response["size"] = info.size;
-        }
-        
-        res.set_content(response.dump(), "application/json");
+        res.set_content(model_info_to_json(model_id, info).dump(), "application/json");
     } else {
         res.status = 404;
         res.set_content("{\"error\": \"Model not found\"}", "application/json");
@@ -601,16 +591,9 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
         // Check if streaming is requested
         bool is_streaming = request_json.contains("stream") && request_json["stream"].get<bool>();
         
-        // FLM requires the checkpoint name in the request, not the Lemonade model name
+        // Use original request body - each backend (FLM, llamacpp, etc.) handles 
+        // model name transformation internally via their forward methods
         std::string request_body = req.body;
-        if (router_->get_loaded_recipe() == "flm") {
-            auto request_json_copy = request_json;
-            request_json_copy["model"] = router_->get_loaded_checkpoint();
-            request_body = request_json_copy.dump();
-            if (!is_streaming) {
-                request_json = request_json_copy;  // Update for non-streaming path too
-            }
-        }
         
         // Handle enable_thinking=false by prepending /no_think to last user message
         if (request_json.contains("enable_thinking") && 
@@ -811,16 +794,8 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
         // Check if streaming is requested
         bool is_streaming = request_json.contains("stream") && request_json["stream"].get<bool>();
         
-        // FLM requires the checkpoint name in the request, not the Lemonade model name
+        // Use original request body - each backend handles model name transformation internally
         std::string request_body = req.body;
-        if (router_->get_loaded_recipe() == "flm") {
-            auto request_json_copy = request_json;
-            request_json_copy["model"] = router_->get_loaded_checkpoint();
-            request_body = request_json_copy.dump();
-            if (!is_streaming) {
-                request_json = request_json_copy;  // Update for non-streaming path too
-            }
-        }
         
         if (is_streaming) {
             try {
@@ -1113,6 +1088,7 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
         bool reranking = request_json.value("reranking", false);
         std::string mmproj = request_json.value("mmproj", "");
         bool do_not_upgrade = request_json.value("do_not_upgrade", false);
+        bool stream = request_json.value("stream", false);
         
         std::cout << "[Server] Pulling model: " << model_name << std::endl;
         if (!checkpoint.empty()) {
@@ -1122,11 +1098,63 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
             std::cout << "[Server]   recipe: " << recipe << std::endl;
         }
         
-        model_manager_->download_model(model_name, checkpoint, recipe, 
-                                      reasoning, vision, embedding, reranking, mmproj, do_not_upgrade);
-        
-        nlohmann::json response = {{"status", "success"}, {"model_name", model_name}};
-        res.set_content(response.dump(), "application/json");
+        if (stream) {
+            // SSE streaming mode - send progress events
+            res.set_header("Content-Type", "text/event-stream");
+            res.set_header("Cache-Control", "no-cache");
+            res.set_header("Connection", "keep-alive");
+            res.set_header("X-Accel-Buffering", "no");
+            
+            res.set_chunked_content_provider(
+                "text/event-stream",
+                [this, model_name, checkpoint, recipe, reasoning, vision, 
+                 embedding, reranking, mmproj, do_not_upgrade](size_t offset, httplib::DataSink& sink) {
+                    if (offset > 0) {
+                        return false; // Already sent everything
+                    }
+                    
+                    try {
+                        // Create progress callback that emits SSE events
+                        DownloadProgressCallback progress_cb = [&sink](const DownloadProgress& p) {
+                            nlohmann::json event_data;
+                            event_data["file"] = p.file;
+                            event_data["file_index"] = p.file_index;
+                            event_data["total_files"] = p.total_files;
+                            // Explicitly cast to uint64_t for proper JSON serialization
+                            event_data["bytes_downloaded"] = static_cast<uint64_t>(p.bytes_downloaded);
+                            event_data["bytes_total"] = static_cast<uint64_t>(p.bytes_total);
+                            event_data["percent"] = p.percent;
+                            
+                            if (p.complete) {
+                                std::string event = "event: complete\ndata: " + event_data.dump() + "\n\n";
+                                sink.write(event.c_str(), event.size());
+                            } else {
+                                std::string event = "event: progress\ndata: " + event_data.dump() + "\n\n";
+                                sink.write(event.c_str(), event.size());
+                            }
+                        };
+                        
+                        model_manager_->download_model(model_name, checkpoint, recipe,
+                                                      reasoning, vision, embedding, reranking, 
+                                                      mmproj, do_not_upgrade, progress_cb);
+                        
+                    } catch (const std::exception& e) {
+                        // Send error event
+                        nlohmann::json error_data = {{"error", e.what()}};
+                        std::string event = "event: error\ndata: " + error_data.dump() + "\n\n";
+                        sink.write(event.c_str(), event.size());
+                    }
+                    
+                    return false; // Signal completion
+                });
+        } else {
+            // Legacy synchronous mode - blocks until complete
+            model_manager_->download_model(model_name, checkpoint, recipe, 
+                                          reasoning, vision, embedding, reranking, mmproj, do_not_upgrade);
+            
+            nlohmann::json response = {{"status", "success"}, {"model_name", model_name}};
+            res.set_content(response.dump(), "application/json");
+        }
         
     } catch (const std::exception& e) {
         std::cerr << "[Server] ERROR in handle_pull: " << e.what() << std::endl;
@@ -1144,7 +1172,16 @@ void Server::handle_load(const httplib::Request& req, httplib::Response& res) {
         auto request_json = nlohmann::json::parse(req.body);
         std::string model_name = request_json["model_name"];
         
-        std::cout << "[Server] Loading model: " << model_name << std::endl;
+        // Extract optional per-model settings (defaults to -1 / empty = use Router defaults)
+        int ctx_size = request_json.value("ctx_size", -1);
+        std::string llamacpp_backend = request_json.value("llamacpp_backend", "");
+        std::string llamacpp_args = request_json.value("llamacpp_args", "");
+        
+        std::cout << "[Server] Loading model: " << model_name;
+        if (ctx_size > 0) std::cout << " (ctx_size=" << ctx_size << ")";
+        if (!llamacpp_backend.empty()) std::cout << " (backend=" << llamacpp_backend << ")";
+        if (!llamacpp_args.empty()) std::cout << " (args=" << llamacpp_args << ")";
+        std::cout << std::endl;
         
         // Check if model is already loaded (early return optimization)
         std::string loaded_model = router_->get_loaded_model();
@@ -1162,11 +1199,24 @@ void Server::handle_load(const httplib::Request& req, httplib::Response& res) {
             return;
         }
         
-        // Use helper function to handle loading (download outside mutex, no race conditions)
-        auto_load_model_if_needed(model_name);
+        // Get model info
+        if (!model_manager_->model_exists(model_name)) {
+            throw std::runtime_error("Model not found: " + model_name);
+        }
         
-        // Get model info for response
         auto info = model_manager_->get_model_info(model_name);
+        
+        // Download model if needed (first-time use)
+        if (!info.downloaded) {
+            std::cout << "[Server] Model not downloaded, downloading..." << std::endl;
+            model_manager_->download_model(model_name);
+            info = model_manager_->get_model_info(model_name);
+        }
+        
+        // Load model with optional per-model settings
+        router_->load_model(model_name, info, true, ctx_size, llamacpp_backend, llamacpp_args);
+        
+        // Return success response
         nlohmann::json response = {
             {"status", "success"},
             {"model_name", model_name},
@@ -1189,19 +1239,52 @@ void Server::handle_unload(const httplib::Request& req, httplib::Response& res) 
         std::cout << "[Server] Request method: " << req.method << ", body length: " << req.body.length() << std::endl;
         std::cout << "[Server] Content-Type: " << req.get_header_value("Content-Type") << std::endl;
         
-        // Unload doesn't need any request body
-        router_->unload_model();
+        // Multi-model support: Optional model_name parameter
+        std::string model_name;
+        if (!req.body.empty()) {
+            try {
+                auto request_json = nlohmann::json::parse(req.body);
+                if (request_json.contains("model_name") && request_json["model_name"].is_string()) {
+                    model_name = request_json["model_name"].get<std::string>();
+                } else if (request_json.contains("model") && request_json["model"].is_string()) {
+                    model_name = request_json["model"].get<std::string>();
+                }
+            } catch (...) {
+                // Ignore parse errors, just unload all
+            }
+        }
         
-        std::cout << "[Server] Model unloaded successfully" << std::endl;
-        nlohmann::json response = {
-            {"status", "success"},
-            {"message", "Model unloaded successfully"}
-        };
-        res.status = 200; // Explicitly set success status first
-        res.set_content(response.dump(), "application/json");
+        router_->unload_model(model_name);  // Empty string = unload all
+        
+        if (model_name.empty()) {
+            std::cout << "[Server] All models unloaded successfully" << std::endl;
+            nlohmann::json response = {
+                {"status", "success"},
+                {"message", "All models unloaded successfully"}
+            };
+            res.status = 200;
+            res.set_content(response.dump(), "application/json");
+        } else {
+            std::cout << "[Server] Model '" << model_name << "' unloaded successfully" << std::endl;
+            nlohmann::json response = {
+                {"status", "success"},
+                {"message", "Model unloaded successfully"},
+                {"model_name", model_name}
+            };
+            res.status = 200;
+            res.set_content(response.dump(), "application/json");
+        }
     } catch (const std::exception& e) {
         std::cerr << "[Server ERROR] Unload failed: " << e.what() << std::endl;
-        res.status = 500;
+        
+        // Check if error is "Model not loaded" for 404
+        std::string error_msg = e.what();
+        if (error_msg.find("not loaded") != std::string::npos) {
+            res.status = 404;
+        } else {
+            res.status = 500;
+        }
+        
         nlohmann::json error = {{"error", e.what()}};
         res.set_content(error.dump(), "application/json");
     }
@@ -1562,26 +1645,17 @@ void Server::handle_system_info(const httplib::Request& req, httplib::Response& 
         return;
     }
     
-    try {
-        // Get verbose parameter from query string (default to false)
-        bool verbose = false;
-        if (req.has_param("verbose")) {
-            std::string verbose_param = req.get_param_value("verbose");
-            std::transform(verbose_param.begin(), verbose_param.end(), verbose_param.begin(), ::tolower);
-            verbose = (verbose_param == "true" || verbose_param == "1");
-        }
-        
-        // Get system info with cache handling
-        nlohmann::json system_info = SystemInfoCache::get_system_info_with_cache(verbose);
-        
-        res.set_content(system_info.dump(), "application/json");
-        
-    } catch (const std::exception& e) {
-        std::cerr << "[Server] ERROR in handle_system_info: " << e.what() << std::endl;
-        res.status = 500;
-        nlohmann::json error = {{"error", e.what()}};
-        res.set_content(error.dump(), "application/json");
+    // Get verbose parameter from query string (default to false)
+    bool verbose = false;
+    if (req.has_param("verbose")) {
+        std::string verbose_param = req.get_param_value("verbose");
+        std::transform(verbose_param.begin(), verbose_param.end(), verbose_param.begin(), ::tolower);
+        verbose = (verbose_param == "true" || verbose_param == "1");
     }
+    
+    // Get system info - this function handles all errors internally and never throws
+    nlohmann::json system_info = SystemInfoCache::get_system_info_with_cache(verbose);
+    res.set_content(system_info.dump(), "application/json");
 }
 
 void Server::handle_log_level(const httplib::Request& req, httplib::Response& res) {

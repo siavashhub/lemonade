@@ -21,7 +21,10 @@ public:
            int ctx_size = 4096,
            bool tray = false,
            const std::string& llamacpp_backend = "vulkan",
-           const std::string& llamacpp_args = "");
+           const std::string& llamacpp_args = "",
+           int max_llm_models = 1,
+           int max_embedding_models = 1,
+           int max_reranking_models = 1);
     
     ~Server();
     
@@ -62,6 +65,9 @@ private:
     
     // Helper function for auto-loading models (eliminates code duplication and race conditions)
     void auto_load_model_if_needed(const std::string& model_name);
+    
+    // Helper function to convert ModelInfo to JSON (used by models endpoints)
+    nlohmann::json model_info_to_json(const std::string& model_id, const ModelInfo& info);
     
     int port_;
     std::string host_;
