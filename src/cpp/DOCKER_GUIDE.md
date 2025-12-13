@@ -24,7 +24,7 @@ This configuration has been tested with both the Vulkan and CPU backends and you
 # ==============================================================
 # # 1. Build stage — compile lemonade C++ binaries
 # # ============================================================
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:24.04 AS builder
 
 # Avoid interactive prompts during build
 ENV DEBIAN_FRONTEND=noninteractive
@@ -58,7 +58,7 @@ RUN echo "=== Build directory contents ===" && \
 # # ============================================================
 # # 2. Runtime stage — small, clean image
 # # ============================================================
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 # Install runtime dependencies only
 RUN apt-get update && apt-get install -y \
