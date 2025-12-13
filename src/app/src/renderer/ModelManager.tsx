@@ -8,6 +8,7 @@ import {
 import { ToastContainer, useToast } from './Toast';
 import { useConfirmDialog } from './ConfirmDialog';
 import { serverFetch, onServerPortChange } from './utils/serverConfig';
+import { downloadTracker } from './utils/downloadTracker';
 
 interface ModelManagerProps {
   isVisible: boolean;
@@ -33,7 +34,7 @@ const ModelManager: React.FC<ModelManagerProps> = ({ isVisible, width = 280 }) =
   const [showDownloadedOnly, setShowDownloadedOnly] = useState(false);
   const [showAddModelForm, setShowAddModelForm] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [currentLoadedModel, setCurrentLoadedModel] = useState<string | null>(null);
+  const [loadedModels, setLoadedModels] = useState<Set<string>>(new Set());
   const [loadingModels, setLoadingModels] = useState<Set<string>>(new Set());
   const [hoveredModel, setHoveredModel] = useState<string | null>(null);
   const [newModel, setNewModel] = useState(createEmptyModelForm);
@@ -62,16 +63,21 @@ const ModelManager: React.FC<ModelManagerProps> = ({ isVisible, width = 280 }) =
       const response = await serverFetch('/health');
       const data = await response.json();
       
-      if (data && data.model_loaded) {
-        setCurrentLoadedModel(data.model_loaded);
-        // Remove from loading state if it was loading
+      if (data && data.all_models_loaded && Array.isArray(data.all_models_loaded)) {
+        // Extract model names from the all_models_loaded array
+        const loadedModelNames = new Set<string>(
+          data.all_models_loaded.map((model: any) => model.model_name)
+        );
+        setLoadedModels(loadedModelNames);
+        
+        // Remove loaded models from loading state
         setLoadingModels(prev => {
           const newSet = new Set(prev);
-          newSet.delete(data.model_loaded);
+          loadedModelNames.forEach(modelName => newSet.delete(modelName));
           return newSet;
         });
       } else {
-        setCurrentLoadedModel(null);
+        setLoadedModels(new Set());
       }
     } catch (error) {
       console.error('Failed to fetch current loaded model:', error);
@@ -84,6 +90,7 @@ const ModelManager: React.FC<ModelManagerProps> = ({ isVisible, width = 280 }) =
       setSupportedModelsData(data);
       const suggestedModels = Object.entries(data)
         .filter(([name, info]) => info.suggested || name.startsWith(USER_MODEL_PREFIX))
+        .filter(([name, info]) => info.recipe !== 'whispercpp')
         .map(([name, info]) => ({ name, info }))
         .sort((a, b) => a.name.localeCompare(b.name));
       setModels(suggestedModels);
@@ -151,7 +158,7 @@ const ModelManager: React.FC<ModelManagerProps> = ({ isVisible, width = 280 }) =
         loadModels();
       }
     };
-    
+
     window.addEventListener('modelLoadStart' as any, handleModelLoadStart);
     window.addEventListener('modelLoadEnd' as any, handleModelLoadEnd);
 
@@ -170,6 +177,17 @@ const ModelManager: React.FC<ModelManagerProps> = ({ isVisible, width = 280 }) =
       }
     };
   }, [fetchDownloadedModels, fetchCurrentLoadedModel, loadModels]);
+
+  // Auto-expand the single category if only one is available
+  useEffect(() => {
+    const groupedModels = organizationMode === 'recipe' ? groupModelsByRecipe() : groupModelsByCategory();
+    const categories = Object.keys(groupedModels);
+    
+    // If only one category exists and it's not already expanded, expand it
+    if (categories.length === 1 && !expandedCategories.has(categories[0])) {
+      setExpandedCategories(new Set([categories[0]]));
+    }
+  }, [models, organizationMode, showDownloadedOnly, searchQuery]);
 
   const getFilteredModels = () => {
     let filtered = models;
@@ -379,7 +397,7 @@ const ModelManager: React.FC<ModelManagerProps> = ({ isVisible, width = 280 }) =
     }));
   };
 
-  const handleDownloadModel = async (modelName: string) => {
+  const handleDownloadModel = useCallback(async (modelName: string) => {
     try {
       const modelData = supportedModelsData[modelName];
       if (!modelData) {
@@ -390,22 +408,150 @@ const ModelManager: React.FC<ModelManagerProps> = ({ isVisible, width = 280 }) =
       // Add to loading state to show loading indicator
       setLoadingModels(prev => new Set(prev).add(modelName));
       
-      const response = await serverFetch('/pull', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model_name: modelName, ...modelData })
-      });
+      // Create abort controller for this download
+      const abortController = new AbortController();
+      const downloadId = downloadTracker.startDownload(modelName, abortController);
       
-      if (!response.ok) {
-        throw new Error(`Failed to download model: ${response.statusText}`);
+      // Dispatch event to open download manager
+      window.dispatchEvent(new CustomEvent('download:started', { detail: { modelName } }));
+      
+      let downloadCompleted = false;
+      let isPaused = false;
+      let isCancelled = false;
+      
+      // Listen for cancel and pause events
+      const handleCancel = (event: CustomEvent) => {
+        if (event.detail.modelName === modelName) {
+          isCancelled = true;
+          abortController.abort();
+        }
+      };
+      const handlePause = (event: CustomEvent) => {
+        if (event.detail.modelName === modelName) {
+          isPaused = true;
+          abortController.abort();
+        }
+      };
+      window.addEventListener('download:cancelled' as any, handleCancel);
+      window.addEventListener('download:paused' as any, handlePause);
+      
+      try {
+        const response = await serverFetch('/pull', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            model_name: modelName, 
+            ...modelData,
+            stream: true  // Enable SSE streaming for progress updates
+          }),
+          signal: abortController.signal,
+        });
+        
+        if (!response.ok) {
+          throw new Error(`Failed to download model: ${response.statusText}`);
+        }
+        
+        // Read SSE stream for progress updates
+        const reader = response.body?.getReader();
+        if (!reader) {
+          throw new Error('No response body');
+        }
+        
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let currentEventType = 'progress';
+        
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            
+            if (done) break;
+            
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i];
+              
+              if (line.startsWith('event:')) {
+                currentEventType = line.substring(6).trim();
+              } else if (line.startsWith('data:')) {
+                try {
+                  const data = JSON.parse(line.substring(5).trim());
+                  
+                  if (currentEventType === 'progress') {
+                    downloadTracker.updateProgress(downloadId, data);
+                  } else if (currentEventType === 'complete') {
+                    downloadTracker.completeDownload(downloadId);
+                    downloadCompleted = true;
+                  } else if (currentEventType === 'error') {
+                    downloadTracker.failDownload(downloadId, data.error || 'Unknown error');
+                    throw new Error(data.error || 'Download failed');
+                  }
+                } catch (parseError) {
+                  console.error('Failed to parse SSE data:', line, parseError);
+                }
+              } else if (line.trim() === '') {
+                // Empty line resets event type to default
+                currentEventType = 'progress';
+              }
+            }
+          }
+        } catch (streamError: any) {
+          // If we already got the complete event, ignore stream errors (connection closing is expected)
+          if (!downloadCompleted) {
+            throw streamError;
+          }
+          // Otherwise, it's a normal completion after the server closed the connection
+        }
+        
+        // Mark as complete if not already done
+        if (!downloadCompleted) {
+          downloadTracker.completeDownload(downloadId);
+          downloadCompleted = true;
+        }
+        
+        // Refresh downloaded models and current loaded model status
+        await fetchDownloadedModels();
+        await fetchCurrentLoadedModel();
+        
+        // Show success notification
+        showSuccess(`Model "${modelName}" downloaded successfully.`);
+      } catch (error: any) {
+        // Only handle as error if download didn't complete successfully
+        if (downloadCompleted) {
+          // Download actually succeeded, ignore any network errors from connection closing
+          return;
+        }
+        
+        if (error.name === 'AbortError') {
+          if (isPaused) {
+            downloadTracker.pauseDownload(downloadId);
+            showWarning(`Download paused: ${modelName}`);
+          } else if (isCancelled) {
+            downloadTracker.cancelDownload(downloadId);
+            showWarning(`Download cancelled: ${modelName}`);
+            // Dispatch cleanup-complete event to signal that file handles are released
+            window.dispatchEvent(new CustomEvent('download:cleanup-complete', {
+              detail: { id: downloadId, modelName }
+            }));
+          } else {
+            downloadTracker.cancelDownload(downloadId);
+            showWarning(`Download cancelled: ${modelName}`);
+            // Dispatch cleanup-complete event to signal that file handles are released
+            window.dispatchEvent(new CustomEvent('download:cleanup-complete', {
+              detail: { id: downloadId, modelName }
+            }));
+          }
+        } else {
+          downloadTracker.failDownload(downloadId, error.message || 'Unknown error');
+          throw error;
+        }
+      } finally {
+        window.removeEventListener('download:cancelled' as any, handleCancel);
+        window.removeEventListener('download:paused' as any, handlePause);
       }
-      
-      // Refresh downloaded models and current loaded model status
-      await fetchDownloadedModels();
-      await fetchCurrentLoadedModel();
-      
-      // Show success notification
-      showSuccess(`Model "${modelName}" downloaded successfully.`);
     } catch (error) {
       console.error('Error downloading model:', error);
       showError(`Failed to download model: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -417,7 +563,32 @@ const ModelManager: React.FC<ModelManagerProps> = ({ isVisible, width = 280 }) =
         return newSet;
       });
     }
-  };
+  }, [supportedModelsData, showError, showSuccess, showWarning, fetchDownloadedModels, fetchCurrentLoadedModel]);
+
+  // Separate useEffect for download resume/retry to avoid stale closure issues
+  useEffect(() => {
+    const handleDownloadResume = (event: CustomEvent) => {
+      const { modelName } = event.detail;
+      if (modelName) {
+        handleDownloadModel(modelName);
+      }
+    };
+
+    const handleDownloadRetry = (event: CustomEvent) => {
+      const { modelName } = event.detail;
+      if (modelName) {
+        handleDownloadModel(modelName);
+      }
+    };
+    
+    window.addEventListener('download:resume' as any, handleDownloadResume);
+    window.addEventListener('download:retry' as any, handleDownloadRetry);
+    
+    return () => {
+      window.removeEventListener('download:resume' as any, handleDownloadResume);
+      window.removeEventListener('download:retry' as any, handleDownloadRetry);
+    };
+  }, [handleDownloadModel]);
 
   const handleLoadModel = async (modelName: string) => {
     try {
@@ -466,7 +637,9 @@ const ModelManager: React.FC<ModelManagerProps> = ({ isVisible, width = 280 }) =
   const handleUnloadModel = async (modelName: string) => {
     try {
       const response = await serverFetch('/unload', {
-        method: 'POST'
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model_name: modelName })
       });
       
       if (!response.ok) {
@@ -550,28 +723,29 @@ const ModelManager: React.FC<ModelManagerProps> = ({ isVisible, width = 280 }) =
         </div>
       </div>
       
-      {/* Currently Loaded Model Section */}
-      {currentLoadedModel && (
+      {/* Currently Loaded Models Section */}
+      {loadedModels.size > 0 && (
         <div className="loaded-model-section">
-          <div className="loaded-model-label">CURRENTLY LOADED</div>
-          <div className="loaded-model-info">
-            <div className="loaded-model-details">
-              <span className="loaded-model-indicator">●</span>
-              <span className="loaded-model-name">{currentLoadedModel}</span>
+          <div className="loaded-model-label">CURRENTLY LOADED ({loadedModels.size})</div>
+          {Array.from(loadedModels).map(modelName => (
+            <div key={modelName} className="loaded-model-info">
+              <div className="loaded-model-details">
+                <span className="loaded-model-indicator">●</span>
+                <span className="loaded-model-name">{modelName}</span>
+              </div>
+              <button 
+                className="eject-model-button"
+                onClick={() => handleUnloadModel(modelName)}
+                title="Eject model"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M9 11L12 8L15 11" />
+                  <path d="M12 8V16" />
+                  <path d="M5 20H19" />
+                </svg>
+              </button>
             </div>
-            <button 
-              className="eject-model-button"
-              onClick={() => handleUnloadModel(currentLoadedModel)}
-              title="Eject model"
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M9 11L12 8L15 11" />
-                <path d="M12 8V16" />
-                <path d="M5 20H19" />
-              </svg>
-              Eject
-            </button>
-          </div>
+          ))}
         </div>
       )}
       
@@ -593,7 +767,7 @@ const ModelManager: React.FC<ModelManagerProps> = ({ isVisible, width = 280 }) =
               <div className="model-list">
                 {groupedModels[category].map(model => {
                   const isDownloaded = downloadedModels.has(model.name);
-                  const isLoaded = currentLoadedModel === model.name;
+                  const isLoaded = loadedModels.has(model.name);
                   const isLoading = loadingModels.has(model.name);
                   
                   let statusClass = 'not-downloaded';
