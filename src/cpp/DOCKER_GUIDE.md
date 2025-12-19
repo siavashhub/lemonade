@@ -35,6 +35,23 @@ The Dockerfile below uses a **multi-stage build** to compile Lemonade C++ compon
 
 Place the Dockerfile in the parent directory of the repository root when building.
 
+> **Build context note**
+>
+> This guide assumes the Dockerfile and `docker-compose.yml` live outside the Lemonade repository directory.
+> Like below
+>```css
+>.
+>├── docker-compose.yml
+>├── Dockerfile
+>└── lemonade/
+>    ├── src
+>    ├── docs
+>    ├── .devcontainer
+>    └── ...
+>```
+> If you place them inside the repository,
+> update the Dockerfile to use `COPY . /app` instead.
+
 This configuration has been tested with both the Vulkan and CPU backends and you can modify or extend it to suit your specific deployment needs.
 
 ```dockerfile
