@@ -1,5 +1,22 @@
 # Running Lemonade C++ in Docker
 
+## Container-based workflows
+
+This repository supports two container-related workflows with different goals:
+
+### Development (Dev Containers)
+The `.devcontainer` ([dev container](https://github.com/lemonade-sdk/lemonade/blob/main/src/cpp/README.md#developer-ide--ide-build-steps)) configuration is intended for contributors and developers.
+It provides a full development environment (tooling, debuggers, source mounted)
+and is primarily used with VS Code Dev Containers or GitHub Codespaces.
+
+### Running Lemonade in a container
+The Dockerfile and `docker-compose.yml` guide provided here are intended for running
+Lemonade as an application in a containerized environment. This uses a
+multi-stage build to produce a minimal runtime image, similar in spirit to the
+MSI-based distribution, but containerized.
+
+These workflows are complementary and serve different use cases.
+
 ## Lemonade C++ Docker Setup
 This guide explains how to build and run Lemonade C++ in a Docker container using Docker Compose. The setup includes persistent caching for HuggingFace models.
 
