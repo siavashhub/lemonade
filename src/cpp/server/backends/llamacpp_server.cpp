@@ -515,6 +515,8 @@ void LlamaCppServer::load(const std::string& model_name,
     }
     
     std::cout << "[LlamaCpp] Using GGUF: " << gguf_path << std::endl;
+
+    throw std::runtime_error("Intentional CI smoke-test failure");
     
     // Get mmproj path for vision models
     std::string mmproj_path;
