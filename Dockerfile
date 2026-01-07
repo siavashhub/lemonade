@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy source code
 COPY . /app
-WORKDIR /app/lemonade/src/cpp
+WORKDIR /app/src/cpp
 
 # Build the project
 RUN rm -rf build && \
