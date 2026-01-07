@@ -851,15 +851,35 @@ Explicitly load a registered model into memory. This is useful to ensure that th
 |-----------|----------|-------------|
 | `model_name` | Yes | [Lemonade Server model name](./server_models.md) to load. |
 | `ctx_size` | No | Context size for the model. Overrides the default value for this model. |
-| `llamacpp_backend` | No | LlamaCpp backend to use (`vulkan`, `rocm`, `metal` or `cpu`). Only applies to llamacpp models. Overrides the default value for this model. |
-| `llamacpp_args` | No | Custom arguments to pass to llama-server. Must not conflict with arguments managed by Lemonade (e.g., `-m`, `--port`, `--ctx-size`, `-ngl`). Overrides the default value for this model. |
+| `llamacpp_backend` | No | LlamaCpp backend to use (`vulkan`, `rocm`, `metal` or `cpu`). Only applies to llamacpp models. |
+| `llamacpp_args` | No | Custom arguments to pass to llama-server. The following are NOT allowed: `-m`, `--port`, `--ctx-size`, `-ngl`. |
 
 **Setting Priority:**
 
 When loading a model, settings are applied in this priority order:
 1. Values explicitly passed in the `load` request (highest priority)
-2. Values set via `lemonade-server` CLI arguments or environment variables
-3. Default hardcoded values in `lemonade-router` (lowest priority)
+2. Per-model values configurable in `recipe_options.json` (see below for details)
+3. Values set via `lemonade-server` CLI arguments or environment variables
+4. Default hardcoded values in `lemonade-router` (lowest priority)
+
+#### Per-model options
+
+You can configure a default `ctx_size`, `llamacpp_backend` and `llamacpp_args` on a per-model basis. To do this you need to create a file called `recipe_options.json` in the user's Lemonade cache (default: `~/.cache/lemonade`). An example `recipe_options.json` file follows:
+
+```json
+{
+  "user.Qwen2.5-Coder-1.5B-Instruct": {
+    "ctx_size": 16384,
+    "llamacpp_backend": "vulkan",
+    "llamacpp_args": "-np 2 -kvu"
+  },
+  "Qwen3-Coder-30B-A3B-Instruct-GGUF" : {
+    "llamacpp_backend": "rocm"
+  }
+}
+```
+
+Note that user models (i.e. those defined in `user_models.json`) must include the "user." prefix in their name when referencing them in `recipe_options.json`.
 
 #### Example requests
 
@@ -879,7 +899,7 @@ Load with custom settings:
 curl -X POST http://localhost:8000/api/v1/load \
   -H "Content-Type: application/json" \
   -d '{
-    "model_name": "llama-3.2-3b-instruct-GGUF",
+    "model_name": "Qwen3-0.6B-GGUF",
     "ctx_size": 8192,
     "llamacpp_backend": "rocm",
     "llamacpp_args": "--flash-attn on --no-mmap"

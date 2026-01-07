@@ -1,4 +1,4 @@
-## 🍋 Lemonade: Local LLM Serving with GPU and NPU acceleration
+## 🍋 Lemonade: Local LLMs with GPU and NPU acceleration
 
 <p align="center">
   <a href="https://discord.gg/5xXzkMu8Zk">
@@ -35,9 +35,9 @@
   <a href="https://discord.gg/5xXzkMu8Zk">Discord</a>
 </h3>
 
-Lemonade helps users run local LLMs with the highest performance by configuring state-of-the-art inference engines for their NPUs and GPUs.
+Lemonade helps users discover and run local AI apps by serving optimized LLMs right from their own GPUs and NPUs.
 
-Startups such as [Styrk AI](https://styrk.ai/styrk-ai-and-amd-guardrails-for-your-on-device-ai-revolution/), research teams like [Hazy Research at Stanford](https://www.amd.com/en/developer/resources/technical-articles/2025/minions--on-device-and-cloud-language-model-collaboration-on-ryz.html), and large companies like [AMD](https://www.amd.com/en/developer/resources/technical-articles/unlocking-a-wave-of-llm-apps-on-ryzen-ai-through-lemonade-server.html) use Lemonade to run LLMs.
+Apps like [n8n](https://n8n.io/integrations/lemonade-model/), [VS Code Copilot](https://marketplace.visualstudio.com/items?itemName=lemonade-sdk.lemonade-sdk), [Morphik](https://www.morphik.ai/docs/local-inference#lemonade), and many more use Lemonade to seamlessly run LLMs on any PC.
 
 ## Getting Started
 
@@ -135,8 +135,8 @@ Lemonade supports the following configurations, while also making it easy to swi
 | Under Development                                 | Under Consideration                            | Recently Completed                       |
 |---------------------------------------------------|------------------------------------------------|------------------------------------------|
 | Image Generation      | vLLM support                                   | General speech-to-text support (whisper.cpp)                 |
-| Add imagegen and transcription to app    | Handheld devices: Ryzen AI Z2 Extreme APUs     | Multiple models loaded at the same time  |
-| ROCm support for Ryzen AI 360-375 (Strix) APUs    | Text to speech                               | Lemonade desktop app                     |
+| Check back in 2026 :)    | Handheld devices: Ryzen AI Z2 Extreme APUs     | ROCm support for Ryzen AI 360-375 (Strix) APUs  |
+|     | Text to speech                               | Lemonade desktop app                     |
 
 ## Integrate Lemonade Server with Your Application
 

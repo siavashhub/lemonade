@@ -375,8 +375,8 @@ bool SystemInfo::check_vulkan_support() {
     return false;
 }
 
-// Helper to identify ROCm architecture from GPU name (same logic as llamacpp_server.cpp)
-static std::string identify_rocm_arch_from_name(const std::string& device_name) {
+// Helper to identify ROCm architecture from GPU name
+std::string identify_rocm_arch_from_name(const std::string& device_name) {
     std::string device_lower = device_name;
     std::transform(device_lower.begin(), device_lower.end(), device_lower.begin(), ::tolower);
     
@@ -389,6 +389,13 @@ static std::string identify_rocm_arch_from_name(const std::string& device_name) 
     if (device_lower.find("8050s") != std::string::npos || 
         device_lower.find("8060s") != std::string::npos) {
         return "gfx1151";
+    }
+    
+    // STX Point iGPUs (gfx1150 architecture)
+    // Radeon 880M / 890M Graphics
+    if (device_lower.find("880m") != std::string::npos ||
+        device_lower.find("890m") != std::string::npos) {
+        return "gfx1150";
     }
     
     // RDNA4 GPUs (gfx120X architecture)
@@ -664,9 +671,10 @@ bool WindowsSystemInfo::is_supported_ryzen_ai_processor() {
     std::string processor_lower = processor_name;
     std::transform(processor_lower.begin(), processor_lower.end(), processor_lower.begin(), ::tolower);
     
-    // Check for Ryzen AI 300-series pattern: "ryzen ai" followed by a 3-digit number starting with 3
-    // Pattern: ryzen ai.*\b3\d{2}\b
-    std::regex pattern(R"(ryzen ai.*\b[34]\d{2}\b)", std::regex::icase);
+    // Check for Ryzen AI 300/400-series pattern: "ryzen ai" followed by a 3-digit number starting with 3 or 4
+    // Also matches Ryzen AI Z2 series (e.g., "Ryzen AI Z2 Extreme")
+    // Pattern: ryzen ai.*((\b[34]\d{2}\b)|(\bz2\b))
+    std::regex pattern(R"(ryzen ai.*((\b[34]\d{2}\b)|(\bz2\b)))", std::regex::icase);
     
     return std::regex_search(processor_lower, pattern);
 }

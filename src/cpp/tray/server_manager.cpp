@@ -83,7 +83,8 @@ bool ServerManager::start_server(
     int max_llm_models,
     int max_embedding_models,
     int max_reranking_models,
-    int max_audio_models)
+    int max_audio_models,
+    const std::string& extra_models_dir)
 {
     if (is_server_running()) {
         DEBUG_LOG(this, "Server is already running");
@@ -103,7 +104,11 @@ bool ServerManager::start_server(
     show_console_ = show_console;
     is_ephemeral_ = is_ephemeral;
     llamacpp_args_ = llamacpp_args;
+    extra_models_dir_ = extra_models_dir;
     host_ = host;
+
+    const char* api_key_env = std::getenv("LEMONADE_API_KEY");
+    api_key_ = api_key_env ? std::string(api_key_env) : "";
     
     if (!spawn_process()) {
         std::cerr << "Failed to spawn server process" << std::endl;
@@ -393,6 +398,10 @@ bool ServerManager::spawn_process() {
     cmdline += " --max-loaded-models " + std::to_string(max_llm_models_) + " " +
                std::to_string(max_embedding_models_) + " " + std::to_string(max_reranking_models_) + " " +
                std::to_string(max_audio_models_);
+    // Extra models directory
+    if (!extra_models_dir_.empty()) {
+        cmdline += " --extra-models-dir \"" + extra_models_dir_ + "\"";
+    }
     
     DEBUG_LOG(this, "Starting server: " << cmdline);
     
@@ -610,6 +619,12 @@ bool ServerManager::spawn_process() {
         args.push_back(max_rer_str.c_str());
         args.push_back(max_aud_str.c_str());
 
+        // Extra models directory
+        if (!extra_models_dir_.empty()) {
+            args.push_back("--extra-models-dir");
+            args.push_back(extra_models_dir_.c_str());
+        }
+
         args.push_back(nullptr);
         
         execv(server_binary_path_.c_str(), const_cast<char**>(args.data()));
@@ -809,6 +824,10 @@ std::string ServerManager::make_http_request(
     httplib::Client cli(connect_host, port_);
     cli.set_connection_timeout(10, 0);  // 10 second connection timeout
     cli.set_read_timeout(timeout_seconds, 0);  // Configurable read timeout
+
+    if (api_key_ != "") {
+        cli.set_bearer_token_auth(api_key_);
+    }
     
     httplib::Result res;
     
