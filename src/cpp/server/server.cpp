@@ -102,8 +102,8 @@ void Server::log_request(const httplib::Request& req) {
 }
 
 httplib::Server::HandlerResponse Server::authenticate_request(const httplib::Request& req, httplib::Response& res) {
-    // Skip auth for health checks
-    if (req.path == "/api/v1/health") {
+    // Skip auth for live checks
+    if (req.path == "/live") {
         return httplib::Server::HandlerResponse::Unhandled;
     }
     
@@ -122,10 +122,19 @@ httplib::Server::HandlerResponse Server::authenticate_request(const httplib::Req
 void Server::setup_routes(httplib::Server &web_server) {
     // Add pre-routing handler to log ALL incoming requests (except health checks)
     web_server.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        // Absolute bypass for liveness probe
+        if (req.path == "/live") {
+            return httplib::Server::HandlerResponse::Unhandled;
+        }
+
         this->log_request(req);
         return authenticate_request(req, res);
     });
     
+    web_server.Get("/live", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_live(req, res);
+    });
+
     // Setup CORS for all routes
     setup_cors(web_server);
     
@@ -155,7 +164,7 @@ void Server::setup_routes(httplib::Server &web_server) {
     // Health check
     register_get("health", [this](const httplib::Request& req, httplib::Response& res) {
         handle_health(req, res);
-    });
+    });  
     
     // Models endpoints
     register_get("models", [this](const httplib::Request& req, httplib::Response& res) {
@@ -478,7 +487,7 @@ void Server::setup_http_logger(httplib::Server &web_server) {
     // Add request logging for ALL requests (except health checks)
     web_server.set_logger([](const httplib::Request& req, const httplib::Response& res) {
         // Skip logging health checks to reduce log noise
-        if (req.path != "/api/v0/health" && req.path != "/api/v1/health") {
+        if (req.path != "/api/v0/health" && req.path != "/api/v1/health" && req.path != "/live") {
             std::cout << "[Server] " << req.method << " " << req.path << " - " << res.status << std::endl;
         }
     });
@@ -734,6 +743,14 @@ void Server::handle_health(const httplib::Request& req, httplib::Response& res) 
     };
     
     res.set_content(response.dump(), "application/json");
+}
+
+void Server::handle_live(const httplib::Request& req, httplib::Response& res) {
+    // liveness response
+    static const char* kLiveResponse = R"({"status":"ok"})";
+
+    res.set_content(kLiveResponse, "application/json");
+    res.status = 200;
 }
 
 void Server::handle_models(const httplib::Request& req, httplib::Response& res) {
