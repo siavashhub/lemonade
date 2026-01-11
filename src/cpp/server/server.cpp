@@ -746,6 +746,12 @@ void Server::handle_health(const httplib::Request& req, httplib::Response& res) 
 }
 
 void Server::handle_live(const httplib::Request& req, httplib::Response& res) {
+    // For HEAD requests, just return 200 OK
+    if (req.method == "HEAD") {
+        res.status = 200;
+        return;
+    }
+        
     // liveness response
     static const char* kLiveResponse = R"({"status":"ok"})";
 
