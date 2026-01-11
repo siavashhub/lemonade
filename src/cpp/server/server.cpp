@@ -164,7 +164,7 @@ void Server::setup_routes(httplib::Server &web_server) {
     // Health check
     register_get("health", [this](const httplib::Request& req, httplib::Response& res) {
         handle_health(req, res);
-    });  
+    });
     
     // Models endpoints
     register_get("models", [this](const httplib::Request& req, httplib::Response& res) {
