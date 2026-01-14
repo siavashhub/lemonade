@@ -85,7 +85,7 @@ window.lmnRender = function() {
   
   // Update active states and disabled states
   const cells = {
-    os: ['win', 'linux', 'macos'],
+    os: ['win', 'linux', 'macos', 'docker'],
     distro: ['win', 'macos', 'ubuntu', 'arch', 'fedora'],
     type: ['app', 'server'],
     fw: ['oga', 'llama', 'flm'],
@@ -129,6 +129,7 @@ function renderDownload() {
   const { os, distro, type } = lmnState;
   const osDistro = document.getElementById('lmn-install-distro');
   const downloadArea = document.getElementById('lmn-download-area');
+  const installType = document.getElementById('lmn-install-type');
   const cmdDiv = document.getElementById('lmn-command');
   const installCmdDiv = document.getElementById('lmn-install-commands');
   const version = window.lmnLatestVersion || 'VERSION';
@@ -136,6 +137,7 @@ function renderDownload() {
   // Handle macOS "Coming soon"
   if (os === 'macos') {
     if (downloadArea) downloadArea.style.display = 'none';
+    if (installType) installType.style.display = 'table-row';
     if (installCmdDiv) installCmdDiv.style.display = 'none';
     if (osDistro) osDistro.style.display = 'none';
     if (cmdDiv) {
@@ -146,6 +148,8 @@ function renderDownload() {
   
   if (os === 'win') {
     if (osDistro) osDistro.style.display = 'none';
+    if (installType) installType.style.display = 'table-row';
+    
     // Windows: Show download button
     let link, buttonText;
     if (type === 'app') {
@@ -171,6 +175,8 @@ function renderDownload() {
   
   if (os === 'linux') {
     if (osDistro) osDistro.style.display = 'table-row'
+    if (installType) installType.style.display = 'table-row';
+
     if (distro === 'ubuntu') {
       // Ubuntu: Show wget + dpkg commands
       let debFile;
@@ -234,6 +240,51 @@ function renderDownload() {
       }
       return;
     }
+  }
+
+  if (os === 'docker') {
+    if (osDistro) osDistro.style.display = 'none';
+
+    if (installType) installType.style.display = 'none';
+
+    if (downloadArea) {
+      downloadArea.style.display = 'none';
+    }
+    if (installCmdDiv) {
+      installCmdDiv.style.display = 'block';
+      const commands = [
+        `docker run -d \\`,
+          `  --name lemonade-server \\`,
+          `  -p 8000:8000 \\`,
+          `  -v lemonade-cache:/root/.cache/huggingface \\`,
+          `  -v lemonade-llama:/opt/lemonade/llama \\`,
+          `  -e LEMONADE_LLAMACPP_BACKEND=cpu \\`,
+          `  ghcr.io/lemonade-sdk/lemonade-server:latest`
+      ];
+      
+      installCmdDiv.innerHTML = `<pre><code class="language-bash" id="lmn-install-pre-block"></code></pre>`;
+      
+      setTimeout(() => {
+        const pre = document.getElementById('lmn-install-pre-block');
+        if (pre) {
+          pre.innerHTML = commands.map((line, idx) => {
+            const safeLine = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            return `<div class="lmn-command-line"><span>${safeLine}</span><button class="lmn-copy-btn" title="Copy" onclick="lmnCopyInstallLine(event, ${idx})">📋</button></div>`;
+          }).join('');
+        }
+      }, 0);
+    }    
+
+    let dockerNote = `<div class="lmn-note lmn-source-note">To build from source, see the <a href="https://github.com/lemonade-sdk/lemonade/blob/main/src/cpp/DOCKER_GUIDE.md" target="_blank">Docker Guide</a>`;
+    if (cmdDiv) {
+      cmdDiv.innerHTML = dockerNote;
+    }
+  
+    return;
+  } else {
+    // Hide Docker section for other platforms
+    const dockerSection = document.getElementById('lmn-docker-section');
+    if (dockerSection) dockerSection.style.display = 'none';
   }
   
   // Build from source note (only depends on os and type)
@@ -357,21 +408,22 @@ window.lmnInit = function() {
         <div class="lmn-section-header">Download & Install</div>
         <table class="lmn-installer-table lmn-embedded-table">
           <tr>
-            <td class="lmn-label">Operating System</td>
+            <td class="lmn-label">Platform</td>
             <td id="os-win" class="lmn-active">Windows 11</td>
             <td id="os-linux">Linux</td>
             <td id="os-macos">macOS</td>
+            <td id="os-docker">Docker</td>
           </tr>
           <tr id="lmn-install-distro" style="display: none;">
             <td class="lmn-label">Linux Distribution</td>
-            <td id="distro-ubuntu" class="lmn-active">Ubuntu 24.04+</td>          
+            <td id="distro-ubuntu" class="lmn-active" colspan="2">Ubuntu 24.04+</td>          
             <td id="distro-arch">Arch Linux</td>            
             <td id="distro-fedora">Fedora</td>
           </tr>
-          <tr>
+          <tr id="lmn-install-type">
             <td class="lmn-label">Installation Type</td>
             <td id="type-app" colspan="2" class="lmn-active">App + Server</td>
-            <td id="type-server">Server Only</td>
+            <td id="type-server" colspan="2">Server Only</td>
           </tr>
         </table>
         <div id="lmn-download-area" class="lmn-download-section">
