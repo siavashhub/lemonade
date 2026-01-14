@@ -77,8 +77,10 @@ curl http://localhost:8000/api/v1/models
 
 You should receive a response listing available models.
 
+<br>
+
 # Build Your Own Docker Image
-If you want to build a custom image, check out the `DOCKER_GUIDE` for detailed instructions.
+Documentation below shows container based workflows and how to build your own environments if needed.
 
 ## Container-based workflows
 
