@@ -102,11 +102,6 @@ void Server::log_request(const httplib::Request& req) {
 }
 
 httplib::Server::HandlerResponse Server::authenticate_request(const httplib::Request& req, httplib::Response& res) {
-    // Skip auth for live checks
-    if (req.path == "/live") {
-        return httplib::Server::HandlerResponse::Unhandled;
-    }
-    
     if ((api_key_ != "") && (req.method != "OPTIONS")) {
         if (api_key_ != httplib::get_bearer_token_auth(req)) {
             res.status = 401;

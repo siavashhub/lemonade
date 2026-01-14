@@ -49,6 +49,7 @@ The additional endpoints are:
 - GET `/api/v1/health` - Check server health
 - GET `/api/v1/stats` - Performance statistics from the last request
 - GET `/api/v1/system-info` - System information and device enumeration
+- GET `/live` - Check server liveness for load balancers and orchestrators
 
 ## Multi-Model Support
 
