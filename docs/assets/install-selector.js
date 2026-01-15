@@ -269,7 +269,9 @@ function renderDownload() {
         if (pre) {
           pre.innerHTML = commands.map((line, idx) => {
             const safeLine = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            return `<div class="lmn-command-line"><span>${safeLine}</span><button class="lmn-copy-btn" title="Copy" onclick="lmnCopyInstallLine(event, ${idx})">📋</button></div>`;
+            // Only show button on first line (idx === 0)
+            const button = idx === 0 ? `<button class="lmn-copy-btn" title="Copy" onclick="lmnCopyAllInstall(event)">📋</button>` : '';
+            return `<div class="lmn-command-line"><span>${safeLine}</span>${button}</div>`;
           }).join('');
         }
       }, 0);
@@ -308,6 +310,21 @@ window.lmnCopyInstallLine = function(e, idx) {
   const lines = Array.from(pre.querySelectorAll('.lmn-command-line span')).map(span => span.textContent);
   if (lines[idx] !== undefined) {
     navigator.clipboard.writeText(lines[idx]);
+    const btn = e.currentTarget;
+    const old = btn.textContent;
+    btn.textContent = '✔';
+    setTimeout(() => { btn.textContent = old; }, 900);
+  }
+};
+
+window.lmnCopyAllInstall = function(e) {
+  e.stopPropagation();
+  const pre = document.getElementById('lmn-install-pre-block');
+  if (!pre) return;
+  const lines = Array.from(pre.querySelectorAll('.lmn-command-line span')).map(span => span.textContent);
+  if (lines !== undefined) {
+    // Join with newlines instead of commas for proper formatting
+    navigator.clipboard.writeText(lines.join('\n'));
     const btn = e.currentTarget;
     const old = btn.textContent;
     btn.textContent = '✔';
