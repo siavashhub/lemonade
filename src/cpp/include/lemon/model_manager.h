@@ -7,6 +7,7 @@
 #include <functional>
 #include <nlohmann/json.hpp>
 #include "model_types.h"
+#include "recipe_options.h"
 
 namespace lemon {
 
@@ -39,11 +40,7 @@ struct ModelInfo {
     std::string source;  // "local_upload" for locally uploaded models
     bool downloaded = false;     // Whether model is downloaded and available
     double size = 0.0;   // Model size in GB
-
-    // Recipe options
-    std::string llamacpp_args = "";
-    std::string llamacpp_backend = "";
-    int ctx_size = -1;
+    RecipeOptions recipe_options;
     
     // Multi-model support fields
     ModelType type = ModelType::LLM;      // Model type for LRU cache management
@@ -134,7 +131,6 @@ private:
     json load_optional_json(const std::string& path);
     void save_user_models(const json& user_models);
     
-    std::string get_cache_dir();
     std::string get_user_models_file();
     std::string get_recipe_options_file();
     
