@@ -11,6 +11,9 @@ const ALLOWLIST = [
   // Linux: llama.cpp only (CPU, GPU)
   { os: 'linux', fw: 'llama', dev: 'cpu' },
   { os: 'linux', fw: 'llama', dev: 'gpu' },
+  // Docker: llama.cpp only (CPU, GPU)
+  { os: 'docker', fw: 'llama', dev: 'cpu' },
+  { os: 'docker', fw: 'llama', dev: 'gpu' },
 ];
 
 const NPU_DRIVER_URL = 'https://account.amd.com/en/forms/downloads/ryzenai-eula-public-xef.html?filename=NPU_RAI1.5_280_WHQL.zip';
@@ -258,7 +261,6 @@ function renderDownload() {
           `  -p 8000:8000 \\`,
           `  -v lemonade-cache:/root/.cache/huggingface \\`,
           `  -v lemonade-llama:/opt/lemonade/llama \\`,
-          `  -e LEMONADE_LLAMACPP_BACKEND=cpu \\`,
           `  ghcr.io/lemonade-sdk/lemonade-server:latest`
       ];
       
@@ -269,7 +271,7 @@ function renderDownload() {
         if (pre) {
           pre.innerHTML = commands.map((line, idx) => {
             const safeLine = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            // Only show button on first line (idx === 0)
+            // Only show copy button on first line
             const button = idx === 0 ? `<button class="lmn-copy-btn" title="Copy" onclick="lmnCopyAllInstall(event)">📋</button>` : '';
             return `<div class="lmn-command-line"><span>${safeLine}</span>${button}</div>`;
           }).join('');
@@ -345,7 +347,7 @@ function renderQuickStart() {
     return;
   }
   
-  const commands = ['lemonade-server -h'];
+  let commands = ['lemonade-server -h'];
   
   if (fw === 'oga') {
     if (dev === 'npu') {
@@ -385,6 +387,33 @@ function renderQuickStart() {
     notes += `<div class="lmn-note"><strong>Tip:</strong> To select a backend, use <code>--llamacpp rocm</code> or <code>--llamacpp vulkan</code></div>`;
     if (os === 'linux') {
       notes += `<div class="lmn-note"><strong>Note:</strong> You may need to run <code>sudo update-pciids</code> for GPU detection on Linux.</div>`;
+    }
+  }
+
+  // backend config for docker
+  if (os === 'docker') {  
+    commands = [];
+
+    if (fw === 'llama' && dev === 'gpu') {
+      commands.push(`docker run -d \\
+  --name lemonade-server \\
+  -p 8000:8000 \\
+  -v lemonade-cache:/root/.cache/huggingface \\
+  -v lemonade-llama:/opt/lemonade/llama \\
+  -e LEMONADE_LLAMACPP_BACKEND=vulkan \\
+  ghcr.io/lemonade-sdk/lemonade-server:latest`);      
+      notes = `<div class="lmn-note"><strong>Tip:</strong> To select a specific backend, update the LEMONADE_LLAMACPP_BACKEND environment variable: <code>LEMONADE_LLAMACPP_BACKEND=vulkan</code></div>`;
+    }
+
+    if (fw === 'llama' && dev === 'cpu') {
+      commands.push(`docker run -d \\
+  --name lemonade-server \\
+  -p 8000:8000 \\
+  -v lemonade-cache:/root/.cache/huggingface \\
+  -v lemonade-llama:/opt/lemonade/llama \\
+  -e LEMONADE_LLAMACPP_BACKEND=cpu \\
+  ghcr.io/lemonade-sdk/lemonade-server:latest`);         
+      notes = `<div class="lmn-note"><strong>Tip:</strong> To select a specific backend, update the LEMONADE_LLAMACPP_BACKEND environment variable: <code>LEMONADE_LLAMACPP_BACKEND=cpu</code></div>`;
     }
   }
   
