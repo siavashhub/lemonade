@@ -174,6 +174,8 @@ void LlamaCppServer::install(const std::string& backend) {
     std::string filename;
     std::string expected_version = BackendUtils::get_backend_version(SPEC.recipe, backend);
 
+    std::cout << "[********LlamaCppServerInstall] Backend configured: " << backend << std::endl;   
+
     if (backend == "rocm") {
         // ROCm support from lemonade-sdk/llamacpp-rocm
         repo = "lemonade-sdk/llamacpp-rocm";
@@ -246,6 +248,9 @@ void LlamaCppServer::load(const std::string& model_name,
     bool use_gpu = (llamacpp_backend != "cpu");
 
     // Install llama-server if needed (use per-model backend)
+    std::string target_test_arch = lemon::SystemInfo::get_rocm_arch();
+    std::cout << "[********Arch] ROCM?: " << target_test_arch << std::endl;    
+    std::cout << "[********LlamaCppServerLoad] llamacpp_backend: " << llamacpp_backend << std::endl;    
     install(llamacpp_backend);
 
     // Use pre-resolved GGUF path
@@ -285,7 +290,7 @@ void LlamaCppServer::load(const std::string& model_name,
     push_arg(args, reserved_flags, "--port", std::to_string(port_));
     push_arg(args, reserved_flags, "--jinja", std::vector<std::string>{"--no-jinja"});
 
-    std::cout << "[LlamaCpp] Using backend: " << llamacpp_backend << "\n"
+    std::cout << "[********LlamaCpp] Using backend: " << llamacpp_backend << "\n"
             << "[LlamaCpp] Use GPU: " << (use_gpu ? "true" : "false") << std::endl;
 
     // Add mmproj file if present (for vision models)
