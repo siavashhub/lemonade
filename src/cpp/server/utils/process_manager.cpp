@@ -1,14 +1,31 @@
+// On Windows, set up header guards BEFORE any other includes
+#ifdef _WIN32
+#ifndef _WINSOCKAPI_
+#define _WINSOCKAPI_
+#endif
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <winsock2.h>
+#include <windows.h>
+#include <processenv.h>
+#pragma comment(lib, "ws2_32.lib")
+#endif
+
 #include <lemon/utils/process_manager.h>
 #include <stdexcept>
 #include <iostream>
 #include <thread>
 #include <chrono>
 #include <string>
+#include <cstring>
+#include <algorithm>
+#include <cctype>
+#include <lemon/utils/aixlog.hpp>
 
 #ifdef _WIN32
-#include <winsock2.h>
-#include <windows.h>
-#pragma comment(lib, "ws2_32.lib")
+#ifdef ERROR
+#undef ERROR
+#endif
 #else
 #include <unistd.h>
 #include <sys/types.h>
@@ -19,6 +36,12 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <errno.h>
+#ifdef __linux__
+#include <sys/prctl.h>  // PR_SET_PDEATHSIG — kill child when parent dies
+#endif
+#ifdef HAVE_LIBCAP
+#include <sys/capability.h>
+#endif
 #endif
 
 namespace lemon {
@@ -33,7 +56,92 @@ static bool should_filter_line(const std::string& line) {
             line.find("Enter 'exit' to stop the server") != std::string::npos);
 }
 
+static bool is_error_line(const std::string& line) {
+    std::string lowered = line;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return lowered.find("error") != std::string::npos;
+}
+
+static void log_process_line(const std::string& line) {
+    if (should_filter_line(line)) {
+        return;
+    }
+
+    if (is_error_line(line)) {
+        LOG(ERROR, "Process") << line << std::endl;
+    } else {
+        LOG(INFO, "Process") << line << std::endl;
+    }
+}
+
+#ifdef HAVE_LIBCAP
+// Helper function to preserve capabilities across exec()
+// This allows child processes to inherit CAP_SYS_RESOURCE and other capabilities
+// from the parent process when available
+static void preserve_capabilities_for_exec() {
+    // Get the current process capabilities
+    cap_t caps = cap_get_proc();
+    if (!caps) {
+        // If we can't get capabilities, just proceed without them
+        // This is not a fatal error - the process will run with default permissions
+        return;
+    }
+
+    // Check if we have any effective capabilities worth preserving
+    cap_flag_value_t has_sys_resource = CAP_CLEAR;
+    cap_get_flag(caps, CAP_SYS_RESOURCE, CAP_EFFECTIVE, &has_sys_resource);
+
+    // Only proceed if we actually have CAP_SYS_RESOURCE or other useful caps
+    if (has_sys_resource == CAP_SET) {
+        // Set the capability as inheritable so it survives exec()
+        cap_value_t cap_list[] = {CAP_SYS_RESOURCE};
+
+        // Mark CAP_SYS_RESOURCE as inheritable
+        if (cap_set_flag(caps, CAP_INHERITABLE, 1, cap_list, CAP_SET) == 0) {
+            // Apply the modified capability set
+            if (cap_set_proc(caps) == 0) {
+                // Enable ambient capabilities (requires Linux 4.3+)
+                // This ensures the capability is both inherited and effective in the child
+                // Ignore errors as ambient caps might not be supported on older kernels
+                prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_SYS_RESOURCE, 0, 0);
+            }
+        }
+    }
+
+    cap_free(caps);
+}
+#endif
+
 #ifdef _WIN32
+// Helper function to escape arguments for Windows command line
+// Windows command-line parsing rules:
+// - Arguments are separated by spaces (or tabs)
+// - Double quotes can be used to include spaces in arguments
+// - To include a double quote in an argument, escape it with a backslash
+// - Backslashes before a double quote are also escaped
+static std::string escape_windows_arg(const std::string& arg) {
+    std::string result = "\"";
+    for (size_t i = 0; i < arg.size(); ++i) {
+        if (arg[i] == '"') {
+            // Escape the quote with a backslash
+            result += "\\\"";
+        } else if (arg[i] == '\\') {
+            // Check if this backslash is followed by a quote
+            // If so, we need to escape the backslash too
+            if (i + 1 < arg.size() && arg[i + 1] == '"') {
+                result += "\\\\";
+            } else {
+                result += '\\';
+            }
+        } else {
+            result += arg[i];
+        }
+    }
+    result += "\"";
+    return result;
+}
+
 // Thread function to read from pipe and filter output
 static DWORD WINAPI output_filter_thread(LPVOID param) {
     HANDLE pipe = static_cast<HANDLE>(param);
@@ -51,20 +159,74 @@ static DWORD WINAPI output_filter_thread(LPVOID param) {
             std::string line = line_buffer.substr(0, pos);
             line_buffer = line_buffer.substr(pos + 1);
 
-            // Only print if not a health check line
-            if (!should_filter_line(line)) {
-                std::cout << line << std::endl;
-            }
+            log_process_line(line);
         }
     }
 
     // Print any remaining partial line
-    if (!line_buffer.empty() && !should_filter_line(line_buffer)) {
-        std::cout << line_buffer << std::endl;
+    if (!line_buffer.empty()) {
+        log_process_line(line_buffer);
     }
 
     CloseHandle(pipe);
     return 0;
+}
+
+static std::string lowercase_ascii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+static std::vector<char> build_windows_environment_block(
+    const std::vector<std::pair<std::string, std::string>>& env_vars) {
+    std::vector<std::string> merged_entries;
+
+    LPWCH environment = GetEnvironmentStringsW();
+    if (environment) {
+        for (const wchar_t* entry = environment; *entry != L'\0';
+             entry += std::wcslen(entry) + 1) {
+            int size_needed = WideCharToMultiByte(CP_UTF8, 0, entry, -1, nullptr, 0, nullptr, nullptr);
+            if (size_needed > 0) {
+                std::string narrow(size_needed - 1, '\0');
+                WideCharToMultiByte(CP_UTF8, 0, entry, -1, &narrow[0], size_needed, nullptr, nullptr);
+                merged_entries.emplace_back(std::move(narrow));
+            }
+        }
+        FreeEnvironmentStringsW(environment);
+    }
+
+    for (const auto& env : env_vars) {
+        const std::string key_lower = lowercase_ascii(env.first);
+        const std::string new_entry = env.first + "=" + env.second;
+
+        bool replaced = false;
+        for (auto& existing : merged_entries) {
+            size_t equals = existing.find('=');
+            if (equals == std::string::npos) {
+                continue;
+            }
+
+            std::string existing_key = lowercase_ascii(existing.substr(0, equals));
+            if (existing_key == key_lower) {
+                existing = new_entry;
+                replaced = true;
+                break;
+            }
+        }
+
+        if (!replaced) {
+            merged_entries.push_back(new_entry);
+        }
+    }
+
+    std::vector<char> block;
+    for (const auto& entry : merged_entries) {
+        block.insert(block.end(), entry.begin(), entry.end());
+        block.push_back('\0');
+    }
+    block.push_back('\0');
+    return block;
 }
 #endif
 
@@ -82,9 +244,9 @@ ProcessHandle ProcessManager::start_process(
 
 #ifdef _WIN32
     // Windows implementation
-    std::string cmdline = "\"" + executable + "\"";
+    std::string cmdline = escape_windows_arg(executable);
     for (const auto& arg : args) {
-        cmdline += " \"" + arg + "\"";
+        cmdline += " " + escape_windows_arg(arg);
     }
 
     STARTUPINFOA si;
@@ -124,16 +286,31 @@ ProcessHandle ProcessManager::start_process(
         si.hStdOutput = stdout_write;
         si.hStdError = stderr_write;
 
-        std::cout << "[ProcessManager] Starting process with filtered output: " << cmdline << std::endl;
+        LOG(DEBUG, "ProcessManager") << "Starting process with filtered output: " << cmdline << std::endl;
     } else if (inherit_output) {
         // Direct inheritance without filtering
         si.dwFlags |= STARTF_USESTDHANDLES;
         si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
         si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
         si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-        std::cout << "[ProcessManager] Starting process with inherited output: " << cmdline << std::endl;
+        LOG(DEBUG, "ProcessManager") << "Starting process with inherited output: " << cmdline << std::endl;
     } else {
-        std::cout << "[ProcessManager] Starting process: " << cmdline << std::endl;
+        // Redirect to NUL to suppress output when not in debug mode
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+        HANDLE hNul = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hNul != INVALID_HANDLE_VALUE) {
+            // Ensure the NUL handle is inheritable
+            SetHandleInformation(hNul, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            si.hStdOutput = hNul;
+            si.hStdError = hNul;
+        }
+    }
+
+    std::vector<char> environment_block;
+    if (!env_vars.empty()) {
+        environment_block = build_windows_environment_block(env_vars);
     }
 
     BOOL success = CreateProcessA(
@@ -143,11 +320,16 @@ ProcessHandle ProcessManager::start_process(
         nullptr,
         TRUE,  // Inherit handles
         (inherit_output && !filter_health_logs) ? 0 : CREATE_NO_WINDOW,
-        nullptr,
+        environment_block.empty() ? nullptr : environment_block.data(),
         working_dir.empty() ? nullptr : working_dir.c_str(),
         &si,
         &pi
     );
+
+    // If we opened a NUL handle, we can close it now (the child process has its own inherited handle)
+    if (!inherit_output && si.hStdOutput != nullptr && si.hStdOutput != INVALID_HANDLE_VALUE) {
+        CloseHandle(si.hStdOutput);
+    }
 
     if (!success) {
         DWORD error = GetLastError();
@@ -169,7 +351,7 @@ ProcessHandle ProcessManager::start_process(
 
         std::string full_error = "Failed to start process '" + executable +
                                 "': " + error_msg + " (Error code: " + std::to_string(error) + ")";
-        std::cerr << "[ProcessManager ERROR] " << full_error << std::endl;
+        LOG(ERROR, "ProcessManager") << full_error << std::endl;
         throw std::runtime_error(full_error);
     }
 
@@ -183,7 +365,9 @@ ProcessHandle ProcessManager::start_process(
         CreateThread(nullptr, 0, output_filter_thread, stderr_read, 0, nullptr);
     }
 
-    std::cout << "[ProcessManager] Process started successfully, PID: " << pi.dwProcessId << std::endl;
+    if (inherit_output) {
+        LOG(INFO, "ProcessManager") << "Process started successfully, PID: " << pi.dwProcessId << std::endl;
+    }
 
     handle.handle = pi.hProcess;
     handle.pid = pi.dwProcessId;
@@ -201,6 +385,18 @@ ProcessHandle ProcessManager::start_process(
         }
     }
 
+    if (inherit_output) {
+        std::string cmdline = executable;
+        for (const auto& arg : args) {
+            cmdline += " " + arg;
+        }
+        if (filter_health_logs) {
+            LOG(DEBUG, "ProcessManager") << "Starting process with filtered output: " << cmdline << std::endl;
+        } else {
+            LOG(DEBUG, "ProcessManager") << "Starting process with inherited output: " << cmdline << std::endl;
+        }
+    }
+
     pid_t pid = fork();
 
     if (pid < 0) {
@@ -209,6 +405,14 @@ ProcessHandle ProcessManager::start_process(
 
     if (pid == 0) {
         // Child process
+#ifdef __linux__
+        // Ensure this child is killed when the parent process dies.
+        // This is the Linux equivalent of the Windows Job Object and
+        // prevents orphaned backend processes (llama-server, etc.)
+        // when lemond is killed or crashes.
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+#endif
+
         if (!working_dir.empty()) {
             chdir(working_dir.c_str());
         }
@@ -226,7 +430,21 @@ ProcessHandle ProcessManager::start_process(
             dup2(stderr_pipe[1], STDERR_FILENO);
             close(stdout_pipe[1]);
             close(stderr_pipe[1]);
+        } else if (!inherit_output) {
+            // Redirect to /dev/null to suppress output when not in debug mode
+            int dev_null = open("/dev/null", O_WRONLY);
+            if (dev_null >= 0) {
+                dup2(dev_null, STDOUT_FILENO);
+                dup2(dev_null, STDERR_FILENO);
+                close(dev_null);
+            }
         }
+
+#ifdef HAVE_LIBCAP
+        // Preserve capabilities (e.g., CAP_SYS_RESOURCE) across exec
+        // This allows the child process to inherit capabilities from the parent
+        preserve_capabilities_for_exec();
+#endif
 
         // Prepare argv
         std::vector<char*> argv_ptrs;
@@ -240,11 +458,15 @@ ProcessHandle ProcessManager::start_process(
 
         // If execvp returns, it failed
         std::cerr << "Failed to execute: " << executable << std::endl;
-        exit(1);
+        _exit(1);
     }
 
     // Parent process
     handle.pid = pid;
+
+    if (inherit_output) {
+        LOG(INFO, "ProcessManager") << "Process started successfully, PID: " << pid << std::endl;
+    }
 
     // Start filter threads if needed
     if (inherit_output && filter_health_logs) {
@@ -266,14 +488,12 @@ ProcessHandle ProcessManager::start_process(
                     std::string line = line_buffer.substr(0, pos);
                     line_buffer = line_buffer.substr(pos + 1);
 
-                    if (!should_filter_line(line)) {
-                        std::cout << line << std::endl;
-                    }
+                    log_process_line(line);
                 }
             }
 
-            if (!line_buffer.empty() && !should_filter_line(line_buffer)) {
-                std::cout << line_buffer << std::endl;
+            if (!line_buffer.empty()) {
+                log_process_line(line_buffer);
             }
 
             close(fd);
@@ -293,14 +513,12 @@ ProcessHandle ProcessManager::start_process(
                     std::string line = line_buffer.substr(0, pos);
                     line_buffer = line_buffer.substr(pos + 1);
 
-                    if (!should_filter_line(line)) {
-                        std::cerr << line << std::endl;
-                    }
+                    log_process_line(line);
                 }
             }
 
-            if (!line_buffer.empty() && !should_filter_line(line_buffer)) {
-                std::cerr << line_buffer << std::endl;
+            if (!line_buffer.empty()) {
+                log_process_line(line_buffer);
             }
 
             close(fd);
@@ -336,7 +554,7 @@ void ProcessManager::stop_process(ProcessHandle handle) {
 
         if (!exited_gracefully) {
             // If still alive, force kill
-            std::cerr << "[ProcessManager WARNING] Process did not respond to SIGTERM, using SIGKILL" << std::endl;
+            LOG(WARNING, "ProcessManager") << "Process did not respond to SIGTERM, using SIGKILL" << std::endl;
             kill(handle.pid, SIGKILL);
             waitpid(handle.pid, &status, 0);
         }
@@ -346,7 +564,7 @@ void ProcessManager::stop_process(ProcessHandle handle) {
         // Without this delay, rapid restarts cause the new process to hang waiting
         // for GPU resources that are still being cleaned up.
         // This matches the Python test behavior which has a 5s delay after server start.
-        std::cout << "[ProcessManager] Process terminated, waiting for GPU driver cleanup..." << std::endl;
+        LOG(INFO, "ProcessManager") << "Process terminated, waiting for GPU driver cleanup..." << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(2));
     }
 #endif
@@ -465,9 +683,9 @@ int ProcessManager::run_process_with_output(
 
 #ifdef _WIN32
     // Windows implementation
-    std::string cmdline = "\"" + executable + "\"";
+    std::string cmdline = escape_windows_arg(executable);
     for (const auto& arg : args) {
-        cmdline += " \"" + arg + "\"";
+        cmdline += " " + escape_windows_arg(arg);
     }
 
     // Create pipes for stdout
@@ -653,6 +871,9 @@ int ProcessManager::run_process_with_output(
 
     if (pid == 0) {
         // Child process
+#ifdef __linux__
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+#endif
         close(stdout_pipe[0]);  // Close read end
 
         // Redirect stdout and stderr to pipe
@@ -663,6 +884,11 @@ int ProcessManager::run_process_with_output(
         if (!working_dir.empty()) {
             chdir(working_dir.c_str());
         }
+
+#ifdef HAVE_LIBCAP
+        // Preserve capabilities (e.g., CAP_SYS_RESOURCE) across exec
+        preserve_capabilities_for_exec();
+#endif
 
         // Prepare argv
         std::vector<char*> argv_ptrs;
@@ -854,6 +1080,75 @@ int ProcessManager::find_free_port(int start_port) {
 #endif
 
     return -1;  // No free port found
+}
+
+int ProcessManager::run_command(const std::string& command, std::string& output, int timeout_seconds) {
+    output.clear();
+
+#ifdef _WIN32
+    // Windows: use CreateProcess + pipe to avoid console window flash.
+    // This is a drop-in replacement for _popen() that works in SUBSYSTEM:WINDOWS apps.
+    HANDLE stdout_read = nullptr;
+    HANDLE stdout_write = nullptr;
+
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = nullptr;
+
+    if (!CreatePipe(&stdout_read, &stdout_write, &sa, 0)) {
+        return -1;
+    }
+    SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = INVALID_HANDLE_VALUE;
+    si.hStdOutput = stdout_write;
+    si.hStdError = stdout_write;
+
+    PROCESS_INFORMATION pi = {};
+    // Wrap in cmd /c so shell features (redirection, pipes) work
+    std::string cmdline = "cmd /c " + command;
+    BOOL success = CreateProcessA(
+        nullptr, const_cast<char*>(cmdline.c_str()),
+        nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+        nullptr, nullptr, &si, &pi);
+
+    CloseHandle(stdout_write);
+
+    if (!success) {
+        CloseHandle(stdout_read);
+        return -1;
+    }
+
+    // Read all output
+    char buf[4096];
+    DWORD bytes_read;
+    while (ReadFile(stdout_read, buf, sizeof(buf), &bytes_read, nullptr) && bytes_read > 0) {
+        output.append(buf, bytes_read);
+    }
+    CloseHandle(stdout_read);
+
+    WaitForSingleObject(pi.hProcess, timeout_seconds > 0 ? timeout_seconds * 1000 : INFINITE);
+    DWORD exit_code = 1;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    return static_cast<int>(exit_code);
+#else
+    // Unix: popen is fine — no console window issue
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) return -1;
+
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), pipe)) {
+        output += buf;
+    }
+    return pclose(pipe);
+#endif
 }
 
 } // namespace utils

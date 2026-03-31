@@ -11,24 +11,23 @@ namespace backends {
 
 class KokoroServer : public WrappedServer, public ITextToSpeechServer {
 public:
+    static InstallParams get_install_params(const std::string& backend, const std::string& version);
+
     inline static const BackendSpec SPEC = BackendSpec(
-        // recipe
             "kokoro",
-        // executable
     #ifdef _WIN32
             "koko.exe"
     #else
             "koko"
     #endif
+        , get_install_params
     );
 
     explicit KokoroServer(const std::string& log_level,
-                          ModelManager* model_manager);
+                          ModelManager* model_manager,
+                          BackendManager* backend_manager);
 
     ~KokoroServer() override;
-
-    // WrappedServer interface
-    void install(const std::string& backend) override;
 
     void load(const std::string& model_name,
              const ModelInfo& model_info,

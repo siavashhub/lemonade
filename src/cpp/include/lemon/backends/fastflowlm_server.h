@@ -1,18 +1,31 @@
 #pragma once
 
 #include "../wrapped_server.h"
+#include "backend_utils.h"
 #include <string>
 
 namespace lemon {
 namespace backends {
 
-class FastFlowLMServer : public WrappedServer, public IEmbeddingsServer, public IRerankingServer {
+class FastFlowLMServer : public WrappedServer, public IEmbeddingsServer, public IRerankingServer, public IAudioServer {
 public:
-    FastFlowLMServer(const std::string& log_level = "info", ModelManager* model_manager = nullptr);
+    inline static const BackendSpec SPEC = BackendSpec(
+        // recipe
+            "flm",
+        // executable
+    #ifdef _WIN32
+            "flm.exe"
+    #else
+            "flm"
+    #endif
+    );
+
+    FastFlowLMServer(const std::string& log_level, ModelManager* model_manager = nullptr,
+                     BackendManager* backend_manager = nullptr);
 
     ~FastFlowLMServer() override;
 
-    void install(const std::string& backend = "") override;
+    void install(const std::string& backend = "");
 
     std::string download_model(const std::string& checkpoint,
                               bool do_not_upgrade = false);
@@ -35,6 +48,9 @@ public:
     // IRerankingServer implementation
     json reranking(const json& request) override;
 
+    // IAudioServer implementation
+    json audio_transcriptions(const json& request) override;
+
     // FLM uses /api/tags for readiness check instead of /health
     bool wait_for_ready();
 
@@ -42,38 +58,24 @@ public:
     void forward_streaming_request(const std::string& endpoint,
                                    const std::string& request_body,
                                    httplib::DataSink& sink,
-                                   bool sse = true) override;
+                                   bool sse = true,
+                                   long timeout_seconds = 0) override;
 
 private:
-    // Existing methods
-    std::string get_flm_path();
-    bool check_npu_available();
+    // Static helpers for install logic (no instance state needed)
+    static std::string get_flm_path();
 
     // Version management
-    std::string get_flm_required_version();  // Get required version from backend_versions.json
-    std::string get_flm_installed_version(); // Get currently installed version (empty if not installed)
-    bool compare_versions(const std::string& v1, const std::string& v2); // true if v1 >= v2
-
-    // NPU driver check
-    std::string get_min_npu_driver_version();  // Get minimum driver version from backend_versions.json
-    std::string get_npu_driver_version();      // Get current NPU driver version via WMI
-    bool check_npu_driver_version();           // Check if NPU driver meets minimum requirements
+    static std::string get_flm_required_version();
 
     // Installation - returns true if FLM was upgraded (may invalidate existing models)
-    bool install_flm_if_needed();
-    bool download_flm_installer(const std::string& output_path);
-    void run_flm_installer(const std::string& installer_path, bool silent);
+    static bool install_flm_if_needed();
+    static bool download_flm_installer(const std::string& output_path);
+    static void run_flm_installer(const std::string& installer_path, bool silent);
 
     // Environment management
-    void refresh_environment_path();
-    bool verify_flm_installation(const std::string& expected_version, int max_retries = 10);
-
-    // Cache for installed version (to avoid repeated calls to flm --version)
-    mutable std::string cached_installed_version_;
-    void invalidate_version_cache();  // Call after installation to force re-check
-
-    // Track whether FLM was upgraded during install() - used to detect model invalidation
-    bool flm_was_upgraded_ = false;
+    static void refresh_environment_path();
+    static bool verify_flm_installation(const std::string& expected_version, int max_retries = 10);
 
     bool is_loaded_ = false;
 };

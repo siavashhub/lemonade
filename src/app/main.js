@@ -1,10 +1,18 @@
-const { app, BrowserWindow, ipcMain, shell, session, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, session, screen, webFrameMain, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { spawn, spawnSync } = require('child_process');
 const strict = require('assert/strict');
 const dgram = require('dgram');
+
+// Register lemonade:// protocol handler for deep linking from tray/CLI
+if (process.defaultApp) {
+  // Dev mode: need to pass the script path
+  app.setAsDefaultProtocolClient('lemonade', process.execPath, [path.resolve(process.argv[1])]);
+} else {
+  app.setAsDefaultProtocolClient('lemonade');
+}
 
 const DEFAULT_MIN_WIDTH = 400;
 const DEFAULT_MIN_HEIGHT = 600;
@@ -94,6 +102,34 @@ const getHomeDirectory = () => {
     return os.homedir();
   }
   return process.env.HOME || process.env.USERPROFILE || '';
+};
+
+const getLocalInterfaceAddresses = () => {
+  const interfaces = os.networkInterfaces ? os.networkInterfaces() : {};
+  const localAddresses = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+
+  Object.values(interfaces || {}).forEach((entries) => {
+    if (!Array.isArray(entries)) {
+      return;
+    }
+    entries.forEach((entry) => {
+      if (entry && typeof entry.address === 'string') {
+        localAddresses.add(entry.address);
+      }
+    });
+  });
+
+  return localAddresses;
+};
+
+const isBeaconFromLocalMachine = (address) => {
+  if (!address || typeof address !== 'string') {
+    return false;
+  }
+
+  const normalized = address.replace(/^::ffff:/, '');
+  const localAddresses = getLocalInterfaceAddresses();
+  return localAddresses.has(address) || localAddresses.has(normalized);
 };
 
 const getCacheDirectory = () => {
@@ -493,13 +529,20 @@ const discoverServerPort = () => {
         cleanup();
         if (!discovered) {
           discovered = true;
-          console.log('Falling back to default port due to socket error');
-          resolve(DEFAULT_PORT);
+          const fallbackPort = cachedServerPort || DEFAULT_PORT;
+          console.log(`Falling back to cached port due to socket error: ${fallbackPort}`);
+          resolve(fallbackPort);
         }
       });
 
       socket.on('message', (msg, rinfo) => {
         if (discovered) return;
+
+        // Ignore beacons from other machines. We only derive localhost port
+        // in discovery mode, so remote beacons can cause invalid localhost targets.
+        if (!isBeaconFromLocalMachine(rinfo?.address)) {
+          return;
+        }
 
         try {
           const payload = JSON.parse(msg.toString());
@@ -536,8 +579,9 @@ const discoverServerPort = () => {
         if (!discovered) {
           discovered = true;
           cleanup();
-          console.log('UDP discovery timeout, falling back to default port');
-          resolve(DEFAULT_PORT);
+          const fallbackPort = cachedServerPort || DEFAULT_PORT;
+          console.log(`UDP discovery timeout, falling back to cached port: ${fallbackPort}`);
+          resolve(fallbackPort);
         }
       }, DISCOVERY_TIMEOUT_MS);
 
@@ -549,12 +593,102 @@ const discoverServerPort = () => {
         cleanup();
         if (!discovered) {
           discovered = true;
-          resolve(DEFAULT_PORT);
+          resolve(cachedServerPort || DEFAULT_PORT);
         }
       }
     });
   });
 };
+
+/**
+ * Background beacon listener that continuously monitors for lemonade server
+ * UDP beacons on localhost. When a beacon is received with a different port
+ * than the currently cached port, it updates the cached port and broadcasts
+ * the change to all renderer windows.
+ */
+let beaconSocket = null;
+
+const startBeaconListener = async () => {
+  const BEACON_PORT = 8000;
+
+  // Don't listen if an explicit base URL is configured
+  const baseURL = await getBaseURLFromConfig();
+  if (baseURL) {
+    console.log('Beacon listener skipped - using explicit server URL:', baseURL);
+    return;
+  }
+
+  if (beaconSocket) {
+    return; // Already listening
+  }
+
+  const socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+  beaconSocket = socket;
+
+  socket.on('error', (err) => {
+    console.error('Beacon listener socket error:', err);
+    try { socket.close(); } catch (e) { /* ignore */ }
+    beaconSocket = null;
+
+    // Retry after 10 seconds
+    setTimeout(() => startBeaconListener(), 10000);
+  });
+
+  socket.on('message', (msg, rinfo) => {
+    try {
+      if (!isBeaconFromLocalMachine(rinfo?.address)) {
+        return;
+      }
+
+      const payload = JSON.parse(msg.toString());
+
+      if (payload.service === 'lemonade' && payload.url) {
+        const urlMatch = payload.url.match(/:(\d+)\//);
+        if (urlMatch && urlMatch[1]) {
+          const port = parseInt(urlMatch[1], 10);
+          if (!isNaN(port) && port > 0 && port < 65536 && port !== cachedServerPort) {
+            console.log(`Beacon listener detected server port change: ${cachedServerPort} -> ${port}`);
+            cachedServerPort = port;
+            broadcastServerPortUpdated(port);
+          }
+        }
+      }
+    } catch (e) {
+      // Not a valid JSON beacon, ignore
+    }
+  });
+
+  socket.on('listening', () => {
+    const address = socket.address();
+    console.log(`Beacon listener started on ${address.address}:${address.port}`);
+  });
+
+  try {
+    socket.bind(BEACON_PORT);
+  } catch (bindError) {
+    console.error('Failed to bind beacon listener socket:', bindError);
+    beaconSocket = null;
+
+    // Retry after 10 seconds
+    setTimeout(() => startBeaconListener(), 10000);
+  }
+};
+
+// Renderer signals that React has mounted and IPC listeners are active.
+// Deliver any pending lemonade:// protocol navigation now.
+ipcMain.on('renderer-ready', () => {
+  rendererReady = true;
+  if (pendingProtocolNav && Object.keys(pendingProtocolNav).length > 0) {
+    if (mainWindow && mainWindow.webContents) {
+      mainWindow.webContents.send('navigate', pendingProtocolNav);
+    }
+    pendingProtocolNav = null;
+  }
+});
+
+ipcMain.handle('write-clipboard', (_event, text) => {
+  clipboard.writeText(String(text));
+});
 
 // Returns the configured server base URL, or null if using localhost discovery
 ipcMain.handle('get-server-base-url', async () => {
@@ -617,6 +751,7 @@ ipcMain.handle('get-system-stats', async () => {
         memory_gb: data.memory_gb || 0,
         gpu_percent: data.gpu_percent,
         vram_gb: data.vram_gb,
+        npu_percent: data.npu_percent,
       };
     }
   } catch (error) {
@@ -629,6 +764,7 @@ ipcMain.handle('get-system-stats', async () => {
     memory_gb: 0,
     gpu_percent: null,
     vram_gb: null,
+    npu_percent: null,
   };
 });
 
@@ -781,11 +917,59 @@ function createWindow() {
 
   mainWindow.loadFile(htmlPath);
 
+  // Pending lemonade:// navigation is delivered when the renderer signals ready
+  // via the 'renderer-ready' IPC (see ipcMain.on below), not on did-finish-load,
+  // because React effects haven't registered their listeners at that point.
+
   // Open all external links in the default browser
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     // Open in external browser instead of new Electron window
     shell.openExternal(url);
     return { action: 'deny' }; // Prevent Electron from opening a new window
+  });
+
+  const isHttpUrl = (value) => {
+    try {
+      const parsed = new URL(value);
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    } catch {
+      return false;
+    }
+  };
+
+  // Intercept all anchor clicks inside loaded iframe pages and route them through
+  // window.open so Electron's setWindowOpenHandler opens them in the system browser.
+  const injectIframeLinkInterceptor = (frame) => {
+    if (!frame || !isHttpUrl(frame.url) || frame === mainWindow.webContents.mainFrame) {
+      return;
+    }
+
+    frame.executeJavaScript(`
+      (() => {
+        if (window.__lemonadeExternalLinkInterceptorInstalled) return;
+        window.__lemonadeExternalLinkInterceptorInstalled = true;
+
+        document.addEventListener('click', (event) => {
+          const element = event.target && event.target.closest ? event.target.closest('a[href]') : null;
+          if (!element) return;
+
+          const href = element.href || element.getAttribute('href') || '';
+          if (!/^https?:\\/\\//i.test(href)) return;
+
+          event.preventDefault();
+          event.stopPropagation();
+          window.open(href, '_blank', 'noopener,noreferrer');
+        }, true);
+      })();
+    `).catch(() => {});
+  };
+
+  mainWindow.webContents.on('did-frame-finish-load', (_event, isMainFrame, frameProcessId, frameRoutingId) => {
+    if (isMainFrame) {
+      return;
+    }
+    const frame = webFrameMain.fromId(frameProcessId, frameRoutingId);
+    injectIframeLinkInterceptor(frame);
   });
 
   // Open DevTools in development mode
@@ -804,13 +988,83 @@ function createWindow() {
 
   mainWindow.on('closed', function () {
     mainWindow = null;
+    rendererReady = false;
   });
 }
 
 
+// Pending protocol navigation — stored when URL arrives before renderer is ready
+let pendingProtocolNav = null;
+let rendererReady = false;
+
+function handleProtocolUrl(url) {
+  if (!url || !url.startsWith('lemonade://')) return;
+
+  try {
+    // Parse: lemonade://open?view=logs&model=foo
+    const parsed = new URL(url);
+    const view = parsed.searchParams.get('view');
+    const model = parsed.searchParams.get('model');
+
+    const navData = {};
+    if (view) navData.view = view;
+    if (model) navData.model = model;
+
+    // Focus the window
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    }
+
+    // If renderer isn't ready yet, queue it for delivery after load
+    if (!rendererReady || !mainWindow || !mainWindow.webContents) {
+      pendingProtocolNav = navData;
+      return;
+    }
+
+    if (Object.keys(navData).length > 0) {
+      mainWindow.webContents.send('navigate', navData);
+    }
+  } catch (e) {
+    console.error('Failed to parse protocol URL:', url, e);
+  }
+}
+
+const gotTheLock = app.requestSingleInstanceLock();
+
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on('second-instance', (event, commandLine, workingDirectory) => {
+    // Someone tried to run a second instance -- focus existing window
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+    // On Windows, the protocol URL is in commandLine
+    const url = commandLine.find(arg => arg.startsWith('lemonade://'));
+    if (url) {
+      handleProtocolUrl(url);
+    }
+  });
+}
+
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  handleProtocolUrl(url);
+});
+
 app.on('ready', () => {
   ensureTrayRunning();
+  startBeaconListener();
   createWindow();
+
+  // Handle protocol URL from initial launch (Windows/Linux)
+  const protocolUrl = process.argv.find(arg => arg.startsWith('lemonade://'));
+  if (protocolUrl) {
+    handleProtocolUrl(protocolUrl);
+  }
 
   // Allow microphone access for streaming audio transcription.
   // Only 'media' is auto-approved; all other permissions use Electron's default (deny).
@@ -857,6 +1111,13 @@ app.on('ready', () => {
 app.on('window-all-closed', function () {
   if (process.platform !== 'darwin') {
     app.quit();
+  }
+});
+
+app.on('will-quit', () => {
+  if (beaconSocket) {
+    try { beaconSocket.close(); } catch (e) { /* ignore */ }
+    beaconSocket = null;
   }
 });
 

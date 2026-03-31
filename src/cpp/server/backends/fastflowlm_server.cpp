@@ -1,16 +1,18 @@
 #include "lemon/backends/fastflowlm_server.h"
+#include "lemon/system_info.h"
+#include "lemon/error_types.h"
 #include "lemon/utils/process_manager.h"
 #include "lemon/utils/http_client.h"
 #include "lemon/utils/path_utils.h"
+#include "lemon/utils/version_utils.h"
 #include "lemon/utils/json_utils.h"
-#include "lemon/error_types.h"
 #include <iostream>
 #include <filesystem>
-#include <fstream>
 #include <cstdlib>
 #include <thread>
 #include <chrono>
 #include <sstream>
+#include <lemon/utils/aixlog.hpp>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -24,15 +26,16 @@
 #endif
 
 // URL to direct users to for driver updates
-static const std::string DRIVER_INSTALL_URL = "https://lemonade-server.ai/driver_install";
+static const std::string DRIVER_INSTALL_URL = "https://lemonade-server.ai/driver_install.html";
 
 namespace fs = std::filesystem;
 
 namespace lemon {
 namespace backends {
 
-FastFlowLMServer::FastFlowLMServer(const std::string& log_level, ModelManager* model_manager)
-    : WrappedServer("FastFlowLM", log_level, model_manager) {
+FastFlowLMServer::FastFlowLMServer(const std::string& log_level, ModelManager* model_manager,
+                                   BackendManager* backend_manager)
+    : WrappedServer("FastFlowLM", log_level, model_manager, backend_manager) {
 }
 
 FastFlowLMServer::~FastFlowLMServer() {
@@ -40,20 +43,16 @@ FastFlowLMServer::~FastFlowLMServer() {
 }
 
 void FastFlowLMServer::install(const std::string& backend) {
-    std::cout << "[FastFlowLM] Checking FLM installation..." << std::endl;
-
-    // Reset upgrade tracking
-    flm_was_upgraded_ = false;
-
-    // Check NPU driver version first
-    if (!check_npu_driver_version()) {
-        throw std::runtime_error("NPU driver version check failed - please update your driver");
-    }
+#ifndef _WIN32
+    auto status = SystemInfoCache::get_flm_status();
+    throw std::runtime_error(
+        "Visit the documentation for installation instructions. " +
+        std::string(status.action.empty() ? "" : status.action));
+#else
+    LOG(INFO, "FastFlowLM") << "[FastFlowLM] Checking FLM installation..." << std::endl;
 
     try {
-        // Install FLM if needed (uses version from backend_versions.json)
-        // Returns true if FLM was installed or upgraded
-        flm_was_upgraded_ = install_flm_if_needed();
+        install_flm_if_needed();
 
         // Verify flm is now available
         std::string flm_path = get_flm_path();
@@ -61,30 +60,26 @@ void FastFlowLMServer::install(const std::string& backend) {
             throw std::runtime_error("FLM installation failed - not found in PATH");
         }
 
-        std::cout << "[FastFlowLM] FLM ready at: " << flm_path << std::endl;
+        LOG(INFO, "FastFlowLM") << "FLM ready at: " << flm_path << std::endl;
+
+        // Signal system-info to re-evaluate FLM status
+        SystemInfoCache::invalidate_recipes();
 
     } catch (const std::exception& e) {
         // Fallback: show manual installation instructions
         std::string required_version = get_flm_required_version();
-        std::cerr << "\n" << std::string(70, '=') << std::endl;
-        std::cerr << "ERROR: FLM installation failed: " << e.what() << std::endl;
-        std::cerr << std::string(70, '=') << std::endl;
-        std::cerr << "\nPlease install FLM " << required_version << " manually:" << std::endl;
-        std::cerr << "  https://github.com/FastFlowLM/FastFlowLM/releases/download/"
+        LOG(ERROR, "FastFlowLM") << "FLM installation failed: " << e.what() << std::endl;
+        LOG(ERROR, "FastFlowLM") << "Please install FLM " << required_version << " manually:" << std::endl;
+        LOG(ERROR, "FastFlowLM") << "  https://github.com/FastFlowLM/FastFlowLM/releases/download/"
                   << required_version << "/flm-setup.exe" << std::endl;
-        std::cerr << "\nAfter installation, restart your terminal and try again." << std::endl;
-        std::cerr << std::string(70, '=') << std::endl << std::endl;
+        LOG(ERROR, "FastFlowLM") << "After installation, restart your terminal and try again." << std::endl;
         throw;
     }
+#endif
 }
 
 std::string FastFlowLMServer::download_model(const std::string& checkpoint, bool do_not_upgrade) {
-    std::cout << "[FastFlowLM] Pulling model with FLM: " << checkpoint << std::endl;
-
-    // Check NPU driver version before pulling models
-    if (!check_npu_driver_version()) {
-        throw std::runtime_error("NPU driver version check failed - please update your driver before pulling FLM models");
-    }
+    LOG(INFO, "FastFlowLM") << "Pulling model with FLM: " << checkpoint << std::endl;
 
     // Use flm pull command to download the model
     std::string flm_path = get_flm_path();
@@ -97,11 +92,11 @@ std::string FastFlowLMServer::download_model(const std::string& checkpoint, bool
         args.push_back("--force");
     }
 
-    std::cout << "[ProcessManager] Starting process: \"" << flm_path << "\"";
+    LOG(INFO, "ProcessManager") << "Starting process: \"" << flm_path << "\"";
     for (const auto& arg : args) {
-        std::cout << " \"" << arg << "\"";
+        LOG(INFO, "ProcessManager") << " \"" << arg << "\"";
     }
-    std::cout << std::endl;
+    LOG(INFO, "ProcessManager") << std::endl;
 
     // Run flm pull command (with debug output if enabled)
     auto handle = utils::ProcessManager::start_process(flm_path, args, "", is_debug());
@@ -109,18 +104,18 @@ std::string FastFlowLMServer::download_model(const std::string& checkpoint, bool
     // Wait for download to complete
     if (!utils::ProcessManager::is_running(handle)) {
         int exit_code = utils::ProcessManager::get_exit_code(handle);
-        std::cerr << "[FastFlowLM ERROR] FLM pull failed with exit code: " << exit_code << std::endl;
+        LOG(ERROR, "FastFlowLM") << "FLM pull failed with exit code: " << exit_code << std::endl;
         throw std::runtime_error("FLM pull failed");
     }
 
     // Wait for process to complete
     int timeout_seconds = 300; // 5 minutes
-    std::cout << "[FastFlowLM] Waiting for model download to complete..." << std::endl;
+    LOG(INFO, "FastFlowLM") << "Waiting for model download to complete..." << std::endl;
     for (int i = 0; i < timeout_seconds * 10; ++i) {
         if (!utils::ProcessManager::is_running(handle)) {
             int exit_code = utils::ProcessManager::get_exit_code(handle);
             if (exit_code != 0) {
-                std::cerr << "[FastFlowLM ERROR] FLM pull failed with exit code: " << exit_code << std::endl;
+                LOG(ERROR, "FastFlowLM") << "FLM pull failed with exit code: " << exit_code << std::endl;
                 throw std::runtime_error("FLM pull failed with exit code: " + std::to_string(exit_code));
             }
             break;
@@ -129,11 +124,11 @@ std::string FastFlowLMServer::download_model(const std::string& checkpoint, bool
 
         // Print progress every 5 seconds
         if (i % 50 == 0 && i > 0) {
-            std::cout << "[FastFlowLM] Still downloading... (" << (i/10) << "s elapsed)" << std::endl;
+            LOG(INFO, "FastFlowLM") << "Still downloading... (" << (i/10) << "s elapsed)" << std::endl;
         }
     }
 
-    std::cout << "[FastFlowLM] Model pull completed successfully" << std::endl;
+    LOG(INFO, "FastFlowLM") << "Model pull completed successfully" << std::endl;
     return checkpoint;
 }
 
@@ -141,30 +136,24 @@ void FastFlowLMServer::load(const std::string& model_name,
                            const ModelInfo& model_info,
                            const RecipeOptions& options,
                            bool do_not_upgrade) {
-    std::cout << "[FastFlowLM] Loading model: " << model_name << std::endl;
-    int ctx_size = options.get_option("ctx_size");
+    LOG(INFO, "FastFlowLM") << "Loading model: " << model_name << std::endl;
 
+    // Get FLM-specific options from RecipeOptions
+    int ctx_size = options.get_option("ctx_size");
+    std::string flm_args = options.get_option("flm_args");
+
+    std::cout << "[FastFlowLM] Options: ctx_size=" << ctx_size;
+    if (!flm_args.empty()) {
+        std::cout << ", flm_args=\"" << flm_args << "\"";
+    }
+    std::cout << std::endl;
     // Note: checkpoint_ is set by Router via set_model_metadata() before load() is called
     // We use checkpoint_ (base class field) for FLM API calls
 
-    // Check if model was downloaded before FLM upgrade (for invalidation detection)
-    bool model_was_downloaded = model_manager_ && model_manager_->is_model_downloaded(model_name);
-
-    // Install/check FLM
-    install();
-
-    // Check if FLM upgrade invalidated the model
-    // This happens when a new FLM version requires models to be re-downloaded
-    if (flm_was_upgraded_ && model_was_downloaded && model_manager_) {
-        // Refresh and check if model is now marked as not downloaded
-        model_manager_->refresh_flm_download_status();
-
-        if (!model_manager_->is_model_downloaded(model_name)) {
-            std::cout << "[FastFlowLM] Model '" << model_name
-                      << "' was invalidated by FLM upgrade" << std::endl;
-            throw ModelInvalidatedException(model_name,
-                "FLM was upgraded and the model format has changed");
-        }
+    // Check FLM is ready via system-info (single source of truth)
+    auto status = SystemInfoCache::get_flm_status();
+    if (!status.is_ready()) {
+        throw std::runtime_error(status.error_string());
     }
 
     // Download model if needed
@@ -176,26 +165,57 @@ void FastFlowLMServer::load(const std::string& model_name,
     // Get flm executable path
     std::string flm_path = get_flm_path();
 
-    // Construct flm serve command
+    // Construct flm serve command based on model type
     // Bind to localhost only for security
-    std::vector<std::string> args = {
-        "serve",
-        model_info.checkpoint(),
-        "--ctx-len", std::to_string(ctx_size),
-        "--port", std::to_string(port_),
-        "--host", "127.0.0.1"
-    };
-
-    std::cout << "[FastFlowLM] Starting flm-server..." << std::endl;
-    std::cout << "[ProcessManager] Starting process: \"" << flm_path << "\"";
-    for (const auto& arg : args) {
-        std::cout << " \"" << arg << "\"";
+    std::vector<std::string> args;
+    if (model_type_ == ModelType::AUDIO) {
+        // ASR mode: flm serve --asr 1
+        args = {
+            "serve",
+            "--asr", "1",
+            "--port", std::to_string(port_),
+            "--host", "127.0.0.1",
+            "--quiet"
+        };
+    } else if (model_type_ == ModelType::EMBEDDING) {
+        // Embedding mode: flm serve --embed 1
+        args = {
+            "serve",
+            "--embed", "1",
+            "--port", std::to_string(port_),
+            "--host", "127.0.0.1",
+            "--quiet"
+        };
+    } else {
+        // LLM mode (default): flm serve <checkpoint> --ctx-len N
+        args = {
+            "serve",
+            model_info.checkpoint(),
+            "--ctx-len", std::to_string(ctx_size),
+            "--port", std::to_string(port_),
+            "--host", "127.0.0.1",
+            "--quiet"
+        };
     }
-    std::cout << std::endl;
 
-    // Start the flm serve process (filter health check spam)
+    // Parse and append custom flm_args if provided
+    if (!flm_args.empty()) {
+        std::istringstream iss(flm_args);
+        std::string token;
+        while (iss >> token) {
+            args.push_back(token);
+        }
+    }
+
+    LOG(INFO, "FastFlowLM") << "Starting flm-server..." << std::endl;
+    LOG(INFO, "ProcessManager") << "Starting process: \"" << flm_path << "\"";
+    for (const auto& arg : args) {
+        LOG(INFO, "ProcessManager") << " \"" << arg << "\"";
+    }
+    LOG(INFO, "ProcessManager") << std::endl;
+
     process_handle_ = utils::ProcessManager::start_process(flm_path, args, "", is_debug(), true);
-    std::cout << "[ProcessManager] Process started successfully" << std::endl;
+    LOG(INFO, "ProcessManager") << "Process started successfully" << std::endl;
 
     // Wait for flm-server to be ready
     bool ready = wait_for_ready();
@@ -206,12 +226,12 @@ void FastFlowLMServer::load(const std::string& model_name,
     }
 
     is_loaded_ = true;
-    std::cout << "[FastFlowLM] Model loaded on port " << port_ << std::endl;
+    LOG(INFO, "FastFlowLM") << "Model loaded on port " << port_ << std::endl;
 }
 
 void FastFlowLMServer::unload() {
-    std::cout << "[FastFlowLM] Unloading model..." << std::endl;
-    if (is_loaded_ && process_handle_.handle) {
+    LOG(INFO, "FastFlowLM") << "Unloading model..." << std::endl;
+    if (is_loaded_ && process_handle_.pid != 0) {
         utils::ProcessManager::stop_process(process_handle_);
         process_handle_ = {nullptr, 0};
         port_ = 0;
@@ -223,37 +243,44 @@ bool FastFlowLMServer::wait_for_ready() {
     // FLM doesn't have a health endpoint, so we use /api/tags to check if it's up
     std::string tags_url = get_base_url() + "/api/tags";
 
-    std::cout << "Waiting for " + server_name_ + " to be ready..." << std::endl;
+    LOG(INFO, "FastFlowLM") << "Waiting for " + server_name_ + " to be ready..." << std::endl;
 
     const int max_attempts = 300;  // 5 minutes timeout (large models can take time to load)
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
         // Check if process is still running
         if (!utils::ProcessManager::is_running(process_handle_)) {
-            std::cerr << "[ERROR] " << server_name_ << " process has terminated!" << std::endl;
+            LOG(ERROR, "FastFlowLM") << server_name_ << " process has terminated!" << std::endl;
             int exit_code = utils::ProcessManager::get_exit_code(process_handle_);
-            std::cerr << "[ERROR] Process exit code: " << exit_code << std::endl;
-            std::cerr << "\nTroubleshooting tips:" << std::endl;
-            std::cerr << "  1. Check if FLM is installed correctly: flm --version" << std::endl;
-            std::cerr << "  2. Try running: flm serve <model> --ctx-len 8192 --port 8001" << std::endl;
-            std::cerr << "  3. Check NPU drivers are installed (Windows only)" << std::endl;
+            LOG(ERROR, "FastFlowLM") << "Process exit code: " << exit_code << std::endl;
+            LOG(ERROR, "FastFlowLM") << "Troubleshooting tips:" << std::endl;
+            LOG(ERROR, "FastFlowLM") << "  1. Check if FLM is installed correctly: flm --version" << std::endl;
+            LOG(ERROR, "FastFlowLM") << "  2. Try running: flm serve <model> --ctx-len 8192 --port 8001" << std::endl;
+            LOG(ERROR, "FastFlowLM") << "  3. Check NPU drivers are installed (Windows only)" << std::endl;
             return false;
         }
 
-        // Try to reach the /api/tags endpoint (sleep 1 second between attempts)
+        // Try to reach the /api/tags endpoint
         if (utils::HttpClient::is_reachable(tags_url, 1)) {
-            std::cout << server_name_ + " is ready!" << std::endl;
+            LOG(INFO, "FastFlowLM") << server_name_ + " is ready!" << std::endl;
             return true;
         }
 
-        // No need to sleep here - is_reachable already sleeps 1 second
+        // Sleep 1 second between attempts
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
-    std::cerr << "[ERROR] " << server_name_ << " failed to start within "
+    LOG(ERROR, "FastFlowLM") << server_name_ << " failed to start within "
               << max_attempts << " seconds" << std::endl;
     return false;
 }
 
 json FastFlowLMServer::chat_completion(const json& request) {
+    if (model_type_ == ModelType::AUDIO || model_type_ == ModelType::EMBEDDING) {
+        return ErrorResponse::from_exception(
+            UnsupportedOperationException("Chat completion", "FLM " + model_type_to_string(model_type_) + " model")
+        );
+    }
+
     // FLM requires the checkpoint name in the request (e.g., "gemma3:4b")
     // (whereas llama-server ignores the model name field)
     json modified_request = request;
@@ -263,6 +290,12 @@ json FastFlowLMServer::chat_completion(const json& request) {
 }
 
 json FastFlowLMServer::completion(const json& request) {
+    if (model_type_ == ModelType::AUDIO || model_type_ == ModelType::EMBEDDING) {
+        return ErrorResponse::from_exception(
+            UnsupportedOperationException("Text completion", "FLM " + model_type_to_string(model_type_) + " model")
+        );
+    }
+
     // FLM requires the checkpoint name in the request (e.g., "lfm2:1.2b")
     // (whereas llama-server ignores the model name field)
     json modified_request = request;
@@ -272,11 +305,87 @@ json FastFlowLMServer::completion(const json& request) {
 }
 
 json FastFlowLMServer::embeddings(const json& request) {
+    if (model_type_ == ModelType::AUDIO) {
+        return ErrorResponse::from_exception(
+            UnsupportedOperationException("Embeddings", "FLM " + model_type_to_string(model_type_) + " model")
+        );
+    }
     return forward_request("/v1/embeddings", request);
 }
 
 json FastFlowLMServer::reranking(const json& request) {
+    if (model_type_ != ModelType::LLM) {
+        return ErrorResponse::from_exception(
+            UnsupportedOperationException("Reranking", "FLM " + model_type_to_string(model_type_) + " model")
+        );
+    }
     return forward_request("/v1/rerank", request);
+}
+
+json FastFlowLMServer::audio_transcriptions(const json& request) {
+    if (model_type_ != ModelType::AUDIO) {
+        return ErrorResponse::from_exception(
+            UnsupportedOperationException("Audio transcription", "FLM " + model_type_to_string(model_type_) + " model")
+        );
+    }
+
+    try {
+        // Extract audio data from request (same format as WhisperServer)
+        if (!request.contains("file_data")) {
+            throw std::runtime_error("Missing 'file_data' in request");
+        }
+
+        std::string audio_data = request["file_data"].get<std::string>();
+        std::string filename = request.value("filename", "audio.wav");
+
+        // Determine content type from filename extension
+        std::filesystem::path filepath(filename);
+        std::string ext = filepath.extension().string();
+        std::string content_type = "audio/wav";
+        if (ext == ".mp3") content_type = "audio/mpeg";
+        else if (ext == ".m4a") content_type = "audio/mp4";
+        else if (ext == ".ogg") content_type = "audio/ogg";
+        else if (ext == ".flac") content_type = "audio/flac";
+        else if (ext == ".webm") content_type = "audio/webm";
+
+        // Build multipart fields for FLM's /v1/audio/transcriptions endpoint
+        std::vector<utils::MultipartField> fields;
+
+        // Audio file field
+        fields.push_back({
+            "file",
+            audio_data,
+            filepath.filename().string(),
+            content_type
+        });
+
+        // Model field (required by OpenAI API format)
+        fields.push_back({"model", checkpoint_, "", ""});
+
+        // Optional parameters
+        if (request.contains("language")) {
+            fields.push_back({"language", request["language"].get<std::string>(), "", ""});
+        }
+        if (request.contains("prompt")) {
+            fields.push_back({"prompt", request["prompt"].get<std::string>(), "", ""});
+        }
+        if (request.contains("response_format")) {
+            fields.push_back({"response_format", request["response_format"].get<std::string>(), "", ""});
+        }
+        if (request.contains("temperature")) {
+            fields.push_back({"temperature", std::to_string(request["temperature"].get<double>()), "", ""});
+        }
+
+        return forward_multipart_request("/v1/audio/transcriptions", fields);
+
+    } catch (const std::exception& e) {
+        return json{
+            {"error", {
+                {"message", std::string("Transcription failed: ") + e.what()},
+                {"type", "audio_processing_error"}
+            }}
+        };
+    }
 }
 
 json FastFlowLMServer::responses(const json& request) {
@@ -289,7 +398,16 @@ json FastFlowLMServer::responses(const json& request) {
 void FastFlowLMServer::forward_streaming_request(const std::string& endpoint,
                                                   const std::string& request_body,
                                                   httplib::DataSink& sink,
-                                                  bool sse) {
+                                                  bool sse,
+                                                  long timeout_seconds) {
+    // Streaming is only supported for LLM models
+    if (model_type_ == ModelType::AUDIO || model_type_ == ModelType::EMBEDDING) {
+        std::string error_msg = "data: {\"error\":{\"message\":\"Streaming not supported for FLM "
+            + model_type_to_string(model_type_) + " model\",\"type\":\"unsupported_operation\"}}\n\n";
+        sink.write(error_msg.c_str(), error_msg.size());
+        return;
+    }
+
     // FLM requires the checkpoint name in the model field (e.g., "gemma3:4b"),
     // not the Lemonade model name (e.g., "Gemma3-4b-it-FLM")
     try {
@@ -298,10 +416,10 @@ void FastFlowLMServer::forward_streaming_request(const std::string& endpoint,
         std::string modified_body = request.dump();
 
         // Call base class with modified request
-        WrappedServer::forward_streaming_request(endpoint, modified_body, sink, sse);
+        WrappedServer::forward_streaming_request(endpoint, modified_body, sink, sse, timeout_seconds);
     } catch (const json::exception& e) {
         // If JSON parsing fails, forward original request
-        WrappedServer::forward_streaming_request(endpoint, request_body, sink, sse);
+        WrappedServer::forward_streaming_request(endpoint, request_body, sink, sse, timeout_seconds);
     }
 }
 
@@ -311,9 +429,9 @@ std::string FastFlowLMServer::get_flm_path() {
     std::string flm_path = utils::find_flm_executable();
 
     if (!flm_path.empty()) {
-        std::cout << "[FastFlowLM] Found flm at: " << flm_path << std::endl;
+        LOG(INFO, "FastFlowLM") << "Found flm at: " << flm_path << std::endl;
     } else {
-        std::cerr << "[FastFlowLM] flm not found in PATH" << std::endl;
+        LOG(ERROR, "FastFlowLM") << "flm not found in PATH" << std::endl;
     }
 
     return flm_path;
@@ -327,322 +445,67 @@ std::string FastFlowLMServer::get_flm_required_version() {
         json config = utils::JsonUtils::load_from_file(config_path);
 
         if (!config.contains("flm") || !config["flm"].is_object()) {
-            std::cerr << "[FastFlowLM] backend_versions.json is missing 'flm' section" << std::endl;
+            LOG(ERROR, "FastFlowLM") << "backend_versions.json is missing 'flm' section" << std::endl;
             return "v0.9.23";  // Fallback default
         }
 
         const auto& flm_config = config["flm"];
 
-        if (!flm_config.contains("version") || !flm_config["version"].is_string()) {
-            std::cerr << "[FastFlowLM] backend_versions.json is missing 'flm.version'" << std::endl;
+        if (!flm_config.contains("npu") || !flm_config["npu"].is_string()) {
+            LOG(ERROR, "FastFlowLM") << "backend_versions.json is missing 'flm.npu'" << std::endl;
             return "v0.9.23";  // Fallback default
         }
 
-        return flm_config["version"].get<std::string>();
+        return flm_config["npu"].get<std::string>();
 
     } catch (const std::exception& e) {
-        std::cerr << "[FastFlowLM] Error reading backend_versions.json: " << e.what() << std::endl;
+        LOG(ERROR, "FastFlowLM") << "Error reading backend_versions.json: " << e.what() << std::endl;
         return "v0.9.23";  // Fallback default
     }
 }
 
-std::string FastFlowLMServer::get_min_npu_driver_version() {
-    // Get minimum NPU driver version from backend_versions.json
-    std::string config_path = utils::get_resource_path("resources/backend_versions.json");
-
-    try {
-        json config = utils::JsonUtils::load_from_file(config_path);
-
-        if (!config.contains("flm") || !config["flm"].is_object()) {
-            return "32.0.203.311";  // Fallback default
-        }
-
-        const auto& flm_config = config["flm"];
-
-#ifdef _WIN32
-        // Windows: use min_npu_driver field
-        if (!flm_config.contains("min_npu_driver") || !flm_config["min_npu_driver"].is_string()) {
-            return "32.0.203.311";  // Fallback default
-        }
-        return flm_config["min_npu_driver"].get<std::string>();
-#elif defined(__linux__)
-        // Linux: use min_kernel_version field
-        if (!flm_config.contains("min_kernel_version") || !flm_config["min_kernel_version"].is_string()) {
-            return "7.0";  // Fallback default
-        }
-        return flm_config["min_kernel_version"].get<std::string>();
-#else
-        return "";
-#endif
-
-    } catch (const std::exception& e) {
-        std::cerr << "[FastFlowLM] Error reading backend_versions.json: " << e.what() << std::endl;
-#ifdef _WIN32
-        return "32.0.203.311";  // Fallback default for Windows
-#elif defined(__linux__)
-        return "7.0";  // Fallback default for Linux
-#else
-        return "";
-#endif
-    }
-}
-
-std::string FastFlowLMServer::get_flm_installed_version() {
-    // Return cached version if available
-    if (!cached_installed_version_.empty()) {
-        return cached_installed_version_;
-    }
-
-    // Check if flm is installed
-    std::string flm_path = get_flm_path();
-    if (flm_path.empty()) {
-        return "";
-    }
-
-    try {
-        // Run flm --version command using the full path (not relying on PATH)
-        std::string command = "\"" + flm_path + "\" --version 2>&1";
-#ifdef _WIN32
-        FILE* pipe = _popen(command.c_str(), "r");
-#else
-        FILE* pipe = popen(command.c_str(), "r");
-#endif
-        if (!pipe) {
-            return "";
-        }
-
-        char buffer[256];
-        std::string output;
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            output += buffer;
-        }
-
-#ifdef _WIN32
-        _pclose(pipe);
-#else
-        pclose(pipe);
-#endif
-
-        // Parse output like "FLM v0.9.23" - look for "FLM v" specifically
-        // to avoid matching 'v' in other text (like error messages)
-        size_t pos = output.find("FLM v");
-        if (pos != std::string::npos) {
-            std::string version_str = output.substr(pos + 4);  // Skip "FLM "
-            // Remove trailing whitespace and newlines
-            size_t end = version_str.find_first_of(" \n\r\t");
-            if (end != std::string::npos) {
-                version_str = version_str.substr(0, end);
-            }
-            cached_installed_version_ = version_str;
-            return cached_installed_version_;
-        }
-
-        return "";
-
-    } catch (const std::exception& e) {
-        return "";
-    }
-}
-
-void FastFlowLMServer::invalidate_version_cache() {
-    cached_installed_version_.clear();
-}
-
-std::string FastFlowLMServer::get_npu_driver_version() {
-#ifdef _WIN32
-    // Use WMI to query NPU driver version
-    wmi::WMIConnection wmi;
-    if (!wmi.is_valid()) {
-        return "";
-    }
-
-    std::string version;
-    // Query for "NPU Compute Accelerator Device"
-    std::wstring query = L"SELECT DriverVersion FROM Win32_PnPSignedDriver WHERE DeviceName LIKE '%NPU Compute Accelerator Device%'";
-
-    wmi.query(query, [&version](IWbemClassObject* pObj) {
-        if (version.empty()) {  // Only get first result
-            version = wmi::get_property_string(pObj, L"DriverVersion");
-        }
-    });
-
-    return version;
-#elif defined(__linux__)
-    struct utsname uts;
-    if (uname(&uts) != 0) {
-        return "";
-    }
-    return std::string(uts.release);
-#else
-    return "";
-#endif
-}
-
-bool FastFlowLMServer::check_npu_driver_version() {
-    std::string version = get_npu_driver_version();
-    std::string min_version = get_min_npu_driver_version();
-
-    if (version.empty()) {
-#ifdef _WIN32
-        std::cout << "[FastFlowLM] NPU Driver Version: Unknown (Could not detect)" << std::endl;
-#elif defined(__linux__)
-        std::cout << "[FastFlowLM] Kernel Version: Unknown (Could not detect)" << std::endl;
-#endif
-        return true;  // Assume OK if we can't detect, to not block users with unusual setups
-    }
-
-#ifdef _WIN32
-    std::cout << "[FastFlowLM] NPU Driver Version: " << version << std::endl;
-#elif defined(__linux__)
-    std::cout << "[FastFlowLM] Kernel Version: " << version << std::endl;
-#endif
-
-    // Parse and compare versions
-    auto parse_version = [](const std::string& v) -> std::vector<int> {
-        std::vector<int> parts;
-        std::stringstream ss(v);
-        std::string part;
-        while (std::getline(ss, part, '.')) {
-            try {
-                parts.push_back(std::stoi(part));
-            } catch (...) {
-                parts.push_back(0);
-            }
-        }
-        while (parts.size() < 4) parts.push_back(0);  // Ensure 4 parts for driver versions
-        return parts;
-    };
-
-    std::vector<int> current = parse_version(version);
-    std::vector<int> minimum = parse_version(min_version);
-
-    // Pad to same length
-    size_t max_size = (current.size() > minimum.size()) ? current.size() : minimum.size();
-    current.resize(max_size, 0);
-    minimum.resize(max_size, 0);
-
-    // Check if current < minimum
-    bool too_old = false;
-    for (size_t i = 0; i < max_size; ++i) {
-        if (current[i] < minimum[i]) {
-            too_old = true;
-            break;
-        }
-        if (current[i] > minimum[i]) {
-            break;  // Current is newer, we're OK
-        }
-    }
-
-    if (too_old) {
-        std::cerr << "\n" << std::string(70, '=') << std::endl;
-#ifdef _WIN32
-        std::cerr << "ERROR: NPU Driver Version is too old!" << std::endl;
-        std::cerr << "Current: " << version << std::endl;
-        std::cerr << "Minimum: " << min_version << std::endl;
-        std::cerr << "Please update your NPU driver at: " << DRIVER_INSTALL_URL << std::endl;
-        std::cerr << std::string(70, '=') << std::endl << std::endl;
-        // Open browser to driver install page
-        ShellExecuteA(NULL, "open", DRIVER_INSTALL_URL.c_str(), NULL, NULL, SW_SHOWNORMAL);
-#elif defined(__linux__)
-        std::cerr << "ERROR: Kernel Version is too old for NPU support!" << std::endl;
-        std::cerr << "Current: " << version << std::endl;
-        std::cerr << "Minimum: " << min_version << std::endl;
-        std::cerr << "Please upgrade your kernel to 7.0 or later" << std::endl;
-        std::cerr << std::string(70, '=') << std::endl << std::endl;
-#endif
-        return false;
-    }
-
-    return true;
-}
-
-bool FastFlowLMServer::compare_versions(const std::string& v1, const std::string& v2) {
-    // Compare semantic versions: return true if v1 >= v2
-    if (v1.empty() || v2.empty()) {
-        return false;
-    }
-
-    auto parse_version = [](const std::string& v) -> std::vector<int> {
-        std::vector<int> parts;
-        std::string part;
-        for (char c : v) {
-            if (c == '.') {
-                if (!part.empty()) {
-                    parts.push_back(std::stoi(part));
-                    part.clear();
-                }
-            } else if (std::isdigit(c)) {
-                part += c;
-            }
-        }
-        if (!part.empty()) {
-            parts.push_back(std::stoi(part));
-        }
-        return parts;
-    };
-
-    auto parts1 = parse_version(v1);
-    auto parts2 = parse_version(v2);
-
-    // Pad with zeros to make same length (avoid std::max due to Windows.h max macro)
-    size_t max_len = parts1.size() > parts2.size() ? parts1.size() : parts2.size();
-    while (parts1.size() < max_len) parts1.push_back(0);
-    while (parts2.size() < max_len) parts2.push_back(0);
-
-    // Compare each part
-    for (size_t i = 0; i < max_len; ++i) {
-        if (parts1[i] > parts2[i]) return true;
-        if (parts1[i] < parts2[i]) return false;
-    }
-
-    return true; // Equal versions
-}
-
 bool FastFlowLMServer::install_flm_if_needed() {
+#ifdef _WIN32
     std::string required_version = get_flm_required_version();
-    std::string current_version = get_flm_installed_version();
+    std::string current_version = SystemInfo::get_flm_version();
+    const char* ci_mode = std::getenv("LEMONADE_CI_MODE");
+    bool is_ci_mode = ci_mode && (
+        std::string(ci_mode) == "1" ||
+        std::string(ci_mode) == "true" ||
+        std::string(ci_mode) == "TRUE" ||
+        std::string(ci_mode) == "yes" ||
+        std::string(ci_mode) == "True");
 
-    // Normalize versions for comparison (remove 'v' prefix if present)
-    auto normalize_version = [](const std::string& v) -> std::string {
-        if (!v.empty() && v[0] == 'v') {
-            return v.substr(1);
-        }
-        return v;
-    };
-
-    std::string required_normalized = normalize_version(required_version);
-    std::string current_normalized = normalize_version(current_version);
+    // Parse versions using utility (handles 'v' prefix automatically)
+    utils::Version required = utils::Version::parse(required_version);
+    utils::Version current = utils::Version::parse(current_version);
 
     // Case 1: Already have required version or newer
-    if (!current_normalized.empty() && compare_versions(current_normalized, required_normalized)) {
-        std::cout << "[FastFlowLM] FLM " << current_version
+    if (!current.empty() && current >= required) {
+        LOG(INFO, "FastFlowLM") << "FLM " << current_version
                   << " is installed (required: " << required_version << ")" << std::endl;
         return false;  // No upgrade performed
     }
 
     // Case 2: Need to install or upgrade
-    bool is_upgrade = !current_version.empty();
+    bool is_upgrade = !current_version.empty() && current_version != "unknown";
     if (is_upgrade) {
-        std::cout << "[FastFlowLM] Upgrading FLM " << current_version
+        LOG(INFO, "FastFlowLM") << "Upgrading FLM " << current_version
                   << " → " << required_version << "..." << std::endl;
     } else {
-        std::cout << "[FastFlowLM] Installing FLM " << required_version
+        LOG(INFO, "FastFlowLM") << "Installing FLM " << required_version
                   << "..." << std::endl;
     }
 
     // Determine installer path
-#ifdef _WIN32
     char temp_path[MAX_PATH];
     GetTempPathA(MAX_PATH, temp_path);
     std::string installer_path = std::string(temp_path) + "flm-setup.exe";
-#else
-    std::string installer_path = "/tmp/flm-setup";
-#endif
 
     // Delete any existing installer file to avoid collisions
     // We must succeed here to prevent running a stale installer
     if (fs::exists(installer_path)) {
-        std::cout << "[FastFlowLM] Removing existing installer at: " << installer_path << std::endl;
+        LOG(INFO, "FastFlowLM") << "Removing existing installer at: " << installer_path << std::endl;
         try {
             fs::remove(installer_path);
         } catch (const std::exception& e) {
@@ -663,14 +526,16 @@ bool FastFlowLMServer::install_flm_if_needed() {
         throw std::runtime_error("Failed to download FLM installer");
     }
 
-    // Run installer (silent for upgrades, GUI for fresh installs)
-    run_flm_installer(installer_path, is_upgrade);
-
-    // Invalidate version cache to force re-checking after installation
-    invalidate_version_cache();
+    // Run installer in silent mode for upgrades and CI.
+    // Fresh installs outside CI keep GUI behavior for local users.
+    bool force_silent = is_upgrade || is_ci_mode;
+    if (is_ci_mode && !is_upgrade) {
+        LOG(INFO, "FastFlowLM") << "CI mode detected, forcing silent FLM installation..." << std::endl;
+    }
+    run_flm_installer(installer_path, force_silent);
 
     // Verify installation by calling flm --version again
-    if (!verify_flm_installation(required_normalized)) {
+    if (!verify_flm_installation(required_version)) {
         throw std::runtime_error("FLM installation verification failed");
     }
 
@@ -681,17 +546,9 @@ bool FastFlowLMServer::install_flm_if_needed() {
         // Ignore cleanup errors
     }
 
-    std::cout << "[FastFlowLM] Successfully installed FLM "
+    LOG(INFO, "FastFlowLM") << "Successfully installed FLM "
               << required_version << std::endl;
-
-    // Refresh FLM model download status in the model cache
-    // This ensures any pre-existing FLM models are now detected
-    // (FLM upgrade may invalidate previously downloaded models)
-    if (model_manager_) {
-        std::cout << "[FastFlowLM] Refreshing FLM model download status..." << std::endl;
-        model_manager_->refresh_flm_download_status();
-    }
-
+#endif
     return true;  // FLM was installed or upgraded
 }
 
@@ -701,18 +558,19 @@ bool FastFlowLMServer::download_flm_installer(const std::string& output_path) {
     const std::string url =
         "https://github.com/FastFlowLM/FastFlowLM/releases/download/" + version + "/flm-setup.exe";
 
-    std::cout << "[FastFlowLM] Downloading FLM " << version << " installer..." << std::endl;
-    std::cout << "[FastFlowLM] URL: " << url << std::endl;
+    LOG(INFO, "FastFlowLM") << "Downloading FLM " << version << " installer..." << std::endl;
+    LOG(INFO, "FastFlowLM") << "URL: " << url << std::endl;
 
-    auto progress_callback = utils::create_throttled_progress_callback();
+    // Use default throttled progress callback
+    utils::ProgressCallback http_progress_cb = utils::create_throttled_progress_callback();
 
-    auto result = utils::HttpClient::download_file(url, output_path, progress_callback);
+    auto result = utils::HttpClient::download_file(url, output_path, http_progress_cb);
 
     if (result.success) {
-        std::cout << "\n[FastFlowLM] Downloaded installer to "
+        LOG(INFO, "FastFlowLM") << "Downloaded installer to "
                   << output_path << std::endl;
     } else {
-        std::cerr << "[FastFlowLM ERROR] Failed to download installer: "
+        LOG(ERROR, "FastFlowLM") << "Failed to download installer: "
                   << result.error_message << std::endl;
     }
 
@@ -723,16 +581,18 @@ void FastFlowLMServer::run_flm_installer(const std::string& installer_path, bool
     std::vector<std::string> args;
     if (silent) {
         args.push_back("/VERYSILENT");
-        std::cout << "[FastFlowLM] Running silent upgrade..." << std::endl;
+        args.push_back("/SUPPRESSMSGBOXES");
+        args.push_back("/NORESTART");
+        LOG(INFO, "FastFlowLM") << "Running FLM installer in silent mode..." << std::endl;
     } else {
-        std::cout << "[FastFlowLM] Launching installer GUI. "
+        LOG(INFO, "FastFlowLM") << "Launching installer GUI. "
                   << "Please complete the installation..." << std::endl;
     }
 
     // Launch installer and wait for completion
     auto handle = utils::ProcessManager::start_process(installer_path, args, "", false);
 
-    std::cout << "[FastFlowLM] Waiting for installer to complete..." << std::endl;
+    LOG(INFO, "FastFlowLM") << "Waiting for installer to complete..." << std::endl;
 
     // Wait for installer to complete
     int timeout_seconds = 300; // 5 minutes
@@ -744,7 +604,7 @@ void FastFlowLMServer::run_flm_installer(const std::string& installer_path, bool
 
         // Print progress every 10 seconds
         if (!silent && i % 20 == 0 && i > 0) {
-            std::cout << "[FastFlowLM] Still waiting... (" << (i/2) << "s elapsed)" << std::endl;
+            LOG(INFO, "FastFlowLM") << "Still waiting... (" << (i/2) << "s elapsed)" << std::endl;
         }
     }
 
@@ -754,7 +614,7 @@ void FastFlowLMServer::run_flm_installer(const std::string& installer_path, bool
             "FLM installer failed with exit code: " + std::to_string(exit_code));
     }
 
-    std::cout << "[FastFlowLM] Installer completed successfully" << std::endl;
+    LOG(INFO, "FastFlowLM") << "Installer completed successfully" << std::endl;
 }
 
 void FastFlowLMServer::refresh_environment_path() {
@@ -792,59 +652,35 @@ void FastFlowLMServer::refresh_environment_path() {
 }
 
 bool FastFlowLMServer::verify_flm_installation(const std::string& expected_version, int max_retries) {
-    std::cout << "[FastFlowLM] Verifying installation..." << std::endl;
+    LOG(INFO, "FastFlowLM") << "Verifying installation..." << std::endl;
 
     std::this_thread::sleep_for(std::chrono::seconds(2)); // Initial wait
 
     for (int attempt = 0; attempt < max_retries; ++attempt) {
         refresh_environment_path();
 
-        // Invalidate cache to force fresh version check
-        invalidate_version_cache();
+        std::string current = SystemInfo::get_flm_version();
 
-        std::string current = get_flm_installed_version();
+        utils::Version current_ver = utils::Version::parse(current);
+        utils::Version expected_ver = utils::Version::parse(expected_version);
 
-        // Normalize for comparison (remove 'v' prefix)
-        std::string current_normalized = current;
-        if (!current_normalized.empty() && current_normalized[0] == 'v') {
-            current_normalized = current_normalized.substr(1);
-        }
-
-        if (!current_normalized.empty() && compare_versions(current_normalized, expected_version)) {
-            std::cout << "[FastFlowLM] Verification successful: FLM "
+        if (!current_ver.empty() && !expected_ver.empty() && current_ver >= expected_ver) {
+            LOG(INFO, "FastFlowLM") << "Verification successful: FLM "
                       << current << std::endl;
             return true;
         }
 
         if (attempt < max_retries - 1) {
-            std::cout << "[FastFlowLM] FLM not yet available (got: '" << current
+            LOG(INFO, "FastFlowLM") << "FLM not yet available (got: '" << current
                       << "'), retrying... (" << (attempt + 1) << "/" << max_retries << ")" << std::endl;
             std::this_thread::sleep_for(std::chrono::seconds(3));
         }
     }
 
-    std::cerr << "[FastFlowLM ERROR] FLM installation completed but 'flm' "
+    LOG(ERROR, "FastFlowLM") << "FLM installation completed but 'flm' "
               << "is not available in PATH or version check failed" << std::endl;
-    std::cerr << "Expected version: " << expected_version << std::endl;
-    std::cerr << "Please restart your terminal or add FLM to your PATH manually." << std::endl;
-    return false;
-}
-
-bool FastFlowLMServer::check_npu_available() {
-#ifdef _WIN32
-    // Check for AMD NPU driver on Windows
-    // This is a simplified check - in production you'd want more robust detection
-    const char* npu_paths[] = {
-        "C:\\Windows\\System32\\drivers\\amdxdna.sys",
-        "C:\\Windows\\System32\\DriverStore\\FileRepository\\amdxdna.inf_amd64_*\\amdxdna.sys"
-    };
-
-    for (const auto& path : npu_paths) {
-        if (fs::exists(path)) {
-            return true;
-        }
-    }
-#endif
+    LOG(INFO, "FastFlowLM") << "Expected version: " << expected_version << std::endl;
+    LOG(INFO, "FastFlowLM") << "Please restart your terminal or add FLM to your PATH manually." << std::endl;
     return false;
 }
 

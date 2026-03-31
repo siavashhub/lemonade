@@ -6,7 +6,6 @@ with Lemonade's inference backends.
 
 Usage:
     python test_ollama.py
-    python test_ollama.py --server-per-test
     python test_ollama.py --server-binary /path/to/lemonade-server
 """
 
@@ -23,13 +22,14 @@ except ImportError:
 from utils.server_base import (
     ServerTestBase,
     run_server_tests,
-    parse_args,
 )
 from utils.test_models import (
     PORT,
     ENDPOINT_TEST_MODEL,
+    TOOL_CALLING_MODEL,
     VISION_MODEL,
     SD_MODEL,
+    SAMPLE_TOOL,
     TIMEOUT_MODEL_OPERATION,
     TIMEOUT_DEFAULT,
 )
@@ -44,7 +44,7 @@ class OllamaTests(ServerTestBase):
 
     @classmethod
     def setUpClass(cls):
-        """Set up class - start server and ensure test model is pulled."""
+        """Set up class - verify server is running."""
         super().setUpClass()
 
     def get_ollama_client(self):
@@ -550,7 +550,146 @@ class OllamaTests(ServerTestBase):
         chunks = list(stream)
         self.assertGreater(len(chunks), 0)
 
+    # ========================================================================
+    # Anthropic-compatible /v1/messages tests
+    # ========================================================================
+
+    def test_024_anthropic_messages_non_streaming(self):
+        """Test Anthropic-compatible non-streaming messages endpoint."""
+        self.ensure_model_pulled()
+
+        payload = {
+            "model": ENDPOINT_TEST_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Say hello"}],
+                }
+            ],
+            "system": [
+                {
+                    "type": "text",
+                    "text": "You are a concise assistant.",
+                }
+            ],
+            "max_tokens": 16,
+            "stream": False,
+        }
+
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/v1/messages?beta=true",
+            json=payload,
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        data = response.json()
+        self.assertEqual(data.get("type"), "message")
+        self.assertEqual(data.get("role"), "assistant")
+        self.assertEqual(data.get("model"), ENDPOINT_TEST_MODEL)
+        self.assertIn("content", data)
+        self.assertIsInstance(data["content"], list)
+        self.assertGreater(len(data["content"]), 0)
+        self.assertEqual(data["content"][0].get("type"), "text")
+        self.assertIn("usage", data)
+        self.assertIn("input_tokens", data["usage"])
+        self.assertIn("output_tokens", data["usage"])
+
+    def test_025_anthropic_messages_streaming(self):
+        """Test Anthropic-compatible streaming messages endpoint."""
+        self.ensure_model_pulled()
+
+        payload = {
+            "model": ENDPOINT_TEST_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Say hello"}],
+                }
+            ],
+            "max_tokens": 16,
+            "stream": True,
+        }
+
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/v1/messages?beta=true",
+            json=payload,
+            timeout=TIMEOUT_MODEL_OPERATION,
+            stream=True,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        event_types = []
+        data_lines = 0
+        for raw_line in response.iter_lines():
+            if not raw_line:
+                continue
+
+            line = raw_line.decode("utf-8")
+            if line.startswith("event: "):
+                event_types.append(line[len("event: ") :])
+            elif line.startswith("data: "):
+                data_lines += 1
+                payload_json = json.loads(line[len("data: ") :])
+                self.assertIn("type", payload_json)
+
+        self.assertGreater(data_lines, 0, "Expected at least one data event")
+        self.assertIn("message_start", event_types)
+        self.assertIn("content_block_start", event_types)
+        self.assertIn("message_stop", event_types)
+
+    def test_026_anthropic_messages_tool_calling(self):
+        """Test Anthropic-compatible tool calling maps to tool_use blocks."""
+        # Use a model with native tool-calling support in its chat template;
+        # the tiny test model (gemma-3) lacks tool markers so the llama.cpp
+        # autoparser ignores tools even with tool_choice required.
+        response = requests.post(
+            f"{self.base_url}/pull",
+            json={"model_name": TOOL_CALLING_MODEL, "stream": False},
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        anthropic_tool = {
+            "name": SAMPLE_TOOL["function"]["name"],
+            "description": SAMPLE_TOOL["function"].get("description", ""),
+            "input_schema": SAMPLE_TOOL["function"].get("parameters", {}),
+        }
+
+        payload = {
+            "model": TOOL_CALLING_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Run the calculator_calculate tool with expression set to 1+1",
+                        }
+                    ],
+                }
+            ],
+            "tools": [anthropic_tool],
+            "tool_choice": {"type": "any"},
+            "max_tokens": 64,
+            "stream": False,
+        }
+
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/v1/messages?beta=true",
+            json=payload,
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        data = response.json()
+        self.assertIn("content", data)
+        tool_use_blocks = [b for b in data["content"] if b.get("type") == "tool_use"]
+        self.assertGreater(
+            len(tool_use_blocks), 0, "Expected at least one tool_use block"
+        )
+        self.assertEqual(data.get("stop_reason"), "tool_use")
+
 
 if __name__ == "__main__":
-    parse_args()
     run_server_tests(OllamaTests, "OLLAMA API TESTS")

@@ -11,24 +11,23 @@ namespace backends {
 
 class WhisperServer : public WrappedServer, public IAudioServer {
 public:
+    static InstallParams get_install_params(const std::string& backend, const std::string& version);
+
     inline static const BackendSpec SPEC = BackendSpec(
-    // recipe
         "whispercpp",
-    // executable
 #ifdef _WIN32
         "whisper-server.exe"
 #else
         "whisper-server"
 #endif
+        , get_install_params
     );
 
-    explicit WhisperServer(const std::string& log_level = "info",
-                          ModelManager* model_manager = nullptr);
+    explicit WhisperServer(const std::string& log_level,
+                          ModelManager* model_manager,
+                          BackendManager* backend_manager);
 
     ~WhisperServer() override;
-
-    // WrappedServer interface
-    void install(const std::string& backend = "") override;
 
     void load(const std::string& model_name,
              const ModelInfo& model_info,

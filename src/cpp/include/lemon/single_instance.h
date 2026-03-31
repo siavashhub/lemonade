@@ -1,14 +1,15 @@
 #pragma once
 
 #include <string>
+
 #ifdef _WIN32
 #include <windows.h>
-#include <tlhelp32.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/file.h>
 #include <errno.h>
+#include "lemon/utils/path_utils.h"
 #endif
 
 namespace lemon {
@@ -39,8 +40,7 @@ public:
 
         return false;
 #else
-        // Unix/Linux: Use file locking
-        std::string lock_file = "/tmp/lemonade_" + app_name + ".lock";
+        std::string lock_file = utils::get_runtime_dir() + "/lemonade_" + app_name + ".lock";
         int fd = open(lock_file.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0666);
 
         // If the file exists and has been created by another user, let's try again in read-only mode
@@ -64,7 +64,7 @@ public:
     }
 
 #ifdef _WIN32
-    // Windows-specific: Find and activate existing window
+    // Find and activate existing window
     static bool ActivateExistingInstance(const std::string& window_title) {
         HWND existing = FindWindowA(NULL, window_title.c_str());
         if (existing) {

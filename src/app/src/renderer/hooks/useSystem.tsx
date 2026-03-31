@@ -1,23 +1,25 @@
 import React, {createContext, useCallback, useContext, useEffect, useMemo, useState} from "react";
-import {fetchSystemInfoData, SystemInfo, Recipes} from "../utils/systemData";
+import {fetchSystemInfoData, SystemInfo} from "../utils/systemData";
 
 interface SystemContextValue {
   systemInfo?: SystemInfo;
   isLoading: boolean;
   supportedRecipes: SupportedRecipes;
   refresh: () => Promise<void>;
+  ensureSystemInfoLoaded: () => Promise<void>;
 }
 
 // Programmatic structure: recipe -> list of supported backends
 export interface SupportedRecipes {
-  [recipeName: string]: string[]; // e.g., { llamacpp: ['vulkan', 'rocm', 'cpu'], 'ryzenai-llm': ['default'] }
+  [recipeName: string]: string[]; // e.g., { llamacpp: ['vulkan', 'rocm', 'cpu'], 'ryzenai-llm': ['npu'] }
 }
 
 const SystemContext = createContext<SystemContextValue | null>(null);
 
 export const SystemProvider: React.FC<{ children: React.ReactNode }> = ({children}) => {
   const [systemInfo, setSystemInfo] = useState<SystemInfo>();
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(false);
+  const [hasLoaded, setHasLoaded] = useState(false);
 
   // Programmatically extract supported recipes and backends
   const supportedRecipes = useMemo<SupportedRecipes>(() => {
@@ -30,10 +32,10 @@ export const SystemProvider: React.FC<{ children: React.ReactNode }> = ({childre
     for (const [recipeName, recipe] of Object.entries(recipes)) {
       if (!recipe?.backends) continue;
 
-      // Collect all supported backends for this recipe (not just available/installed)
+      // Collect all backends that are viable on this system
       const supportedBackends: string[] = [];
       for (const [backendName, backend] of Object.entries(recipe.backends)) {
-        if (backend?.supported) {
+        if (backend?.state && backend.state !== 'unsupported') {
           supportedBackends.push(backendName);
         }
       }
@@ -52,9 +54,8 @@ export const SystemProvider: React.FC<{ children: React.ReactNode }> = ({childre
     setIsLoading(true);
     try {
       const data = await fetchSystemInfoData();
-
       setSystemInfo(data.info);
-
+      setHasLoaded(true);
     } catch (error) {
       console.error('Failed to fetch system info:', error);
     } finally {
@@ -62,16 +63,33 @@ export const SystemProvider: React.FC<{ children: React.ReactNode }> = ({childre
     }
   }, []);
 
-  // Initial load
+  // Ensure system info is loaded (for lazy loading on first model use)
+  const ensureSystemInfoLoaded = useCallback(async () => {
+    if (!hasLoaded && !isLoading) {
+      await refresh();
+    }
+  }, [hasLoaded, isLoading, refresh]);
+
+  // Auto-refresh when a backend install completes (from any codepath)
   useEffect(() => {
-    refresh();
+    const handleBackendsUpdated = () => {
+      refresh();
+    };
+    window.addEventListener('backendsUpdated', handleBackendsUpdated);
+    return () => {
+      window.removeEventListener('backendsUpdated', handleBackendsUpdated);
+    };
   }, [refresh]);
+
+  // No initial load - system info will be fetched when first needed
+  // (e.g., when user tries to load a model)
 
   const value: SystemContextValue = {
     systemInfo,
     supportedRecipes,
     isLoading,
     refresh,
+    ensureSystemInfoLoaded,
   };
 
   return (

@@ -14,11 +14,11 @@ Tests endpoints that don't require specific inference backends:
 
 Usage:
     python server_endpoints.py
-    python server_endpoints.py --server-per-test
     python server_endpoints.py --server-binary /path/to/lemonade-server
 """
 
 import json
+import platform
 import os
 import requests
 from openai import NotFoundError
@@ -26,8 +26,6 @@ from openai import NotFoundError
 from utils.server_base import (
     ServerTestBase,
     run_server_tests,
-    parse_args,
-    get_config,
     OpenAI,
 )
 from utils.test_models import (
@@ -35,6 +33,10 @@ from utils.test_models import (
     ENDPOINT_TEST_MODEL,
     TIMEOUT_MODEL_OPERATION,
     TIMEOUT_DEFAULT,
+    USER_MODEL_MAIN_CHECKPOINT,
+    USER_MODEL_NAME,
+    USER_MODEL_TE_CHECKPOINT,
+    USER_MODEL_VAE_CHECKPOINT,
 )
 
 
@@ -50,18 +52,13 @@ def get_recipe_options_path():
 class EndpointTests(ServerTestBase):
     """Tests for inference-agnostic endpoints."""
 
-    # Track if model has been pulled in per-test mode (persists across tests)
+    # Track if model has been pulled (persists across tests)
     _model_pulled = False
 
     @classmethod
     def setUpClass(cls):
-        """Set up class - start server and ensure test model is pulled."""
+        """Set up class - verify server and ensure test model is pulled."""
         super().setUpClass()
-
-        # In per-test mode, server isn't started until setUp(), so defer pre-pull
-        if get_config().get("server_per_test", False):
-            print("\n[SETUP] Per-test mode: will pull model in setUp()")
-            return
 
         # Ensure the test model is pulled once for all tests
         cls._ensure_model_pulled()
@@ -88,10 +85,6 @@ class EndpointTests(ServerTestBase):
         """Set up each test."""
         super().setUp()
 
-        # In per-test mode, ensure model is pulled after server starts
-        if get_config().get("server_per_test", False):
-            self._ensure_model_pulled()
-
     def test_000_endpoints_registered(self):
         """Verify all expected endpoints are registered on both v0 and v1."""
         valid_endpoints = [
@@ -110,6 +103,8 @@ class EndpointTests(ServerTestBase):
             "reranking",
             "audio/transcriptions",
             "images/generations",
+            "install",
+            "uninstall",
         ]
 
         session = requests.Session()
@@ -690,6 +685,21 @@ class EndpointTests(ServerTestBase):
             self.assertIsInstance(
                 backends, dict, f"Recipe {recipe_name} backends should be dict"
             )
+            has_supported_backend = any(
+                backend_data.get("state") != "unsupported"
+                for backend_data in backends.values()
+            )
+            if has_supported_backend:
+                self.assertIn(
+                    "default_backend",
+                    recipe_data,
+                    f"Recipe {recipe_name} missing 'default_backend'",
+                )
+                self.assertIn(
+                    recipe_data["default_backend"],
+                    backends,
+                    f"Recipe {recipe_name} default_backend must exist in backends map",
+                )
 
             # Each backend should have required fields
             for backend_name, backend_data in backends.items():
@@ -699,14 +709,19 @@ class EndpointTests(ServerTestBase):
                     f"Backend {recipe_name}/{backend_name} missing 'devices'",
                 )
                 self.assertIn(
-                    "supported",
+                    "state",
                     backend_data,
-                    f"Backend {recipe_name}/{backend_name} missing 'supported'",
+                    f"Backend {recipe_name}/{backend_name} missing 'state'",
                 )
                 self.assertIn(
-                    "available",
+                    "message",
                     backend_data,
-                    f"Backend {recipe_name}/{backend_name} missing 'available'",
+                    f"Backend {recipe_name}/{backend_name} missing 'message'",
+                )
+                self.assertIn(
+                    "action",
+                    backend_data,
+                    f"Backend {recipe_name}/{backend_name} missing 'action'",
                 )
                 self.assertIsInstance(
                     backend_data["devices"],
@@ -714,23 +729,31 @@ class EndpointTests(ServerTestBase):
                     f"Backend {recipe_name}/{backend_name} devices should be list",
                 )
                 self.assertIsInstance(
-                    backend_data["supported"],
-                    bool,
-                    f"Backend {recipe_name}/{backend_name} supported should be bool",
+                    backend_data["state"],
+                    str,
+                    f"Backend {recipe_name}/{backend_name} state should be string",
                 )
                 self.assertIsInstance(
-                    backend_data["available"],
-                    bool,
-                    f"Backend {recipe_name}/{backend_name} available should be bool",
+                    backend_data["message"],
+                    str,
+                    f"Backend {recipe_name}/{backend_name} message should be string",
                 )
-
-                # If not supported, should have error field
-                if not backend_data["supported"]:
-                    self.assertIn(
-                        "error",
-                        backend_data,
-                        f"Unsupported backend {recipe_name}/{backend_name} missing 'error'",
-                    )
+                self.assertIsInstance(
+                    backend_data["action"],
+                    str,
+                    f"Backend {recipe_name}/{backend_name} action should be string",
+                )
+                self.assertIn(
+                    backend_data["state"],
+                    {
+                        "unsupported",
+                        "installable",
+                        "update_required",
+                        "action_required",
+                        "installed",
+                    },
+                    f"Backend {recipe_name}/{backend_name} has invalid state: {backend_data['state']}",
+                )
 
                 # If available, may have version field (optional)
                 # version is optional, so we just check it's a string if present
@@ -745,7 +768,7 @@ class EndpointTests(ServerTestBase):
             f"[OK] /system-info: OS={data['OS Version'][:30]}..., recipes={len(recipes)}"
         )
 
-    def test_019_web_app_root(self):
+    def test_020_web_app_root(self):
         """Test that GET / returns HTML for the web app (browser-accessible UI)."""
         response = requests.get(f"http://localhost:{PORT}/", timeout=TIMEOUT_DEFAULT)
         self.assertEqual(response.status_code, 200)
@@ -763,7 +786,7 @@ class EndpointTests(ServerTestBase):
         )
         print(f"[OK] GET / returned HTML ({len(body)} bytes)")
 
-    def test_020_stats_endpoint(self):
+    def test_021_stats_endpoint(self):
         """Test the /stats endpoint returns performance metrics."""
         # First, make an inference request to populate stats
         requests.post(
@@ -792,6 +815,290 @@ class EndpointTests(ServerTestBase):
         self.assertIsInstance(data, dict)
 
         print(f"[OK] /stats endpoint returned: {list(data.keys())}")
+
+    def test_021_pull_multi(self):
+        # First delete model if it exists to ensure we're actually testing pull
+        delete_response = requests.post(
+            f"{self.base_url}/delete",
+            json={"model_name": USER_MODEL_NAME},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        # 200 = deleted, 422 = not found (both are acceptable)
+        self.assertIn(delete_response.status_code, [200, 422])
+
+        recipe = "sd-cpp"
+        ## sd-cpp currently unavailable on MacOS
+        if platform.system() == "Darwin":
+            recipe = "llamacpp"
+        recipe_backend = f"{recipe}_backend"
+
+        # Verify model is not in downloaded list
+        models_response = requests.get(
+            f"{self.base_url}/models", timeout=TIMEOUT_DEFAULT
+        )
+        models_data = models_response.json()
+        model_ids = [m["id"] for m in models_data["data"]]
+        self.assertNotIn(
+            USER_MODEL_NAME, model_ids, "Model should be deleted before pull test"
+        )
+
+        # Now pull the model
+        response = requests.post(
+            f"{self.base_url}/pull",
+            json={
+                "model_name": USER_MODEL_NAME,
+                "checkpoints": {
+                    "main": USER_MODEL_MAIN_CHECKPOINT,
+                    "text_encoder": USER_MODEL_TE_CHECKPOINT,
+                    "vae": USER_MODEL_VAE_CHECKPOINT,
+                },
+                "recipe": recipe,
+                "recipe_options": {recipe_backend: "cpu"},
+                "stream": False,
+            },
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        data = response.json()
+        self.assertIn("status", data)
+        self.assertEqual(data["status"], "success")
+
+        # Verify model is now in downloaded list
+        models_response = requests.get(
+            f"{self.base_url}/models/" + USER_MODEL_NAME, timeout=TIMEOUT_DEFAULT
+        )
+        model_data = models_response.json()
+        self.assertIn("id", model_data)
+        self.assertEqual(
+            model_data["id"], USER_MODEL_NAME, "Model should be downloaded after pull"
+        )
+        self.assertIn("checkpoints", model_data)
+        self.assertIn("main", model_data["checkpoints"])
+        self.assertEqual(
+            model_data["checkpoints"]["main"],
+            USER_MODEL_MAIN_CHECKPOINT,
+            "Main checkpoint not matching",
+        )
+        self.assertIn("text_encoder", model_data["checkpoints"])
+        self.assertEqual(
+            model_data["checkpoints"]["text_encoder"],
+            USER_MODEL_TE_CHECKPOINT,
+            "Text encoder checkpoint not matching",
+        )
+        self.assertIn("vae", model_data["checkpoints"])
+        self.assertEqual(
+            model_data["checkpoints"]["vae"],
+            USER_MODEL_VAE_CHECKPOINT,
+            "VAE checkpoint not matching",
+        )
+        self.assertIn("recipe", model_data)
+        self.assertEqual(
+            model_data["recipe"], recipe, f"Model recipe should be {recipe}"
+        )
+
+        self.assertIn("labels", model_data)
+        self.assertIn("custom", model_data["labels"])
+
+        if recipe == "sd-cpp":
+            self.assertIn("image", model_data["labels"])
+
+        self.assertIn("recipe_options", model_data)
+        self.assertIn(recipe_backend, model_data["recipe_options"])
+        self.assertEqual(
+            model_data["recipe_options"][recipe_backend],
+            "cpu",
+            f"{recipe_backend} should be cpu",
+        )
+
+        print(f"[OK] Pull (multicheckpoint): model={USER_MODEL_NAME}")
+
+    def _get_test_backend(self):
+        """Get a lightweight test backend based on platform."""
+        import sys
+
+        if sys.platform == "darwin":
+            return "llamacpp", "metal"
+        else:
+            return "llamacpp", "cpu"
+
+    def test_022_install_backend_non_streaming(self):
+        """Test installing a backend via /install endpoint (non-streaming)."""
+        recipe, backend = self._get_test_backend()
+
+        # First uninstall to get clean state
+        requests.post(
+            f"{self.base_url}/uninstall",
+            json={"recipe": recipe, "backend": backend},
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+
+        # Install (non-streaming)
+        response = requests.post(
+            f"{self.base_url}/install",
+            json={"recipe": recipe, "backend": backend, "stream": False},
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["recipe"], recipe)
+        self.assertEqual(data["backend"], backend)
+        print(f"[OK] Non-streaming install of {recipe}:{backend}")
+
+    def test_023_install_backend_streaming(self):
+        """Test installing a backend with SSE streaming progress."""
+        recipe, backend = self._get_test_backend()
+
+        # Uninstall first to force a fresh download
+        requests.post(
+            f"{self.base_url}/uninstall",
+            json={"recipe": recipe, "backend": backend},
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+
+        # Install with streaming
+        response = requests.post(
+            f"{self.base_url}/install",
+            json={"recipe": recipe, "backend": backend, "stream": True},
+            timeout=TIMEOUT_MODEL_OPERATION,
+            stream=True,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        # Parse SSE events
+        got_progress = False
+        got_complete = False
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if line.startswith("event: progress"):
+                got_progress = True
+            elif line.startswith("event: complete"):
+                got_complete = True
+            elif line.startswith("event: error"):
+                self.fail(f"Received error event: {line}")
+
+        self.assertTrue(got_complete, "Expected 'complete' SSE event")
+        print(
+            f"[OK] Streaming install of {recipe}:{backend} (progress events: {got_progress})"
+        )
+
+    def test_024_install_already_installed(self):
+        """Test that installing an already-installed backend returns quickly."""
+        recipe, backend = self._get_test_backend()
+
+        response = requests.post(
+            f"{self.base_url}/install",
+            json={"recipe": recipe, "backend": backend, "stream": False},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "success")
+        print(
+            f"[OK] Re-install of already-installed {recipe}:{backend} returned quickly"
+        )
+
+    def test_025_uninstall_backend(self):
+        """Test uninstalling a backend via /uninstall endpoint."""
+        recipe, backend = self._get_test_backend()
+
+        # Ensure installed first
+        requests.post(
+            f"{self.base_url}/install",
+            json={"recipe": recipe, "backend": backend, "stream": False},
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+
+        # Verify via system-info
+        response = requests.get(f"{self.base_url}/system-info", timeout=TIMEOUT_DEFAULT)
+        info = response.json()
+        self.assertTrue(
+            info["recipes"][recipe]["backends"][backend].get("state", "")
+            in {"installed", "update_required"},
+            f"Expected {recipe}:{backend} to be installed before uninstall",
+        )
+
+        # Uninstall
+        response = requests.post(
+            f"{self.base_url}/uninstall",
+            json={"recipe": recipe, "backend": backend},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "success")
+        print(f"[OK] Uninstalled {recipe}:{backend}")
+
+    def test_026_uninstall_not_installed(self):
+        """Test uninstalling a backend that isn't installed."""
+        recipe, backend = self._get_test_backend()
+
+        # Uninstall twice - second time should still return 200
+        requests.post(
+            f"{self.base_url}/uninstall",
+            json={"recipe": recipe, "backend": backend},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        response = requests.post(
+            f"{self.base_url}/uninstall",
+            json={"recipe": recipe, "backend": backend},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 200)
+        print(f"[OK] Uninstalling non-installed {recipe}:{backend} returns 200")
+
+    def test_027_reinstall_after_uninstall(self):
+        """Test full cycle: install, verify, uninstall, verify, reinstall."""
+        recipe, backend = self._get_test_backend()
+
+        # Re-install to leave system in clean state for other tests
+        response = requests.post(
+            f"{self.base_url}/install",
+            json={"recipe": recipe, "backend": backend, "stream": False},
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+        self.assertEqual(response.status_code, 200)
+        print(f"[OK] Reinstalled {recipe}:{backend} - system in clean state")
+
+    def test_028_install_missing_params(self):
+        """Test that /install returns 400 for missing parameters."""
+        response = requests.post(
+            f"{self.base_url}/install",
+            json={"recipe": "llamacpp"},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 400)
+        print("[OK] /install returns 400 for missing 'backend' parameter")
+
+    def test_029_system_info_release_url(self):
+        """Test that system-info includes release_url for backends."""
+        response = requests.get(f"{self.base_url}/system-info", timeout=TIMEOUT_DEFAULT)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+
+        # Check that at least one backend has a release_url
+        found_url = False
+        if "recipes" in data:
+            for recipe_name, recipe_info in data["recipes"].items():
+                if "backends" in recipe_info:
+                    for backend_name, backend_info in recipe_info["backends"].items():
+                        if "release_url" in backend_info:
+                            found_url = True
+                            url = backend_info["release_url"]
+                            self.assertTrue(
+                                url.startswith("https://github.com/"),
+                                f"Expected GitHub URL, got: {url}",
+                            )
+                            break
+                if found_url:
+                    break
+
+        self.assertTrue(
+            found_url, "Expected at least one backend with release_url in system-info"
+        )
+        print("[OK] system-info contains release_url for backends")
 
 
 if __name__ == "__main__":

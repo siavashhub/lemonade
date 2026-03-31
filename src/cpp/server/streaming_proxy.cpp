@@ -1,7 +1,7 @@
 #include "lemon/streaming_proxy.h"
 #include <sstream>
-#include <iomanip>
 #include <iostream>
+#include <lemon/utils/aixlog.hpp>
 
 namespace lemon {
 
@@ -43,13 +43,13 @@ void StreamingProxy::forward_sse_stream(
 
     if (result.status_code != 200) {
         stream_error = true;
-        std::cerr << "[StreamingProxy] Backend returned error: " << result.status_code << std::endl;
+        LOG(ERROR, "StreamingProxy") << "Backend returned error: " << result.status_code << std::endl;
     }
 
     if (!stream_error) {
         // Ensure [DONE] marker is sent if backend didn't send it
         if (!has_done_marker) {
-            std::cerr << "[StreamingProxy] WARNING: Backend did not send [DONE] marker, adding it" << std::endl;
+            LOG(WARNING, "StreamingProxy") << "WARNING: Backend did not send [DONE] marker, adding it" << std::endl;
             const char* done_marker = "data: [DONE]\n\n";
             sink.write(done_marker, strlen(done_marker));
         }
@@ -57,7 +57,7 @@ void StreamingProxy::forward_sse_stream(
         // Explicitly flush and signal completion
         sink.done();
 
-        std::cout << "[Server] Streaming completed - 200 OK" << std::endl;
+        LOG(INFO, "Server") << "Streaming completed - 200 OK" << std::endl;
 
         // Parse telemetry from buffered data
         auto telemetry = parse_telemetry(telemetry_buffer);
@@ -66,6 +66,9 @@ void StreamingProxy::forward_sse_stream(
         if (on_complete) {
             on_complete(telemetry);
         }
+    } else {
+        // Properly terminate the chunked response even on error
+        sink.done();
     }
 }
 
@@ -95,13 +98,16 @@ void StreamingProxy::forward_byte_stream(
 
     if (result.status_code != 200) {
         stream_error = true;
-        std::cerr << "[StreamingProxy] Backend returned error: " << result.status_code << std::endl;
+        LOG(ERROR, "StreamingProxy") << "Backend returned error: " << result.status_code << std::endl;
     }
 
     if (!stream_error) {
         // Explicitly flush and signal completion
         sink.done();
-        std::cout << "[Server] Streaming completed - 200 OK" << std::endl;
+        LOG(INFO, "Server") << "Streaming completed - 200 OK" << std::endl;
+    } else {
+        // Properly terminate the chunked response even on error
+        sink.done();
     }
 }
 
@@ -175,7 +181,7 @@ StreamingProxy::TelemetryData StreamingProxy::parse_telemetry(const std::string&
                 }
             }
         } catch (const std::exception& e) {
-            std::cerr << "[StreamingProxy] Error parsing telemetry: " << e.what() << std::endl;
+            LOG(ERROR, "StreamingProxy") << "Error parsing telemetry: " << e.what() << std::endl;
         }
     }
 

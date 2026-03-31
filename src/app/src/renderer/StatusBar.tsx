@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { serverConfig, onServerUrlChange } from './utils/serverConfig';
 
 interface ServerStats {
@@ -13,6 +13,7 @@ interface SystemStats {
   memory_gb: number;
   gpu_percent: number | null;
   vram_gb: number | null;
+  npu_percent: number | null;
 }
 
 const StatusBar: React.FC = () => {
@@ -27,7 +28,12 @@ const StatusBar: React.FC = () => {
     memory_gb: 0,
     gpu_percent: null,
     vram_gb: null,
+    npu_percent: null,
   });
+  const [connectionStatus, setConnectionStatus] = useState<'connected' | 'connecting' | 'disconnected'>('connecting');
+  const [serverUrl, setServerUrl] = useState<string>('');
+  const [lastSuccessfulConnection, setLastSuccessfulConnection] = useState<number | null>(null);
+  const lastSystemStatsFetchRef = useRef<number>(0);
 
   const fetchStats = useCallback(async () => {
     try {
@@ -40,13 +46,22 @@ const StatusBar: React.FC = () => {
           time_to_first_token: data.time_to_first_token ?? null,
           tokens_per_second: data.tokens_per_second ?? null,
         });
+        setConnectionStatus('connected');
+        setLastSuccessfulConnection(Date.now());
       }
     } catch {
-      // Server may not be running, ignore errors
+      // Connection monitoring interval will handle timeout
+      setConnectionStatus('disconnected');
     }
   }, []);
 
   const fetchSystemStats = useCallback(async () => {
+    const now = Date.now();
+    if (now - lastSystemStatsFetchRef.current < 1000) {
+      return;
+    }
+    lastSystemStatsFetchRef.current = now;
+
     try {
       if (window.api?.getSystemStats) {
         const stats = await window.api.getSystemStats();
@@ -55,41 +70,48 @@ const StatusBar: React.FC = () => {
           memory_gb: stats.memory_gb ?? 0,
           gpu_percent: stats.gpu_percent ?? null,
           vram_gb: stats.vram_gb ?? null,
+          npu_percent: stats.npu_percent ?? null,
         });
       }
     } catch {
-      // Ignore errors
     }
   }, []);
 
   useEffect(() => {
-    // Initial fetch
     fetchStats();
     fetchSystemStats();
 
-    // Listen for inference completion to refresh server stats
+    const initialUrl = serverConfig.getServerBaseUrl();
+    setServerUrl(initialUrl);
+
     const handleInferenceComplete = () => {
       fetchStats();
     };
     window.addEventListener('inference-complete', handleInferenceComplete);
 
-    // Poll server stats infrequently as fallback (every 30s)
-    const statsInterval = setInterval(fetchStats, 30000);
-    // Poll system stats more frequently (every 5s) since they change over time
-    const systemInterval = setInterval(fetchSystemStats, 5000);
-
-    // Re-fetch when server URL changes
-    const unsubscribe = onServerUrlChange(() => {
+    const unsubscribe = onServerUrlChange((url, apiKey) => {
+      setServerUrl(url);
+      setConnectionStatus('connecting');
       fetchStats();
     });
 
     return () => {
       window.removeEventListener('inference-complete', handleInferenceComplete);
-      clearInterval(statsInterval);
-      clearInterval(systemInterval);
       unsubscribe();
     };
   }, [fetchStats, fetchSystemStats]);
+
+  useEffect(() => {
+    // Poll every 3s when connecting/disconnected, every 15s when connected
+    const pollInterval = connectionStatus === 'connected' ? 15000 : 3000;
+    const statsInterval = setInterval(fetchStats, pollInterval);
+    const systemInterval = setInterval(fetchSystemStats, 5000);
+
+    return () => {
+      clearInterval(statsInterval);
+      clearInterval(systemInterval);
+    };
+  }, [connectionStatus, fetchStats, fetchSystemStats]);
 
   const formatTokens = (value: number | null): string => {
     if (value === null || value === undefined) return 'N/A';
@@ -107,7 +129,7 @@ const StatusBar: React.FC = () => {
 
   const formatPercent = (percent: number | null): string => {
     if (percent === null || percent === undefined) return 'N/A';
-    return `${percent.toFixed(2)} %`;
+    return `${percent.toFixed(1)} %`;
   };
 
   const formatTtft = (seconds: number | null): string => {
@@ -120,44 +142,81 @@ const StatusBar: React.FC = () => {
     return `${tps.toFixed(1)}`;
   };
 
+  const formatServerUrl = (url: string): string => {
+    if (!url) return 'N/A';
+
+    if (url.includes('localhost') || url.includes('127.0.0.1')) {
+      return url;
+    }
+
+    try {
+      const urlObj = new URL(url);
+      return urlObj.host;
+    } catch {
+      return url;
+    }
+  };
+
   return (
     <div className="status-bar">
+      <div className="status-bar-item status-bar-connection" title={serverUrl}>
+        <span className={`connection-indicator connection-${connectionStatus}`}>●</span>
+        <span className="status-bar-label status-bar-label-long">STATUS:</span>
+        <span className="status-bar-label status-bar-label-short"></span>
+        <span className="status-bar-value">{connectionStatus.toUpperCase()}</span>
+      </div>
+
       <div className="status-bar-item">
-        <span className="status-bar-label">INPUT TOKENS:</span>
+        <span className="status-bar-label status-bar-label-long">INPUT TOKENS:</span>
+        <span className="status-bar-label status-bar-label-short">IN:</span>
         <span className="status-bar-value">{formatTokens(serverStats.input_tokens)}</span>
       </div>
       <div className="status-bar-item">
-        <span className="status-bar-label">OUTPUT TOKENS:</span>
+        <span className="status-bar-label status-bar-label-long">OUTPUT TOKENS:</span>
+        <span className="status-bar-label status-bar-label-short">OUT:</span>
         <span className="status-bar-value">{formatTokens(serverStats.output_tokens)}</span>
       </div>
       <div className="status-bar-item">
-        <span className="status-bar-label">TPS:</span>
+        <span className="status-bar-label status-bar-label-long">TPS:</span>
+        <span className="status-bar-label status-bar-label-short">TPS:</span>
         <span className="status-bar-value">{formatTps(serverStats.tokens_per_second)}</span>
       </div>
       <div className="status-bar-item">
-        <span className="status-bar-label">TTFT:</span>
+        <span className="status-bar-label status-bar-label-long">TTFT:</span>
+        <span className="status-bar-label status-bar-label-short">TTFT:</span>
         <span className="status-bar-value">{formatTtft(serverStats.time_to_first_token)}</span>
       </div>
       <div className="status-bar-item">
-        <span className="status-bar-label">RAM:</span>
+        <span className="status-bar-label status-bar-label-long">RAM:</span>
+        <span className="status-bar-label status-bar-label-short">RAM:</span>
         <span className="status-bar-value">{formatMemory(systemStats.memory_gb)}</span>
       </div>
       {systemStats.cpu_percent !== null && systemStats.cpu_percent !== undefined && (
         <div className="status-bar-item">
-          <span className="status-bar-label">CPU:</span>
+          <span className="status-bar-label status-bar-label-long">CPU:</span>
+          <span className="status-bar-label status-bar-label-short">CPU:</span>
           <span className="status-bar-value">{formatPercent(systemStats.cpu_percent)}</span>
         </div>
       )}
       {systemStats.gpu_percent !== null && systemStats.gpu_percent !== undefined && (
         <div className="status-bar-item">
-          <span className="status-bar-label">GPU:</span>
+          <span className="status-bar-label status-bar-label-long">GPU:</span>
+          <span className="status-bar-label status-bar-label-short">GPU:</span>
           <span className="status-bar-value">{formatPercent(systemStats.gpu_percent)}</span>
         </div>
       )}
       {systemStats.vram_gb !== null && (
         <div className="status-bar-item">
-          <span className="status-bar-label">VRAM:</span>
+          <span className="status-bar-label status-bar-label-long">VRAM:</span>
+          <span className="status-bar-label status-bar-label-short">VRAM:</span>
           <span className="status-bar-value">{formatVram(systemStats.vram_gb)}</span>
+        </div>
+      )}
+      {systemStats.npu_percent !== null && (
+        <div className="status-bar-item">
+          <span className="status-bar-label status-bar-label-long">NPU:</span>
+          <span className="status-bar-label status-bar-label-short">NPU:</span>
+          <span className="status-bar-value">{formatPercent(systemStats.npu_percent)}</span>
         </div>
       )}
     </div>

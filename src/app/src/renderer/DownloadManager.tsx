@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { serverFetch } from './utils/serverConfig';
+import { deleteModel, uninstallBackend } from './utils/backendInstaller';
 
 export interface DownloadItem {
   id: string;
@@ -13,7 +13,9 @@ export interface DownloadItem {
   status: 'downloading' | 'paused' | 'completed' | 'error' | 'cancelled' | 'deleting';
   error?: string;
   startTime: number;
+  bytesResumed: number;  // Bytes already on disk at session start (for accurate speed)
   abortController?: AbortController;
+  downloadType?: 'model' | 'backend';
 }
 
 interface DownloadManagerProps {
@@ -85,7 +87,9 @@ const DownloadManager: React.FC<DownloadManagerProps> = ({ isVisible, onClose })
   const calculateSpeed = (download: DownloadItem): number => {
     const elapsedSeconds = (Date.now() - download.startTime) / 1000;
     if (elapsedSeconds === 0) return 0;
-    return download.bytesDownloaded / elapsedSeconds;
+    // Only count bytes downloaded in this session, not bytes already on disk from a prior run
+    const sessionBytes = download.bytesDownloaded - (download.bytesResumed || 0);
+    return Math.max(0, sessionBytes) / elapsedSeconds;
   };
 
   const calculateETA = (download: DownloadItem): string => {
@@ -168,18 +172,13 @@ const DownloadManager: React.FC<DownloadManagerProps> = ({ isVisible, onClose })
       window.addEventListener('download:cleanup-complete' as any, handler);
     });
 
-    // Call delete endpoint to clean up any partial downloads
+    // Clean up partial downloads via the unified helpers
     try {
-      const response = await serverFetch('/delete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model_name: download.modelName })
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('Failed to delete partial download files:', response.statusText, errorText);
-        alert(`Download cancelled, but failed to delete files: ${response.statusText}\nPartial files may remain on disk.`);
+      if (download.downloadType === 'backend') {
+        const [recipe, backend] = download.modelName.split(':');
+        await uninstallBackend(recipe, backend);
+      } else {
+        await deleteModel(download.modelName);
       }
     } catch (error) {
       console.error('Error deleting partial download files:', error);
@@ -207,26 +206,20 @@ const DownloadManager: React.FC<DownloadManagerProps> = ({ isVisible, onClose })
       d.id === download.id ? { ...d, status: 'deleting' as const } : d
     ));
 
-    // Call delete endpoint to clean up files
+    // Clean up files via the unified helpers
     try {
-      const response = await serverFetch('/delete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model_name: download.modelName })
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('Failed to delete model files:', response.statusText, errorText);
-        alert(`Failed to delete model files: ${response.statusText}`);
-        return;
+      if (download.downloadType === 'backend') {
+        const [recipe, backend] = download.modelName.split(':');
+        await uninstallBackend(recipe, backend);
+      } else {
+        await deleteModel(download.modelName);
       }
 
       // Only remove from downloads list if deletion was successful
       handleRemoveDownload(download.id);
     } catch (error) {
-      console.error('Error deleting model files:', error);
-      alert(`Error deleting model files: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      console.error('Error deleting download files:', error);
+      alert(`Error deleting files: ${error instanceof Error ? error.message : 'Unknown error'}`);
       // Revert status on error
       setDownloads(prev => prev.map(d =>
         d.id === download.id ? { ...d, status: 'paused' as const } : d
@@ -244,7 +237,7 @@ const DownloadManager: React.FC<DownloadManagerProps> = ({ isVisible, onClose })
   const handleResumeDownload = (download: DownloadItem) => {
     // Dispatch event to trigger a new download
     window.dispatchEvent(new CustomEvent('download:resume', {
-      detail: { modelName: download.modelName }
+      detail: { modelName: download.modelName, downloadType: download.downloadType }
     }));
 
     // Remove the paused download from the list as a new one will be created
@@ -277,7 +270,7 @@ const DownloadManager: React.FC<DownloadManagerProps> = ({ isVisible, onClose })
 
     // Dispatch event to trigger a new download
     window.dispatchEvent(new CustomEvent('download:retry', {
-      detail: { modelName: download.modelName }
+      detail: { modelName: download.modelName, downloadType: download.downloadType }
     }));
 
     // Remove the cancelled download from the list as a new one will be created

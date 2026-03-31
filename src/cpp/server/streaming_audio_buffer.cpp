@@ -1,9 +1,9 @@
 #include "lemon/streaming_audio_buffer.h"
-#include <ixwebsocket/IXBase64.h>
+#include <libwebsockets.h>
 #include <cstring>
-#include <stdexcept>
 #include <algorithm>
 #include <iostream>
+#include <lemon/utils/aixlog.hpp>
 
 namespace lemon {
 
@@ -12,9 +12,12 @@ void StreamingAudioBuffer::append(const std::string& base64_audio) {
         return;
     }
 
-    // Decode base64 to raw bytes using ixwebsocket's base64 implementation
-    std::string decoded_str;
-    macaron::Base64::Decode(base64_audio, decoded_str);
+    // Decode base64 to raw bytes using libwebsockets' base64 implementation
+    std::vector<char> decode_buf(base64_audio.size());
+    int decoded_len = lws_b64_decode_string_len(
+        base64_audio.c_str(), static_cast<int>(base64_audio.size()),
+        decode_buf.data(), static_cast<int>(decode_buf.size()));
+    std::string decoded_str(decode_buf.data(), decoded_len > 0 ? decoded_len : 0);
     const auto* raw_bytes = reinterpret_cast<const uint8_t*>(decoded_str.data());
     size_t raw_size = decoded_str.size();
 
@@ -32,20 +35,20 @@ void StreamingAudioBuffer::append(const std::string& base64_audio) {
     static bool logged_first = false;
     if (!logged_first && num_samples > 0) {
         logged_first = true;
-        std::cout << "[AudioBuffer] base64 length=" << base64_audio.size()
+        LOG(DEBUG, "AudioBuffer") << "base64 length=" << base64_audio.size()
                   << " decoded bytes=" << raw_size
                   << " samples=" << num_samples << std::endl;
-        std::cout << "[AudioBuffer] first 8 raw bytes:";
-        for (size_t i = 0; i < std::min(raw_size, size_t(8)); i++) {
-            std::cout << " " << static_cast<int>(raw_bytes[i]);
+        LOG(DEBUG, "AudioBuffer") << "first 8 raw bytes:";
+        for (size_t i = 0; i < (std::min)(raw_size, size_t(8)); i++) {
+            LOG(DEBUG, "AudioBuffer") << " " << static_cast<int>(raw_bytes[i]);
         }
-        std::cout << std::endl;
-        std::cout << "[AudioBuffer] first 4 int16 samples:";
-        for (size_t i = 0; i < std::min(num_samples, size_t(4)); i++) {
-            std::cout << " " << new_samples[i];
+        LOG(DEBUG, "AudioBuffer") << std::endl;
+        LOG(DEBUG, "AudioBuffer") << "first 4 int16 samples:";
+        for (size_t i = 0; i < (std::min)(num_samples, size_t(4)); i++) {
+            LOG(DEBUG, "AudioBuffer") << " " << new_samples[i];
         }
-        std::cout << std::endl;
-        std::cout << "[AudioBuffer] base64 prefix: " << base64_audio.substr(0, 40) << std::endl;
+        LOG(DEBUG, "AudioBuffer") << std::endl;
+        LOG(DEBUG, "AudioBuffer") << "base64 prefix: " << base64_audio.substr(0, 40) << std::endl;
     }
 
     std::lock_guard<std::mutex> lock(mutex_);

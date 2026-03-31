@@ -9,6 +9,8 @@
 #include <httplib.h>
 #include "wrapped_server.h"
 #include "model_manager.h"
+#include "backend_manager.h"
+#include "runtime_config.h"
 
 namespace lemon {
 
@@ -16,10 +18,9 @@ using json = nlohmann::json;
 
 class Router {
 public:
-    Router(const json& default_options = json::object(),
-           const std::string& log_level = "info",
-           ModelManager* model_manager = nullptr,
-           int max_loaded_models = 1);
+    Router(RuntimeConfig* config,
+           ModelManager* model_manager,
+           BackendManager* backend_manager);
 
     ~Router();
 
@@ -49,6 +50,9 @@ public:
     // Check if a specific model is loaded
     bool is_model_loaded(const std::string& model_name) const;
 
+    // Get the recipe options for a loaded model (empty if not loaded)
+    RecipeOptions get_model_recipe_options(const std::string& model_name) const;
+
     // Get the model type for a loaded model (returns LLM if not found)
     ModelType get_model_type(const std::string& model_name = "") const;
 
@@ -68,6 +72,8 @@ public:
 
     // Image endpoints (OpenAI /v1/images/* compatible)
     json image_generations(const json& request);
+    json image_edits(const json& request);
+    json image_variations(const json& request);
 
     // Forward streaming requests to the appropriate wrapped server
     void chat_completion_stream(const std::string& request_body, httplib::DataSink& sink);
@@ -88,13 +94,10 @@ private:
     // Multi-model support: Manage multiple WrappedServers
     std::vector<std::unique_ptr<WrappedServer>> loaded_servers_;
 
-    // Configuration
-    json default_options_;
-    std::string log_level_;
+    // Configuration (non-owning pointer; same lifetime as Server)
+    RuntimeConfig* config_;
     ModelManager* model_manager_;  // Non-owning pointer to ModelManager
-
-    // Multi-model limit (applies to each type slot)
-    int max_loaded_models_;
+    BackendManager* backend_manager_;  // Non-owning pointer to BackendManager
 
     // Concurrency control for load operations
     mutable std::mutex load_mutex_;              // Protects loading state and loaded_servers_
@@ -108,6 +111,9 @@ private:
     WrappedServer* find_lru_server_by_type(ModelType type) const;
     bool has_npu_server() const;
     WrappedServer* find_npu_server() const;
+    WrappedServer* find_npu_server_by_recipe(const std::string& recipe) const;
+    WrappedServer* find_flm_server_by_type(ModelType type) const;
+    void evict_all_npu_servers();
     void evict_server(WrappedServer* server);
     void evict_all_servers();
     std::unique_ptr<WrappedServer> create_backend_server(const ModelInfo& model_info);

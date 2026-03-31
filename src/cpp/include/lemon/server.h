@@ -11,8 +11,10 @@
 #include <atomic>
 #include <chrono>
 #include <httplib.h>
+#include "runtime_config.h"
 #include "router.h"
 #include "model_manager.h"
+#include "backend_manager.h"
 #ifdef LEMON_HAS_WEBSOCKET
 #include "websocket_server.h"
 #endif
@@ -28,7 +30,8 @@ public:
            const json& default_options,
            int max_loaded_models,
            const std::string& extra_models_dir,
-           bool no_broadcast);
+           bool no_broadcast,
+           long http_timeout);
 
     ~Server();
 
@@ -49,6 +52,16 @@ private:
     void setup_http_logger(httplib::Server &web_server);
     void log_request(const httplib::Request& req);
     httplib::Server::HandlerResponse authenticate_request(const httplib::Request& req, httplib::Response& res);
+
+    // Setup HTTP servers (create httplib::Server instances, routes, CORS, thread pool)
+    void setup_http_servers();
+
+    // Unified config endpoints
+    void handle_config_set(const httplib::Request& req, httplib::Response& res);
+    void handle_config_get(const httplib::Request& req, httplib::Response& res);
+
+    // Side-effect callback for RuntimeConfig::set()
+    void apply_config_side_effects(const std::vector<std::string>& changed_keys);
 
     // Endpoint handlers
     void handle_health(const httplib::Request& req, httplib::Response& res);
@@ -71,19 +84,27 @@ private:
     void handle_log_level(const httplib::Request& req, httplib::Response& res);
     void handle_shutdown(const httplib::Request& req, httplib::Response& res);
     void handle_logs_stream(const httplib::Request& req, httplib::Response& res);
+#ifdef HAVE_SYSTEMD
+    void handle_logs_stream_journald(const httplib::Request& req, httplib::Response& res);
+#endif
+
+    // Backend management endpoint handlers
+    void handle_install(const httplib::Request& req, httplib::Response& res);
+    void handle_uninstall(const httplib::Request& req, httplib::Response& res);
+
+    // Enrich recipes JSON with release_url, download_filename, version from BackendManager
+    void enrich_recipes(json& recipes);
+
+    // Shared SSE streaming helper for download operations
+    void stream_download_operation(
+        httplib::Response& res,
+        std::function<void(DownloadProgressCallback)> operation);
 
     // Helper function for local model resolution and registration
     void resolve_and_register_local_model(
         const std::string& dest_path,
         const std::string& model_name,
-        const std::string& recipe,
-        const std::string& variant,
-        const std::string& mmproj,
-        bool reasoning,
-        bool& vision,
-        bool embedding,
-        bool reranking,
-        bool image,
+        const json& model_data,
         const std::string& hf_cache);
 
     // Audio endpoint handlers (OpenAI /v1/audio/* compatible)
@@ -92,6 +113,15 @@ private:
 
     // Image endpoint handlers (OpenAI /v1/images/* compatible)
     void handle_image_generations(const httplib::Request& req, httplib::Response& res);
+    void handle_image_edits(const httplib::Request& req, httplib::Response& res);
+    void handle_image_variations(const httplib::Request& req, httplib::Response& res);
+    void handle_image_upscale(const httplib::Request& req, httplib::Response& res);
+
+    // Shared helpers for image multipart handlers
+    // Return true on success; on failure set res status/body and return false.
+    bool parse_n_from_form(const httplib::Request& req, httplib::Response& res, nlohmann::json& out);
+    bool extract_image_from_form(const httplib::Request& req, httplib::Response& res, nlohmann::json& out);
+    bool load_image_model(const nlohmann::json& request_json, httplib::Response& res);
 
     // Helper function for auto-loading models (eliminates code duplication and race conditions)
     void auto_load_model_if_needed(const std::string& model_name);
@@ -105,13 +135,11 @@ private:
     double get_cpu_usage();
     double get_gpu_usage();
     double get_vram_usage();
+    double get_npu_utilization();
 
-    int port_;
-    std::string host_;
-    std::string log_level_;
-    json default_options_;
+    std::shared_ptr<RuntimeConfig> config_;
+    std::atomic<int> port_;  // Atomic cache for lock-free reads from listener threads
     std::string log_file_path_;
-    bool no_broadcast_;
 
     std::thread http_v4_thread_;
     std::thread http_v6_thread_;
@@ -122,11 +150,13 @@ private:
 
     std::unique_ptr<Router> router_;
     std::unique_ptr<ModelManager> model_manager_;
+    std::unique_ptr<BackendManager> backend_manager_;
 #ifdef LEMON_HAS_WEBSOCKET
     std::unique_ptr<WebSocketServer> websocket_server_;
 #endif
 
     bool running_;
+    std::atomic<bool> rebind_requested_{false};
 
     std::string api_key_;
     NetworkBeacon udp_beacon_;

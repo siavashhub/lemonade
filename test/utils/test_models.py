@@ -101,6 +101,9 @@ SAMPLE_TOOL = {
 # Models for endpoint testing (inference-agnostic, just need any valid small model)
 ENDPOINT_TEST_MODEL = "Tiny-Test-Model-GGUF"
 
+# Model for tool-calling tests (must have native tool-calling support in its chat template)
+TOOL_CALLING_MODEL = "Qwen3-4B-Instruct-2507-GGUF"
+
 # Secondary model for multi-model testing (small, fast to load)
 MULTI_MODEL_SECONDARY = "Tiny-Test-Model-GGUF"
 
@@ -119,8 +122,22 @@ VISION_MODEL = "Gemma-3-4b-it-GGUF"
 # Stable Diffusion test configuration
 SD_MODEL = "SD-Turbo"
 
+# ESRGAN upscale model test configuration
+ESRGAN_MODEL = "RealESRGAN-x4plus"
+
 # Text-to-Speech test configuration
 TTS_MODEL = "kokoro-v1"
+
+# User models. The combinations of files seen here do not work but we will only test download
+USER_MODEL_NAME = "user.Dummy-Model"
+USER_MODEL_MAIN_CHECKPOINT = (
+    "unsloth/SmolLM2-135M-Instruct-GGUF:SmolLM2-135M-Instruct-Q2_K.gguf"
+)
+USER_MODEL_TE_CHECKPOINT = (
+    "mradermacher/SmolLM2-135M-Instruct-GGUF:SmolLM2-135M-Instruct.Q2_K.gguf"
+)
+# Using a file not at repo top-level
+USER_MODEL_VAE_CHECKPOINT = "Comfy-Org/z_image:split_files/vae/ae.safetensors"
 
 # Models that should be pre-downloaded for offline testing
 MODELS_FOR_OFFLINE_CACHE = [

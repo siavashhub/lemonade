@@ -5,7 +5,6 @@ Tests the /images/generations endpoint with Stable Diffusion models.
 
 Usage:
     python server_sd.py
-    python server_sd.py --server-per-test
     python server_sd.py --server-binary /path/to/lemonade-server
 
 Note: Image generation with CPU backend takes ~2-3 minutes per image at 256x256.
@@ -13,6 +12,9 @@ The Vulkan backend is faster but may have compatibility issues with some GPUs.
 """
 
 import base64
+import io
+import struct
+import zlib
 import requests
 
 from utils.server_base import (
@@ -21,10 +23,33 @@ from utils.server_base import (
 )
 from utils.test_models import (
     SD_MODEL,
+    ESRGAN_MODEL,
     PORT,
     TIMEOUT_MODEL_OPERATION,
     TIMEOUT_DEFAULT,
 )
+
+
+def create_minimal_png(width=8, height=8):
+    """Create a minimal valid RGB PNG image as bytes, without external dependencies."""
+
+    def make_chunk(chunk_type, data):
+        c = chunk_type + data
+        return (
+            struct.pack(">I", len(data))
+            + c
+            + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+        )
+
+    ihdr_data = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    row = b"\x00" + b"\xff\x00\x00" * width  # filter byte + red pixels per row
+    idat_data = zlib.compress(row * height)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + make_chunk(b"IHDR", ihdr_data)
+        + make_chunk(b"IDAT", idat_data)
+        + make_chunk(b"IEND", b"")
+    )
 
 
 class StableDiffusionTests(ServerTestBase):
@@ -316,10 +341,290 @@ class StableDiffusionTests(ServerTestBase):
 
         print(f"[OK] SDXL-Base-1.0 image_defaults verified: {defaults}")
 
+    def test_009_image_edit_not_multipart_error(self):
+        """Test that non-multipart requests to /images/edits return 400."""
+        response = requests.post(
+            f"{self.base_url}/images/edits",
+            json={"model": SD_MODEL, "prompt": "test"},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(
+            response.status_code,
+            400,
+            f"Expected 400 for non-multipart request, got {response.status_code}",
+        )
+        print(
+            f"[OK] Correctly rejected non-multipart edit request: {response.status_code}"
+        )
+
+    def test_010_image_edit_missing_image_error(self):
+        """Test that /images/edits returns 400 when image file is missing."""
+        response = requests.post(
+            f"{self.base_url}/images/edits",
+            data={"model": SD_MODEL, "prompt": "test"},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(
+            response.status_code,
+            400,
+            f"Expected 400 for missing image, got {response.status_code}",
+        )
+        print(
+            f"[OK] Correctly rejected edit request without image: {response.status_code}"
+        )
+
+    def test_011_image_edit_missing_prompt_error(self):
+        """Test that /images/edits returns 400 when prompt is missing."""
+        png_bytes = create_minimal_png()
+        response = requests.post(
+            f"{self.base_url}/images/edits",
+            files={"image": ("test.png", io.BytesIO(png_bytes), "image/png")},
+            data={"model": SD_MODEL},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(
+            response.status_code,
+            400,
+            f"Expected 400 for missing prompt, got {response.status_code}",
+        )
+        print(
+            f"[OK] Correctly rejected edit request without prompt: {response.status_code}"
+        )
+
+    def test_012_image_edit_invalid_n_error(self):
+        """Test that /images/edits returns 400 when n is out of valid range."""
+        png_bytes = create_minimal_png()
+        response = requests.post(
+            f"{self.base_url}/images/edits",
+            files={"image": ("test.png", io.BytesIO(png_bytes), "image/png")},
+            data={"model": SD_MODEL, "prompt": "test", "n": "20"},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(
+            response.status_code,
+            400,
+            f"Expected 400 for n=20, got {response.status_code}",
+        )
+        print(f"[OK] Correctly rejected edit request with n=20: {response.status_code}")
+
+    def test_013_image_variations_not_multipart_error(self):
+        """Test that non-multipart requests to /images/variations return 400."""
+        response = requests.post(
+            f"{self.base_url}/images/variations",
+            json={"model": SD_MODEL},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(
+            response.status_code,
+            400,
+            f"Expected 400 for non-multipart request, got {response.status_code}",
+        )
+        print(
+            f"[OK] Correctly rejected non-multipart variations request: {response.status_code}"
+        )
+
+    def test_014_image_variations_missing_image_error(self):
+        """Test that /images/variations returns 400 when image file is missing."""
+        response = requests.post(
+            f"{self.base_url}/images/variations",
+            data={"model": SD_MODEL},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(
+            response.status_code,
+            400,
+            f"Expected 400 for missing image, got {response.status_code}",
+        )
+        print(
+            f"[OK] Correctly rejected variations request without image: {response.status_code}"
+        )
+
+    def test_015_image_edit_basic(self):
+        """Test basic image edit returns a valid PNG."""
+        png_bytes = create_minimal_png(256, 256)
+        print(f"[INFO] Sending image edit request with model {SD_MODEL}")
+
+        response = requests.post(
+            f"{self.base_url}/images/edits",
+            files={"image": ("test.png", io.BytesIO(png_bytes), "image/png")},
+            data={
+                "model": SD_MODEL,
+                "prompt": "A red circle",
+                "size": "256x256",
+                "n": "1",
+                "response_format": "b64_json",
+            },
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            f"Image edit failed with status {response.status_code}: {response.text}",
+        )
+
+        result = response.json()
+        self.assertIn("data", result, "Response should contain 'data' field")
+        self.assertGreater(
+            len(result["data"]), 0, "Data should have at least one image"
+        )
+        b64_data = result["data"][0]["b64_json"]
+        decoded = base64.b64decode(b64_data)
+        self.assertTrue(decoded[:4] == b"\x89PNG", "Result should be a valid PNG")
+        print(f"[OK] Image edit successful ({len(decoded)} bytes)")
+
+    def test_016_image_variations_basic(self):
+        """Test basic image variations returns a valid PNG."""
+        png_bytes = create_minimal_png(256, 256)
+        print(f"[INFO] Sending image variations request with model {SD_MODEL}")
+
+        response = requests.post(
+            f"{self.base_url}/images/variations",
+            files={"image": ("test.png", io.BytesIO(png_bytes), "image/png")},
+            data={
+                "model": SD_MODEL,
+                "size": "256x256",
+                "n": "1",
+                "response_format": "b64_json",
+            },
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            f"Image variations failed with status {response.status_code}: {response.text}",
+        )
+
+        result = response.json()
+        self.assertIn("data", result, "Response should contain 'data' field")
+        self.assertGreater(
+            len(result["data"]), 0, "Data should have at least one image"
+        )
+        b64_data = result["data"][0]["b64_json"]
+        decoded = base64.b64decode(b64_data)
+        self.assertTrue(decoded[:4] == b"\x89PNG", "Result should be a valid PNG")
+        print(f"[OK] Image variations successful ({len(decoded)} bytes)")
+
+
+    def test_017_upscale_missing_image(self):
+        """Test that /images/upscale returns 400 when image field is missing."""
+        payload = {"model": ESRGAN_MODEL}
+
+        response = requests.post(
+            f"{self.base_url}/images/upscale",
+            json=payload,
+            timeout=TIMEOUT_DEFAULT,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400,
+            f"Expected 400 for missing image, got {response.status_code}",
+        )
+        print(f"[OK] Correctly rejected upscale request without image: {response.status_code}")
+
+    def test_018_upscale_missing_model(self):
+        """Test that /images/upscale returns 400 when model field is missing."""
+        png_bytes = create_minimal_png()
+        b64_image = base64.b64encode(png_bytes).decode("utf-8")
+        payload = {"image": b64_image}
+
+        response = requests.post(
+            f"{self.base_url}/images/upscale",
+            json=payload,
+            timeout=TIMEOUT_DEFAULT,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400,
+            f"Expected 400 for missing model, got {response.status_code}",
+        )
+        print(f"[OK] Correctly rejected upscale request without model: {response.status_code}")
+
+    def test_019_upscale_invalid_model(self):
+        """Test that /images/upscale returns 404 for an unknown model name."""
+        png_bytes = create_minimal_png()
+        b64_image = base64.b64encode(png_bytes).decode("utf-8")
+        payload = {"image": b64_image, "model": "nonexistent-upscale-model"}
+
+        response = requests.post(
+            f"{self.base_url}/images/upscale",
+            json=payload,
+            timeout=TIMEOUT_DEFAULT,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            404,
+            f"Expected 404 for invalid upscale model, got {response.status_code}",
+        )
+        print(f"[OK] Correctly rejected upscale with invalid model: {response.status_code}")
+
+    def test_020_upscale_basic(self):
+        """Test basic upscale: generate an image then upscale it."""
+        # First generate an image
+        gen_payload = {
+            "model": SD_MODEL,
+            "prompt": "A red circle",
+            "size": "256x256",
+            "steps": 2,
+            "n": 1,
+            "response_format": "b64_json",
+        }
+
+        print(f"[INFO] Generating image for upscale test")
+        gen_response = requests.post(
+            f"{self.base_url}/images/generations",
+            json=gen_payload,
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+
+        self.assertEqual(
+            gen_response.status_code,
+            200,
+            f"Image generation failed: {gen_response.text}",
+        )
+
+        gen_result = gen_response.json()
+        b64_image = gen_result["data"][0]["b64_json"]
+
+        # Now upscale
+        upscale_payload = {
+            "image": b64_image,
+            "model": ESRGAN_MODEL,
+        }
+
+        print(f"[INFO] Sending upscale request with {ESRGAN_MODEL}")
+        upscale_response = requests.post(
+            f"{self.base_url}/images/upscale",
+            json=upscale_payload,
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+
+        self.assertEqual(
+            upscale_response.status_code,
+            200,
+            f"Upscale failed with status {upscale_response.status_code}: {upscale_response.text}",
+        )
+
+        result = upscale_response.json()
+        self.assertIn("data", result, "Response should contain 'data' field")
+        self.assertIn("b64_json", result["data"][0], "Should contain base64 image")
+
+        decoded = base64.b64decode(result["data"][0]["b64_json"])
+        self.assertTrue(
+            decoded[:4] == b"\x89PNG",
+            "Upscaled data should be a valid PNG",
+        )
+        print(f"[OK] Upscale successful ({len(decoded)} bytes)")
+
 
 if __name__ == "__main__":
     run_server_tests(
         StableDiffusionTests,
         "STABLE DIFFUSION TESTS",
         wrapped_server="sd-cpp",
+        modality="stable_diffusion",
     )

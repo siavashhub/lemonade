@@ -2,11 +2,13 @@
 
 #include <string>
 #include <map>
+#include <vector>
 #include <functional>
 #include <chrono>
 #include <memory>
 #include <iostream>
 #include <iomanip>
+#include <atomic>
 
 namespace lemon {
 namespace utils {
@@ -15,6 +17,13 @@ struct HttpResponse {
     int status_code;
     std::string body;
     std::map<std::string, std::string> headers;
+};
+
+struct MultipartField {
+    std::string name;
+    std::string data;
+    std::string filename;       // empty for text fields
+    std::string content_type;   // empty for text fields
 };
 
 // Result of a download operation with detailed error information
@@ -47,6 +56,15 @@ struct DownloadOptions {
 
 class HttpClient {
 public:
+    // Set default timeout for all requests
+    static void set_default_timeout(long timeout_seconds) {
+        default_timeout_seconds_ = timeout_seconds;
+    }
+
+    static long get_default_timeout() {
+        return default_timeout_seconds_;
+    }
+
     // Simple GET request
     static HttpResponse get(const std::string& url,
                            const std::map<std::string, std::string>& headers = {});
@@ -56,6 +74,11 @@ public:
                             const std::string& body,
                             const std::map<std::string, std::string>& headers = {},
                             long timeout_seconds = 300);
+
+    // Multipart form data POST request
+    static HttpResponse post_multipart(const std::string& url,
+                                       const std::vector<MultipartField>& fields,
+                                       long timeout_seconds = 300);
 
     // Streaming POST request (calls callback for each chunk as it arrives)
     static HttpResponse post_stream(const std::string& url,
@@ -75,6 +98,8 @@ public:
     static bool is_reachable(const std::string& url, int timeout_seconds = 5);
 
 private:
+    static std::atomic<long> default_timeout_seconds_;
+
     // Single download attempt, may resume from offset
     static DownloadResult download_attempt(const std::string& url,
                                            const std::string& output_path,

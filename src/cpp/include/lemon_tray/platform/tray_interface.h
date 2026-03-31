@@ -28,6 +28,7 @@ struct MenuItem {
     MenuCallback callback;
     bool enabled = true;
     bool checked = false;
+    bool is_checkable = false;
     bool is_separator = false;
     std::shared_ptr<Menu> submenu = nullptr;
     int id = -1; // Platform-specific menu item ID
@@ -53,6 +54,7 @@ struct MenuItem {
         item.text = text;
         item.callback = callback;
         item.checked = checked;
+        item.is_checkable = true;
         item.enabled = enabled;
         return item;
     }
@@ -105,9 +107,6 @@ public:
 
     // Set callback for when ready
     virtual void set_ready_callback(std::function<void()> callback) = 0;
-
-    // Set log level for debug logging
-    virtual void set_log_level(const std::string& log_level) = 0;
 };
 
 // Factory function to create platform-specific tray

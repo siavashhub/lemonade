@@ -1,20 +1,20 @@
 #include "lemon/backends/whisper_server.h"
 #include "lemon/backends/backend_utils.h"
+#include "lemon/backend_manager.h"
 #include "lemon/audio_types.h"
+#include "lemon/utils/custom_args.h"
 #include "lemon/utils/http_client.h"
 #include "lemon/utils/process_manager.h"
-#include "lemon/utils/path_utils.h"
-#include "lemon/utils/json_utils.h"
 #include "lemon/error_types.h"
-#include <httplib.h>
 #include <iostream>
 #include <filesystem>
 #include <fstream>
 #include <random>
 #include <sstream>
 #include <iomanip>
-#include <algorithm>
+#include <set>
 #include <vector>
+#include <lemon/utils/aixlog.hpp>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -29,8 +29,8 @@ using namespace lemon::utils;
 namespace lemon {
 namespace backends {
 
-WhisperServer::WhisperServer(const std::string& log_level, ModelManager* model_manager)
-    : WrappedServer("whisper-server", log_level, model_manager) {
+WhisperServer::WhisperServer(const std::string& log_level, ModelManager* model_manager, BackendManager* backend_manager)
+    : WrappedServer("whisper-server", log_level, model_manager, backend_manager) {
 
     // Create temp directory for audio files
     temp_dir_ = fs::temp_directory_path() / "lemonade_audio";
@@ -46,46 +46,46 @@ WhisperServer::~WhisperServer() {
             fs::remove_all(temp_dir_);
         }
     } catch (const std::exception& e) {
-        std::cerr << "[WhisperServer] Warning: Could not clean up temp directory: "
+        LOG(WARNING, "WhisperServer") << "Could not clean up temp directory: "
                   << e.what() << std::endl;
     }
 }
 
-void WhisperServer::install(const std::string& backend) {
-    std::string repo;
-    std::string filename;
-    std::string expected_version = BackendUtils::get_backend_version(SPEC.recipe, backend);
+InstallParams WhisperServer::get_install_params(const std::string& backend, const std::string& version) {
+    InstallParams params;
 
-    // Determine download URL
     if (backend == "npu") {
-        // NPU support from lemonade-sdk/whisper.cpp-npu
-        repo = "lemonade-sdk/whisper.cpp-npu";
-
+        params.repo = "lemonade-sdk/whisper.cpp-builds";
 #ifdef _WIN32
-        filename = "whisper-" + expected_version + "-windows-npu-x64.zip";
+        params.filename = "whisper-" + version + "-windows-npu-x64.zip";
 #else
         throw std::runtime_error("NPU whisper.cpp only supported on Windows");
 #endif
-        std::cout << "[WhisperServer] Using NPU backend" << std::endl;
-
     } else if (backend == "cpu") {
-        // CPU-only builds from ggml-org/whisper.cpp
-        repo = "ggml-org/whisper.cpp";
-
 #ifdef _WIN32
-        filename = "whisper-bin-x64.zip";
+        params.repo = "ggml-org/whisper.cpp";
+        params.filename = "whisper-bin-x64.zip";
 #elif defined(__linux__)
-        filename = "whisper-bin-x64.zip";
+        params.repo = "lemonade-sdk/whisper.cpp-builds";
+        params.filename = "whisper-" + version + "-linux-cpu-x86_64.tar.gz";
 #elif defined(__APPLE__)
-        filename = "whisper-bin-arm64.zip";
+        params.repo = "ggml-org/whisper.cpp";
+        params.filename = "whisper-bin-arm64.zip";
 #else
         throw std::runtime_error("Unsupported platform for whisper.cpp");
 #endif
+    } else if (backend == "vulkan") {
+#if defined(__linux__)
+        params.repo = "lemonade-sdk/whisper.cpp-builds";
+        params.filename = "whisper-" + version + "-linux-vulkan-x86_64.tar.gz";
+#else
+        throw std::runtime_error("Vulkan whisper.cpp backend is currently supported only on Linux");
+#endif
     } else {
-        throw std::runtime_error("[WhisperServer] Unknown backend: " + backend);
+        throw std::runtime_error("[WhisperServer] Unknown whisper backend: " + backend);
     }
 
-    BackendUtils::install_from_github(SPEC, expected_version, repo, filename, backend);
+    return params;
 }
 
 // Helper to determine NPU compiled cache info based on model info from server_models.json
@@ -103,13 +103,13 @@ static std::pair<std::string, std::string> get_npu_cache_info(const ModelInfo& m
     }
 
     if (!npu_cache_repo.empty() && !npu_cache_filename.empty()) {
-        std::cout << "[WhisperServer] Using NPU cache from server_models.json: "
+        LOG(INFO, "WhisperServer") << "Using NPU cache from server_models.json: "
                   << npu_cache_repo << " / " << npu_cache_filename << std::endl;
         return {npu_cache_repo, npu_cache_filename};
     }
 
     // No NPU cache configured for this model in server_models.json
-    std::cout << "[WhisperServer] No NPU cache configured for model: " << model_info.model_name << std::endl;
+    LOG(INFO, "WhisperServer") << "No NPU cache configured for model: " << model_info.model_name << std::endl;
     return {"", ""};
 }
 
@@ -120,12 +120,12 @@ void WhisperServer::download_npu_compiled_cache(const std::string& model_path,
     auto [cache_repo, cache_filename] = get_npu_cache_info(model_info);
 
     if (cache_repo.empty() || cache_filename.empty()) {
-        std::cout << "[WhisperServer] No NPU compiled cache available for this model" << std::endl;
+        LOG(INFO, "WhisperServer") << "No NPU compiled cache available for this model" << std::endl;
         return;
     }
 
-    std::cout << "[WhisperServer] Downloading NPU compiled cache: " << cache_filename << std::endl;
-    std::cout << "[WhisperServer] From repository: " << cache_repo << std::endl;
+    LOG(INFO, "WhisperServer") << "Downloading NPU compiled cache: " << cache_filename << std::endl;
+    LOG(INFO, "WhisperServer") << "From repository: " << cache_repo << std::endl;
 
     // Determine where to place the .rai file (must be in the same directory as .bin file)
     fs::path model_dir = fs::path(model_path).parent_path();
@@ -133,7 +133,7 @@ void WhisperServer::download_npu_compiled_cache(const std::string& model_path,
 
     // Check if cache already exists
     if (fs::exists(cache_path) && !do_not_upgrade) {
-        std::cout << "[WhisperServer] NPU cache already exists: " << cache_path << std::endl;
+        LOG(INFO, "WhisperServer") << "NPU cache already exists: " << cache_path << std::endl;
         return;
     }
 
@@ -141,7 +141,7 @@ void WhisperServer::download_npu_compiled_cache(const std::string& model_path,
         // Download .rai file directly from HuggingFace using HttpClient
         std::string hf_url = "https://huggingface.co/" + cache_repo + "/resolve/main/" + cache_filename;
 
-        std::cout << "[WhisperServer] Downloading from: " << hf_url << std::endl;
+        LOG(INFO, "WhisperServer") << "Downloading from: " << hf_url << std::endl;
 
         // Download directly to the target location
         auto download_result = utils::HttpClient::download_file(
@@ -154,16 +154,16 @@ void WhisperServer::download_npu_compiled_cache(const std::string& model_path,
             throw std::runtime_error("Failed to download NPU cache from: " + hf_url + " - " + download_result.error_message);
         }
 
-        std::cout << "[WhisperServer] NPU cache ready at: " << cache_path << std::endl;
+        LOG(INFO, "WhisperServer") << "NPU cache ready at: " << cache_path << std::endl;
 
     } catch (const std::exception& e) {
         if (fs::exists(cache_path)) {
             fs::remove(cache_path);
-            std::cout << "[WhisperServer] Cleaned up partial cache file" << std::endl;
+            LOG(INFO, "WhisperServer") << "Cleaned up partial cache file" << std::endl;
         }
 
-        std::cerr << "[WhisperServer] Warning: Failed to download NPU cache: " << e.what() << std::endl;
-        std::cerr << "[WhisperServer] Continuing without NPU cache (may cause runtime errors)" << std::endl;
+        LOG(WARNING, "WhisperServer") << "Failed to download NPU cache: " << e.what() << std::endl;
+        LOG(WARNING, "WhisperServer") << "Continuing without NPU cache (may cause runtime errors)" << std::endl;
     }
 }
 
@@ -171,20 +171,21 @@ void WhisperServer::load(const std::string& model_name,
                         const ModelInfo& model_info,
                         const RecipeOptions& options,
                         bool do_not_upgrade) {
-    std::cout << "[WhisperServer] Loading model: " << model_name << std::endl;
-    std::cout << "[WhisperServer] Per-model settings: " << options.to_log_string() << std::endl;
+    LOG(INFO, "WhisperServer") << "Loading model: " << model_name << std::endl;
+    LOG(INFO, "WhisperServer") << "Per-model settings: " << options.to_log_string() << std::endl;
 
     std::string whispercpp_backend = options.get_option("whispercpp_backend");
+    std::string whispercpp_args = options.get_option("whispercpp_args");
 
-    install(whispercpp_backend);
+    backend_manager_->install_backend(SPEC.recipe, whispercpp_backend);
 
     std::string model_path = model_info.resolved_path();
     if (model_path.empty()) {
         throw std::runtime_error("Model file not found for checkpoint: " + model_info.checkpoint());
     }
 
-    std::cout << "[WhisperServer] Using model: " << model_path << std::endl;
-    std::cout << "[WhisperServer] Using backend: " << whispercpp_backend << std::endl;
+    LOG(INFO, "WhisperServer") << "Using model: " << model_path << std::endl;
+    LOG(INFO, "WhisperServer") << "Using backend: " << whispercpp_backend << std::endl;
 
     // For NPU backend, download the compiled cache (.rai file). This is a must-have for NPU backend.
     if (whispercpp_backend == "npu") {
@@ -200,31 +201,71 @@ void WhisperServer::load(const std::string& model_name,
         throw std::runtime_error("Failed to find an available port");
     }
 
-    std::cout << "[WhisperServer] Starting server on port " << port_ << std::endl;
+    LOG(INFO, "WhisperServer") << "Starting server on port " << port_ << std::endl;
 
-    // Build command line arguments
-    // Note: whisper.cpp server handles audio conversion automatically since v1.8
+    // Build command line arguments. Lemonade manages the model path and port;
+    // optional whisper-server flags like --convert come from whispercpp_args.
     // Note: Don't include exe_path here - ProcessManager::start_process already handles it
     std::vector<std::string> args = {
         "-m", model_path,
         "--port", std::to_string(port_)
     };
 
+    std::set<std::string> reserved_flags = {
+        "-m",
+        "--model",
+        "--port"
+    };
+
+    if (!whispercpp_args.empty()) {
+        std::string validation_error = validate_custom_args(whispercpp_args, reserved_flags);
+        if (!validation_error.empty()) {
+            throw std::invalid_argument(
+                "Invalid custom whisper-server arguments:\n" + validation_error
+            );
+        }
+
+        LOG(DEBUG, "WhisperServer") << "Adding custom arguments: " << whispercpp_args << std::endl;
+        std::vector<std::string> custom_args_vec = parse_custom_args(whispercpp_args);
+        args.insert(args.end(), custom_args_vec.begin(), custom_args_vec.end());
+    }
+
     // Note: whisper-server doesn't support --debug flag
+
+    // Set up environment variables for shared library loading
+    std::vector<std::pair<std::string, std::string>> env_vars;
+    fs::path exe_dir = fs::path(exe_path).parent_path();
+
+#ifndef _WIN32
+    // set LD_LIBRARY_PATH to include executable directory
+    std::string lib_path = exe_dir.string();
+
+    const char* existing_ld_path = std::getenv("LD_LIBRARY_PATH");
+    if (existing_ld_path && strlen(existing_ld_path) > 0) {
+        lib_path = lib_path + ":" + std::string(existing_ld_path);
+    }
+
+    env_vars.push_back({"LD_LIBRARY_PATH", lib_path});
+    if (is_debug()) {
+        std::cout << "[WhisperServer] Setting LD_LIBRARY_PATH=" << lib_path << std::endl;
+    }
+#endif
 
     // Launch the subprocess
     process_handle_ = utils::ProcessManager::start_process(
         exe_path,
         args,
         "",     // working_dir (empty = current)
-        is_debug()  // inherit_output
+        is_debug(),  // inherit_output
+        false,  // filter_health_logs
+        env_vars
     );
 
     if (process_handle_.pid == 0) {
         throw std::runtime_error("Failed to start whisper-server process");
     }
 
-    std::cout << "[WhisperServer] Process started with PID: " << process_handle_.pid << std::endl;
+    LOG(INFO, "WhisperServer") << "Process started with PID: " << process_handle_.pid << std::endl;
 
     // Wait for server to be ready
     if (!wait_for_ready("/health")) {
@@ -232,12 +273,12 @@ void WhisperServer::load(const std::string& model_name,
         throw std::runtime_error("whisper-server failed to start or become ready");
     }
 
-    std::cout << "[WhisperServer] Server is ready!" << std::endl;
+    LOG(INFO, "WhisperServer") << "Server is ready!" << std::endl;
 }
 
 void WhisperServer::unload() {
     if (process_handle_.pid != 0) {
-        std::cout << "[WhisperServer] Stopping server (PID: " << process_handle_.pid << ")" << std::endl;
+        LOG(INFO, "WhisperServer") << "Stopping server (PID: " << process_handle_.pid << ")" << std::endl;
         utils::ProcessManager::stop_process(process_handle_);
         process_handle_ = {nullptr, 0};
         port_ = 0;
@@ -302,9 +343,7 @@ std::string WhisperServer::save_audio_to_temp(const std::string& audio_data,
     outfile.write(audio_data.data(), audio_data.size());
     outfile.close();
 
-    if (is_debug()) {
-        std::cout << "[WhisperServer] Saved audio to temp file: " << temp_file << std::endl;
-    }
+    LOG(DEBUG, "WhisperServer") << "Saved audio to temp file: " << temp_file << std::endl;
 
     return temp_file.string();
 }
@@ -313,12 +352,10 @@ void WhisperServer::cleanup_temp_file(const std::string& path) {
     try {
         if (fs::exists(path)) {
             fs::remove(path);
-            if (is_debug()) {
-                std::cout << "[WhisperServer] Cleaned up temp file: " << path << std::endl;
-            }
+            LOG(DEBUG, "WhisperServer") << "Cleaned up temp file: " << path << std::endl;
         }
     } catch (const std::exception& e) {
-        std::cerr << "[WhisperServer] Warning: Could not delete temp file " << path
+        LOG(WARNING, "WhisperServer") << "Could not delete temp file " << path
                   << ": " << e.what() << std::endl;
     }
 }
@@ -390,9 +427,7 @@ json WhisperServer::forward_multipart_audio_request(const std::string& file_path
     std::string file_content = oss.str();
     file.close();
 
-    if (is_debug()) {
-        std::cout << "[WhisperServer] Audio file size: " << file_content.size() << " bytes" << std::endl;
-    }
+    LOG(DEBUG, "WhisperServer") << "Audio file size: " << file_content.size() << " bytes" << std::endl;
 
     // Determine content type based on file extension
     fs::path filepath(file_path);
@@ -407,89 +442,71 @@ json WhisperServer::forward_multipart_audio_request(const std::string& file_path
     else if (ext == ".flac") content_type = "audio/flac";
     else if (ext == ".webm") content_type = "audio/webm";
 
-    // Build multipart form data using httplib::UploadFormDataItems
-    httplib::UploadFormDataItems items;
+    std::vector<utils::MultipartField> fields;
 
-    // Add the audio file
-    httplib::UploadFormData audio_file;
+    utils::MultipartField audio_file;
     audio_file.name = "file";
-    audio_file.content = file_content;
+    audio_file.data = file_content;
     audio_file.filename = filepath.filename().string();
     audio_file.content_type = content_type;
-    items.push_back(audio_file);
+    fields.push_back(audio_file);
 
     // Add optional parameters as form fields
     std::string response_format = params.value("response_format", "json");
-    httplib::UploadFormData fmt_field;
+    utils::MultipartField fmt_field;
     fmt_field.name = "response_format";
-    fmt_field.content = response_format;
-    items.push_back(fmt_field);
+    fmt_field.data = response_format;
+    fields.push_back(fmt_field);
 
-    httplib::UploadFormData temp_field;
+    utils::MultipartField temp_field;
     temp_field.name = "temperature";
     if (params.contains("temperature")) {
-        temp_field.content = std::to_string(params["temperature"].get<double>());
+        temp_field.data = std::to_string(params["temperature"].get<double>());
     } else {
-        temp_field.content = "0.0";
+        temp_field.data = "0.0";
     }
-    items.push_back(temp_field);
+    fields.push_back(temp_field);
 
     if (params.contains("language")) {
-        httplib::UploadFormData lang_field;
+        utils::MultipartField lang_field;
         lang_field.name = "language";
-        lang_field.content = params["language"].get<std::string>();
-        items.push_back(lang_field);
+        lang_field.data = params["language"].get<std::string>();
+        fields.push_back(lang_field);
     }
 
     if (params.contains("prompt")) {
-        httplib::UploadFormData prompt_field;
+        utils::MultipartField prompt_field;
         prompt_field.name = "prompt";
-        prompt_field.content = params["prompt"].get<std::string>();
-        items.push_back(prompt_field);
+        prompt_field.data = params["prompt"].get<std::string>();
+        fields.push_back(prompt_field);
     }
 
     if (translate) {
-        httplib::UploadFormData translate_field;
+        utils::MultipartField translate_field;
         translate_field.name = "translate";
-        translate_field.content = "true";
-        items.push_back(translate_field);
+        translate_field.data = "true";
+        fields.push_back(translate_field);
     }
 
-    // Create httplib client
-    httplib::Client cli("127.0.0.1", port_);
-    cli.set_connection_timeout(30);  // 30 second connection timeout
-    cli.set_read_timeout(300);       // 5 minute read timeout for transcription
+    const std::string url = "http://127.0.0.1:" + std::to_string(port_) + "/inference";
+    LOG(DEBUG, "WhisperServer") << "Sending multipart request to " << url << std::endl;
 
-    if (is_debug()) {
-        std::cout << "[WhisperServer] Sending multipart request to http://127.0.0.1:"
-                  << port_ << "/inference" << std::endl;
-    }
+    auto res = utils::HttpClient::post_multipart(url, fields, 300);
 
-    // Send the multipart POST request
-    httplib::Result res = cli.Post("/inference", items);
+    LOG(DEBUG, "WhisperServer") << "Response status: " << res.status_code << std::endl;
+    LOG(DEBUG, "WhisperServer") << "Response body: " << res.body << std::endl;
 
-    if (!res) {
-        httplib::Error err = res.error();
-        throw std::runtime_error("HTTP request failed: " + httplib::to_string(err));
-    }
-
-    if (is_debug()) {
-        std::cout << "[WhisperServer] Response status: " << res->status << std::endl;
-        std::cout << "[WhisperServer] Response body: " << res->body << std::endl;
-    }
-
-    // Parse response
-    if (res->status != 200) {
+    if (res.status_code != 200) {
         throw std::runtime_error("whisper-server returned status " +
-                                std::to_string(res->status) + ": " + res->body);
+                                std::to_string(res.status_code) + ": " + res.body);
     }
 
     // Try to parse as JSON
     try {
-        return json::parse(res->body);
+        return json::parse(res.body);
     } catch (const json::parse_error&) {
         // If response_format is not json, return it wrapped
-        return json{{"text", res->body}};
+        return json{{"text", res.body}};
     }
 }
 
@@ -501,9 +518,7 @@ json WhisperServer::forward_multipart_audio_data(const std::string& audio_data,
         throw std::runtime_error("Empty audio data");
     }
 
-    if (is_debug()) {
-        std::cout << "[WhisperServer] Audio data size: " << audio_data.size() << " bytes (no file I/O)" << std::endl;
-    }
+    LOG(DEBUG, "WhisperServer") << "Audio data size: " << audio_data.size() << " bytes (no file I/O)" << std::endl;
 
     // Determine content type based on filename extension
     fs::path filepath(filename);
@@ -517,79 +532,65 @@ json WhisperServer::forward_multipart_audio_data(const std::string& audio_data,
     else if (ext == ".flac") content_type = "audio/flac";
     else if (ext == ".webm") content_type = "audio/webm";
 
-    // Build multipart form data
-    httplib::UploadFormDataItems items;
+    std::vector<utils::MultipartField> fields;
 
-    httplib::UploadFormData audio_file;
+    utils::MultipartField audio_file;
     audio_file.name = "file";
-    audio_file.content = audio_data;
+    audio_file.data = audio_data;
     audio_file.filename = filepath.filename().string();
     audio_file.content_type = content_type;
-    items.push_back(audio_file);
+    fields.push_back(audio_file);
 
     std::string response_format = params.value("response_format", "json");
-    httplib::UploadFormData fmt_field;
+    utils::MultipartField fmt_field;
     fmt_field.name = "response_format";
-    fmt_field.content = response_format;
-    items.push_back(fmt_field);
+    fmt_field.data = response_format;
+    fields.push_back(fmt_field);
 
-    httplib::UploadFormData temp_field;
+    utils::MultipartField temp_field;
     temp_field.name = "temperature";
-    temp_field.content = params.contains("temperature")
+    temp_field.data = params.contains("temperature")
         ? std::to_string(params["temperature"].get<double>())
         : "0.0";
-    items.push_back(temp_field);
+    fields.push_back(temp_field);
 
     if (params.contains("language")) {
-        httplib::UploadFormData lang_field;
+        utils::MultipartField lang_field;
         lang_field.name = "language";
-        lang_field.content = params["language"].get<std::string>();
-        items.push_back(lang_field);
+        lang_field.data = params["language"].get<std::string>();
+        fields.push_back(lang_field);
     }
 
     if (params.contains("prompt")) {
-        httplib::UploadFormData prompt_field;
+        utils::MultipartField prompt_field;
         prompt_field.name = "prompt";
-        prompt_field.content = params["prompt"].get<std::string>();
-        items.push_back(prompt_field);
+        prompt_field.data = params["prompt"].get<std::string>();
+        fields.push_back(prompt_field);
     }
 
     if (translate) {
-        httplib::UploadFormData translate_field;
+        utils::MultipartField translate_field;
         translate_field.name = "translate";
-        translate_field.content = "true";
-        items.push_back(translate_field);
+        translate_field.data = "true";
+        fields.push_back(translate_field);
     }
 
-    // Send request
-    httplib::Client cli("127.0.0.1", port_);
-    cli.set_connection_timeout(30);
-    cli.set_read_timeout(300);
+    const std::string url = "http://127.0.0.1:" + std::to_string(port_) + "/inference";
+    LOG(DEBUG, "WhisperServer") << "Sending multipart request to " << url << " (direct data)" << std::endl;
 
-    if (is_debug()) {
-        std::cout << "[WhisperServer] Sending multipart request to http://127.0.0.1:"
-                  << port_ << "/inference (direct data)" << std::endl;
-    }
+    auto res = utils::HttpClient::post_multipart(url, fields, 300);
 
-    httplib::Result res = cli.Post("/inference", items);
+    LOG(DEBUG, "WhisperServer") << "Response status: " << res.status_code << std::endl;
 
-    if (!res) {
-        throw std::runtime_error("HTTP request failed: " + httplib::to_string(res.error()));
-    }
-
-    if (is_debug()) {
-        std::cout << "[WhisperServer] Response status: " << res->status << std::endl;
-    }
-
-    if (res->status != 200) {
+    if (res.status_code != 200) {
         throw std::runtime_error("whisper-server returned status " +
-                                std::to_string(res->status) + ": " + res->body);
+                                std::to_string(res.status_code) + ": " + res.body);
     }
 
     try {
-        return json::parse(res->body);
+        return json::parse(res.body);
     } catch (const json::parse_error&) {
-        return json{{"text", res->body}};
+        return json{{"text", res.body}};
     }
 }
 

@@ -1,9 +1,10 @@
-import React, { useMemo, useEffect, useRef } from 'react';
+import React, { useMemo, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import MarkdownIt from 'markdown-it';
 import hljs from 'highlight.js';
 import texmath from 'markdown-it-texmath';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
+import { writeClipboard } from './utils/clipboardUtils';
 
 interface MarkdownMessageProps {
   content: string;
@@ -17,6 +18,8 @@ const CHECK_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="16" heigh
 const MarkdownMessage: React.FC<MarkdownMessageProps> = ({ content, isComplete = true }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const copyTimeoutIdRef = useRef<NodeJS.Timeout | null>(null);
+  const maxStreamHeightRef = useRef(0);
+  const [streamMinHeight, setStreamMinHeight] = useState<number | undefined>(undefined);
 
   const md = useMemo(() => {
     const mdInstance = new MarkdownIt({
@@ -86,6 +89,40 @@ const MarkdownMessage: React.FC<MarkdownMessageProps> = ({ content, isComplete =
     return result;
   }, [content, md, isComplete]);
 
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    if (isComplete) {
+      maxStreamHeightRef.current = 0;
+      setStreamMinHeight(undefined);
+      return;
+    }
+
+    const measureAndLock = () => {
+      const currentHeight = container.scrollHeight;
+      // Keep height monotonic while streaming to avoid 1-line markdown reflow jitter.
+      if (currentHeight > maxStreamHeightRef.current) {
+        maxStreamHeightRef.current = currentHeight;
+        setStreamMinHeight(currentHeight);
+      }
+    };
+
+    measureAndLock();
+
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(() => {
+        measureAndLock();
+      });
+      observer.observe(container);
+    }
+
+    return () => {
+      observer?.disconnect();
+    };
+  }, [htmlContent, isComplete]);
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -96,8 +133,15 @@ const MarkdownMessage: React.FC<MarkdownMessageProps> = ({ content, isComplete =
       if (target.tagName === 'A') {
         e.preventDefault();
         const href = target.getAttribute('href');
-        if (href && window.api) {
-          window.api.openExternal(href);
+        if (href) {
+          // Open documentation pages in-app via iframe
+          if (href.endsWith('.html') && (href.includes('lemonade-server.ai') || href.startsWith('/'))) {
+            window.dispatchEvent(new CustomEvent('open-external-content', { detail: { url: href } }));
+            return;
+          }
+          if (window.api) {
+            window.api.openExternal(href);
+          }
         }
       }
     };
@@ -115,15 +159,15 @@ const MarkdownMessage: React.FC<MarkdownMessageProps> = ({ content, isComplete =
       const codeText = codeElement.textContent || '';
 
       try {
-        await navigator.clipboard.writeText(codeText);
+        await writeClipboard(codeText);
         button.innerHTML = CHECK_ICON_SVG;
         button.classList.add('copied');
-        
+
         // Clear any existing timeout before setting a new one
         if (copyTimeoutIdRef.current) {
           clearTimeout(copyTimeoutIdRef.current);
         }
-        
+
         copyTimeoutIdRef.current = setTimeout(() => {
           // Check if button still exists in DOM before modifying
           if (button.isConnected) {
@@ -153,6 +197,7 @@ const MarkdownMessage: React.FC<MarkdownMessageProps> = ({ content, isComplete =
     <div
       ref={containerRef}
       className="markdown-content"
+      style={streamMinHeight ? { minHeight: `${streamMinHeight}px` } : undefined}
       dangerouslySetInnerHTML={{ __html: htmlContent }}
     />
   );
