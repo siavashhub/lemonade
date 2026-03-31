@@ -613,9 +613,9 @@ function renderQuickStart() {
   -p 8000:8000 \\
   -v lemonade-cache:/root/.cache/huggingface \\
   -v lemonade-llama:/opt/lemonade/llama \\
-  -e LEMONADE_LLAMACPP_BACKEND=vulkan \\
+  -e LEMONADE_LLAMACPP=vulkan \\
   ghcr.io/lemonade-sdk/lemonade-server:latest`);
-      notes = `<div class="lmn-note"><strong>Tip:</strong> To select a specific backend, update the LEMONADE_LLAMACPP_BACKEND environment variable: <code>LEMONADE_LLAMACPP_BACKEND=vulkan</code></div>`;
+      notes = `<div class="lmn-note"><strong>Tip:</strong> To select a specific backend, update the LEMONADE_LLAMACPP environment variable: <code>LEMONADE_LLAMACPP=vulkan</code></div>`;
     }
 
     if (fw === 'llama' && dev === 'cpu') {
@@ -624,9 +624,9 @@ function renderQuickStart() {
   -p 8000:8000 \\
   -v lemonade-cache:/root/.cache/huggingface \\
   -v lemonade-llama:/opt/lemonade/llama \\
-  -e LEMONADE_LLAMACPP_BACKEND=cpu \\
+  -e LEMONADE_LLAMACPP=cpu \\
   ghcr.io/lemonade-sdk/lemonade-server:latest`);
-      notes = `<div class="lmn-note"><strong>Tip:</strong> To select a specific backend, update the LEMONADE_LLAMACPP_BACKEND environment variable: <code>LEMONADE_LLAMACPP_BACKEND=cpu</code></div>`;
+      notes = `<div class="lmn-note"><strong>Tip:</strong> To select a specific backend, update the LEMONADE_LLAMACPP environment variable: <code>LEMONADE_LLAMACPP=cpu</code></div>`;
     }
   }
 
