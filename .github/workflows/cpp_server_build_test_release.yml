@@ -439,7 +439,7 @@ jobs:
         run: |
           echo "Checking server health..."
           for i in $(seq 1 15); do
-            if curl -sf http://localhost:8000/live > /dev/null 2>&1; then
+            if curl -sf http://localhost:13305/live > /dev/null 2>&1; then
               echo "Server is running and healthy"
               exit 0
             fi
@@ -451,7 +451,7 @@ jobs:
           /usr/local/bin/lemonade-server serve --no-tray > /tmp/lemonade-server.log 2>&1 &
 
           for i in $(seq 1 15); do
-            if curl -sf http://localhost:8000/live > /dev/null 2>&1; then
+            if curl -sf http://localhost:13305/live > /dev/null 2>&1; then
               echo "Server is running and healthy (started manually)"
               exit 0
             fi
@@ -461,14 +461,6 @@ jobs:
           echo "ERROR: Server did not start within 60 seconds"
           cat /tmp/lemonade-server.log 2>/dev/null || true
           exit 1
-
-      - name: Set debug logging (unsigned path)
-        if: steps.check_signing.outputs.has_signing != 'true'
-        shell: bash
-        run: |
-          curl -sf -X POST http://localhost:8000/internal/set \
-            -H 'Content-Type: application/json' \
-            -d '{"log_level":"debug"}' || echo "Warning: Failed to set debug logging"
 
       - name: Setup Python and virtual environment (unsigned path)
         if: steps.check_signing.outputs.has_signing != 'true'
@@ -486,6 +478,7 @@ jobs:
           PYTHONIOENCODING: utf-8
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           HF_HOME: ${{ github.workspace }}/hf-cache
+          GGML_METAL_NO_RESIDENCY: "1"
         run: |
           set -e
           echo "Running CLI tests..."
@@ -501,6 +494,7 @@ jobs:
           PYTHONIOENCODING: utf-8
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           HF_HOME: ${{ github.workspace }}/hf-cache
+          GGML_METAL_NO_RESIDENCY: "1"
         run: |
           set -e
           echo "Running endpoint tests..."
@@ -515,6 +509,7 @@ jobs:
           PYTHONIOENCODING: utf-8
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           HF_HOME: ${{ github.workspace }}/hf-cache
+          GGML_METAL_NO_RESIDENCY: "1"
         run: |
           set -e
           echo "Running Ollama API tests..."
@@ -529,6 +524,7 @@ jobs:
           PYTHONIOENCODING: utf-8
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           HF_HOME: ${{ github.workspace }}/hf-cache
+          GGML_METAL_NO_RESIDENCY: "1"
         run: |
           set -e
           echo "Running streaming error termination tests..."
@@ -544,7 +540,7 @@ jobs:
         run: |
           set -e
           echo "Running environment variable tests..."
-          .venv/bin/python test/server_env_vars.py --server-binary /usr/local/bin/lemond
+          .venv/bin/python test/server_env_vars.py --lemond-binary /usr/local/bin/lemond
           echo "Environment variable tests PASSED!"
 
       - name: Cleanup keychain
@@ -700,17 +696,6 @@ jobs:
           python-version: '3.10'
           requirements-file: 'test/requirements.txt'
 
-      - name: Set debug logging
-        shell: powershell
-        run: |
-          try {
-            Invoke-WebRequest -Uri "http://localhost:8000/internal/set" -Method POST `
-              -ContentType "application/json" -Body '{"log_level":"debug"}' -UseBasicParsing -ErrorAction Stop | Out-Null
-            Write-Host "Debug logging enabled"
-          } catch {
-            Write-Host "Warning: Failed to set debug logging: $_"
-          }
-
       - name: Install FLM backend for FLM wrapped-server tests
         if: ${{ runner.os == 'Windows' && contains(matrix.extra_args, '--wrapped-server flm') }}
         shell: PowerShell
@@ -828,12 +813,6 @@ jobs:
           python-version: '3.10'
           requirements-file: 'test/requirements.txt'
 
-      - name: Set debug logging
-        run: |
-          curl -sf -X POST http://localhost:8000/internal/set \
-            -H 'Content-Type: application/json' \
-            -d '{"log_level":"debug"}' || echo "Warning: Failed to set debug logging"
-
       - name: Run tests
         env:
           HF_HOME: ${{ env.HF_HOME }}
@@ -895,7 +874,6 @@ jobs:
           echo "Installed file list:"
           rpm -ql lemonade-server | sort
 
-          test -f /etc/lemonade/lemonade.conf
           test -f /opt/bin/lemonade-server
           test -f /opt/bin/lemond
 
@@ -914,6 +892,7 @@ jobs:
       PYTHONIOENCODING: utf-8
       GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
       LEMONADE_VERSION: ${{ needs.build-lemonade-macos-dmg.outputs.version }}
+      GGML_METAL_NO_RESIDENCY: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -931,12 +910,6 @@ jobs:
           venv-name: '.venv'
           python-version: '3.10'
           requirements-file: 'test/requirements.txt'
-
-      - name: Set debug logging
-        run: |
-          curl -sf -X POST http://localhost:8000/internal/set \
-            -H 'Content-Type: application/json' \
-            -d '{"log_level":"debug"}' || echo "Warning: Failed to set debug logging"
 
       - name: Test llamacpp (metal)
         env:
@@ -1026,7 +999,7 @@ jobs:
           elif [ "${{ matrix.test_type }}" = "system-info" ]; then
               echo "Running system-info mock hardware tests..."
               unset LEMONADE_CI_MODE
-              $VENV_PYTHON test/server_system_info.py --server-binary "$SERVER_BINARY"
+              $VENV_PYTHON test/server_system_info.py --lemond-binary lemond
           elif [ "${{ matrix.test_type }}" = "ollama" ]; then
               echo "Running Ollama API tests..."
               $VENV_PYTHON test/test_ollama.py --server-binary "$SERVER_BINARY"
@@ -1038,7 +1011,7 @@ jobs:
               $VENV_PYTHON test/server_streaming_errors.py --server-binary "$SERVER_BINARY"
           elif [ "${{ matrix.test_type }}" = "env-vars" ]; then
               echo "Running environment variable tests..."
-              $VENV_PYTHON test/server_env_vars.py --server-binary ./deb-extract/usr/bin/lemond
+              $VENV_PYTHON test/server_env_vars.py --lemond-binary ./deb-extract/usr/bin/lemond
           fi
 
           echo "${{ matrix.test_type }} tests PASSED!"
@@ -1060,6 +1033,7 @@ jobs:
     env:
       LEMONADE_CI_MODE: "True"
       PYTHONIOENCODING: utf-8
+      GGML_METAL_NO_RESIDENCY: "1"
       GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
       LEMONADE_VERSION: ${{ needs.build-lemonade-macos-dmg.outputs.version }}
     steps:
@@ -1120,14 +1094,6 @@ jobs:
           requirements-file: 'test/requirements.txt'
 
       # ---- Run Tests ----
-      - name: Set debug logging
-        if: ${{ !(runner.os == 'macOS' && needs.build-lemonade-macos-dmg.outputs.has_signing != 'true') }}
-        shell: bash
-        run: |
-          curl -sf -X POST http://localhost:8000/internal/set \
-            -H 'Content-Type: application/json' \
-            -d '{"log_level":"debug"}' || echo "Warning: Failed to set debug logging"
-
       - name: Run ${{ matrix.test_type }} tests
         if: ${{ !(runner.os == 'macOS' && needs.build-lemonade-macos-dmg.outputs.has_signing != 'true') }}
         shell: bash
@@ -1146,10 +1112,11 @@ jobs:
           elif [ "${{ matrix.test_type }}" = "system-info" ]; then
               echo "Running system-info mock hardware tests..."
               # Unset LEMONADE_CI_MODE so the server uses mock cache files
-              # Note: On Linux, caching is disabled by default, but the test sets
-              # LEMONADE_CACHE_DIR to enable it for testing purposes
+              # Note: The test creates a temp home dir with mock hardware_info.json
               unset LEMONADE_CI_MODE
-              $VENV_PYTHON test/server_system_info.py --server-binary "$SERVER_BINARY"
+              # Use lemond directly (next to lemonade-server in the install dir)
+              LEMOND_BINARY="$(dirname "$SERVER_BINARY")/lemond"
+              $VENV_PYTHON test/server_system_info.py --lemond-binary "$LEMOND_BINARY"
           elif [ "${{ matrix.test_type }}" = "ollama" ]; then
               echo "Running Ollama API tests..."
               $VENV_PYTHON test/test_ollama.py --server-binary "$SERVER_BINARY"
@@ -1162,7 +1129,7 @@ jobs:
           elif [ "${{ matrix.test_type }}" = "env-vars" ]; then
               echo "Running environment variable tests..."
               LEMOND_BINARY="$(dirname "$SERVER_BINARY")/lemond"
-              $VENV_PYTHON test/server_env_vars.py --server-binary "$LEMOND_BINARY"
+              $VENV_PYTHON test/server_env_vars.py --lemond-binary "$LEMOND_BINARY"
           fi
 
           echo "${{ matrix.test_type }} tests PASSED!"
@@ -1223,7 +1190,7 @@ jobs:
           FAIL=0
 
           # 1. No API key → must get 401
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/api/v1/health 2>/dev/null || echo "000")
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:13305/api/v1/health 2>/dev/null || echo "000")
           if [ "$HTTP_CODE" = "401" ]; then
             echo "PASS: No API key → $HTTP_CODE"
             PASS=$((PASS+1))
@@ -1233,7 +1200,7 @@ jobs:
           fi
 
           # 2. Wrong API key → must get 401
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer wrong-key" http://127.0.0.1:8000/api/v1/health 2>/dev/null || echo "000")
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer wrong-key" http://127.0.0.1:13305/api/v1/health 2>/dev/null || echo "000")
           if [ "$HTTP_CODE" = "401" ]; then
             echo "PASS: Wrong API key → $HTTP_CODE"
             PASS=$((PASS+1))
@@ -1243,7 +1210,7 @@ jobs:
           fi
 
           # 3. Correct API key → must get 200
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $LEMONADE_API_KEY" http://127.0.0.1:8000/api/v1/health 2>/dev/null || echo "000")
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $LEMONADE_API_KEY" http://127.0.0.1:13305/api/v1/health 2>/dev/null || echo "000")
           if [ "$HTTP_CODE" = "200" ]; then
             echo "PASS: Correct API key → $HTTP_CODE"
             PASS=$((PASS+1))
@@ -1319,7 +1286,7 @@ jobs:
           FAIL=0
 
           # 1. No API key → must get 401
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/api/v1/health 2>/dev/null || echo "000")
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:13305/api/v1/health 2>/dev/null || echo "000")
           if [ "$HTTP_CODE" = "401" ]; then
             echo "PASS: No API key → $HTTP_CODE"
             PASS=$((PASS+1))
@@ -1329,7 +1296,7 @@ jobs:
           fi
 
           # 2. Wrong API key → must get 401
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer wrong-key" http://localhost:8000/api/v1/health 2>/dev/null || echo "000")
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer wrong-key" http://localhost:13305/api/v1/health 2>/dev/null || echo "000")
           if [ "$HTTP_CODE" = "401" ]; then
             echo "PASS: Wrong API key → $HTTP_CODE"
             PASS=$((PASS+1))
@@ -1339,7 +1306,7 @@ jobs:
           fi
 
           # 3. Correct API key → must get 200
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $LEMONADE_API_KEY" http://localhost:8000/api/v1/health 2>/dev/null || echo "000")
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $LEMONADE_API_KEY" http://localhost:13305/api/v1/health 2>/dev/null || echo "000")
           if [ "$HTTP_CODE" = "200" ]; then
             echo "PASS: Correct API key → $HTTP_CODE"
             PASS=$((PASS+1))
