@@ -613,9 +613,18 @@ function renderQuickStart() {
   -p 13305:13305 \\
   -v lemonade-cache:/root/.cache/huggingface \\
   -v lemonade-llama:/opt/lemonade/llama \\
-  -e LEMONADE_LLAMACPP_BACKEND=vulkan \\
+  -e LEMONADE_LLAMACPP=vulkan \\
   ghcr.io/lemonade-sdk/lemonade-server:latest`);
-      notes = `<div class="lmn-note"><strong>Tip:</strong> To select a specific backend, update the LEMONADE_LLAMACPP_BACKEND environment variable: <code>LEMONADE_LLAMACPP_BACKEND=vulkan</code></div>`;
+      notes = `<div class="lmn-note"><strong>Tip:</strong> To use ROCm instead of Vulkan, replace <code>-e LEMONADE_LLAMACPP=vulkan</code> with <code>-e LEMONADE_LLAMACPP=rocm</code> and add the ROCm device flags. The full ROCm command:<pre style="margin:0.6em 0 0;background:linear-gradient(135deg, #2c3e50 0%, #34495e 100%);color:#fff;padding:0.7em 1em;border-radius:6px;font-size:0.92em;overflow-x:auto;line-height:1.6">docker run -d \
+  --name lemonade-server \
+  -p 13305:13305 \
+  -v lemonade-cache:/root/.cache/huggingface \
+  -v lemonade-llama:/opt/lemonade/llama \
+  -e LEMONADE_LLAMACPP=rocm \
+  --device=/dev/kfd \
+  --device=/dev/dri \
+  --group-add video \
+  ghcr.io/lemonade-sdk/lemonade-server:latest</pre></div>`;
     }
 
     if (fw === 'llama' && dev === 'cpu') {
@@ -624,9 +633,9 @@ function renderQuickStart() {
   -p 13305:13305 \\
   -v lemonade-cache:/root/.cache/huggingface \\
   -v lemonade-llama:/opt/lemonade/llama \\
-  -e LEMONADE_LLAMACPP_BACKEND=cpu \\
+  -e LEMONADE_LLAMACPP=cpu \\
   ghcr.io/lemonade-sdk/lemonade-server:latest`);
-      notes = `<div class="lmn-note"><strong>Tip:</strong> To select a specific backend, update the LEMONADE_LLAMACPP_BACKEND environment variable: <code>LEMONADE_LLAMACPP_BACKEND=cpu</code></div>`;
+      notes = `<div class="lmn-note"><strong>Tip:</strong> To select a specific backend, update the LEMONADE_LLAMACPP environment variable: <code>LEMONADE_LLAMACPP=cpu</code></div>`;
     }
   }
 
