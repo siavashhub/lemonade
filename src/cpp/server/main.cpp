@@ -1,10 +1,13 @@
 #include <iostream>
 #include <csignal>
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <lemon/cli_parser.h>
 #include <lemon/config_file.h>
 #include <lemon/logging_config.h>
 #include <lemon/server.h>
+#include <lemon/system_info.h>
 #include <lemon/version.h>
 #include <lemon/utils/path_utils.h>
 #include <lemon/utils/aixlog.hpp>
@@ -15,8 +18,8 @@
 
 using namespace lemon;
 
-// Global flag for signal handling
-static std::atomic<bool> g_shutdown_requested(false);
+// Global flags for signal handling
+static std::atomic<bool> g_reload_requested(false);
 static Server* g_server_instance = nullptr;
 
 // Signal handler for Ctrl+C, SIGTERM, and SIGHUP
@@ -24,21 +27,32 @@ void signal_handler(int signal) {
     if (signal == SIGINT || signal == SIGTERM) {
 #ifndef _WIN32
         const char* msg = "Shutdown signal received, exiting...\n";
-        (void)write(STDOUT_FILENO, msg, 38);
+        // Async-signal-safe write. The (void) cast doesn't suppress the
+        // warn_unused_result attribute on glibc's write(); explicitly
+        // assign-and-discard does. We genuinely don't care about partial
+        // writes from inside a signal handler.
+        ssize_t written = write(STDOUT_FILENO, msg, 38);
+        (void)written;
 #endif
 
-        // Don't call server->stop() from signal handler - it can block/deadlock
-        // Just set the flag and exit immediately. The OS will clean up resources.
-        g_shutdown_requested = true;
+        // Signal shutdown via the Server instance. The main loop will detect
+        // this flag and call server->stop() for graceful cleanup (unloading
+        // models, stopping backend child processes like llama-server).
+        // This ensures child processes are properly terminated instead of
+        // being orphaned when the service is stopped via systemd.
+        if (g_server_instance) {
+            g_server_instance->set_shutdown_requested(true);
+        }
 
-        // Use _exit() for async-signal-safe immediate termination
-        // The OS will handle cleanup of file descriptors, memory, and child processes
-        _exit(0);
+        // Return normally instead of calling _exit(). The main loop will
+        // detect the flag, call stop() to clean up child processes, and
+        // then exit. This prevents orphaned backend processes.
+        return;
 #ifdef SIGHUP
     } else if (signal == SIGHUP) {
-        // Ignore SIGHUP to prevent termination when parent process exits
-        // This allows the server to continue running as a daemon
-        return;
+        // Set the reload flag; a background thread will call invalidate_recipes().
+        // Calling mutex-based code directly from a signal handler is not async-signal-safe.
+        g_reload_requested = true;
 #endif
     }
 }
@@ -107,6 +121,23 @@ int main(int argc, char** argv) {
         g_server_instance = &server;
         std::signal(SIGINT, signal_handler);
         std::signal(SIGTERM, signal_handler);
+#ifdef SIGHUP
+        std::signal(SIGHUP, signal_handler);
+
+        // Background thread: watches g_reload_requested and calls invalidate_recipes().
+        // Mutex-based code (like invalidate_recipes) must not be called directly from
+        // a signal handler, so we use this thread to do the actual work safely.
+        std::thread([]() {
+            while (!g_server_instance || !g_server_instance->should_shutdown()) {
+                if (g_reload_requested.exchange(false)) {
+                    LOG(INFO) << "SIGHUP received - rescanning hardware and recipes..." << std::endl;
+                    SystemInfoCache::invalidate_recipes();
+                    LOG(INFO) << "Hardware rescan complete" << std::endl;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }).detach();
+#endif
 
         server.run();
         g_server_instance = nullptr;

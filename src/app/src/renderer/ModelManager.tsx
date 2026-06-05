@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { Boxes, ChevronRight, Cpu, Settings, SlidersHorizontal, Store, XIcon } from './components/Icons';
-import { ModelInfo } from './utils/modelData';
+import { Boxes, Brain, ChevronRight, Cpu, Eye, Flame, Layers, ListOrdered, Settings, SlidersHorizontal, Sparkles, SquareCode, Store, User, Wrench, XIcon } from './components/Icons';
+import { ModelInfo, USER_MODEL_PREFIX } from './utils/modelData';
+import { CANONICAL_PREFIXES, getModelDisplayName } from './utils/modelDisplayName';
 import { ToastContainer, useToast } from './Toast';
 import { useConfirmDialog } from './ConfirmDialog';
 import { serverFetch } from './utils/serverConfig';
@@ -18,11 +19,13 @@ import ConnectedBackendRow from './components/ConnectedBackendRow';
 import MarketplacePanel, { MarketplaceCategory } from './MarketplacePanel';
 import { RECIPE_DISPLAY_NAMES } from './utils/recipeNames';
 import { EjectIcon } from './components/Icons';
-import { getExperienceComponents, isExperienceFullyDownloaded, isExperienceFullyLoaded, isExperienceModel, isModelEffectivelyDownloaded } from './utils/experienceModels';
+import { getCollectionComponents, isCollectionFullyDownloaded, isCollectionModel, isModelEffectivelyDownloaded, isModelEffectivelyLoaded } from './utils/collectionModels';
+import { getCollectionDisplayName, isCollectionEditableAsCustom } from './utils/customCollections';
 
 interface ModelFamily {
   displayName: string;
   regex: RegExp;
+  recipe?: string;
 }
 
 const SIZE_TOKEN = String.raw`(\d+\.?\d*B(?:-A\d+\.?\d*B)?)`;
@@ -32,6 +35,14 @@ function buildFamilyRegex(prefix: string, suffix = '-GGUF$'): RegExp {
   return new RegExp(`^${prefix}-${SIZE_TOKEN}${suffix}`);
 }
 
+function buildRecipePrefixFamilyRegex(prefix: string): RegExp {
+  return new RegExp(`^${prefix}-${SIZE_TOKEN}(?:$|[-_.])`);
+}
+
+function buildRecipeRemainderFamilyRegex(prefix: string): RegExp {
+  return new RegExp(`^${prefix}-(.+)`);
+}
+
 function buildFlmFamilyRegex(prefix: string): RegExp {
   return new RegExp(`^${prefix}-${FLM_SIZE_TOKEN}-FLM$`);
 }
@@ -39,16 +50,38 @@ function buildFlmFamilyRegex(prefix: string): RegExp {
 const MODEL_FAMILIES: ModelFamily[] = [
   // Standardized family matching: capture *B or *B-A*B.
   {
-    displayName: 'Qwen3',
-    regex: buildFamilyRegex('Qwen3'),
+    displayName: 'Bonsai',
+    regex: buildRecipeRemainderFamilyRegex('Bonsai'),
+    recipe: 'llamacpp',
+  },
+  {
+    displayName: 'Gemma-4',
+    regex: buildRecipeRemainderFamilyRegex('Gemma-4'),
+    recipe: 'llamacpp',
+  },
+  {
+    displayName: 'Qwen2.5-Omni',
+    regex: buildRecipeRemainderFamilyRegex('Qwen2\\.5-Omni'),
+    recipe: 'llamacpp',
   },
   {
     displayName: 'Qwen3-Instruct-2507',
     regex: buildFamilyRegex('Qwen3', '-Instruct-2507-GGUF$'),
   },
   {
+    displayName: 'Qwen3.6',
+    regex: buildRecipeRemainderFamilyRegex('Qwen3\\.6'),
+    recipe: 'llamacpp',
+  },
+  {
+    displayName: 'Qwen3',
+    regex: buildRecipePrefixFamilyRegex('Qwen3'),
+    recipe: 'llamacpp',
+  },
+  {
     displayName: 'Qwen3.5',
-    regex: buildFamilyRegex('Qwen3\\.5'),
+    regex: buildRecipePrefixFamilyRegex('Qwen3\\.5'),
+    recipe: 'llamacpp',
   },
   {
     displayName: 'Qwen3-Embedding',
@@ -97,6 +130,66 @@ type ModelListItem =
   | { type: 'model'; name: string; info: ModelInfo }
   | { type: 'family'; family: ModelFamily; members: { label: string; name: string; info: ModelInfo }[] };
 
+const isUserDefinedModelName = (modelName: string): boolean => {
+  return modelName.startsWith(USER_MODEL_PREFIX);
+};
+
+const getModelListItemSortName = (item: ModelListItem): string => {
+  return item.type === 'family' ? item.family.displayName : getModelDisplayName(item.name);
+};
+
+const getModelListItemSortRank = (item: ModelListItem): number => {
+  return item.type === 'model' && isUserDefinedModelName(item.name) ? 1 : 0;
+};
+
+const MODEL_LABEL_DISPLAY_ORDER = [
+  'reasoning',
+  'coding',
+  'vision',
+  'hot',
+  'embeddings',
+  'reranking',
+  'tool-calling',
+  'custom',
+  'experience',
+];
+
+const sortModelLabelsForDisplay = (labels: string[]): string[] => {
+  const order = new Map(MODEL_LABEL_DISPLAY_ORDER.map((label, index) => [label, index]));
+  return [...labels].sort((a, b) => {
+    const aOrder = order.get(a) ?? Number.MAX_SAFE_INTEGER;
+    const bOrder = order.get(b) ?? Number.MAX_SAFE_INTEGER;
+    return aOrder - bOrder;
+  });
+};
+
+const ModalityIcon: React.FC<{ label: string; title: string }> = ({ label, title }) => {
+  const size = 11;
+  const strokeWidth = 2.2;
+  const icon = (() => {
+    switch (label) {
+      case 'reasoning': return <Brain size={size} strokeWidth={strokeWidth} />;
+      case 'coding': return <SquareCode size={size} strokeWidth={strokeWidth} />;
+      case 'vision': return <Eye size={size} strokeWidth={strokeWidth} />;
+      case 'hot': return <Flame size={size} strokeWidth={strokeWidth} />;
+      case 'embeddings': return <Layers size={size} strokeWidth={strokeWidth} />;
+      case 'reranking': return <ListOrdered size={size} strokeWidth={strokeWidth} />;
+      case 'tool-calling': return <Wrench size={size} strokeWidth={strokeWidth} />;
+      case 'custom': return <User size={size} strokeWidth={strokeWidth} />;
+      case 'experience': return <Sparkles size={size} strokeWidth={strokeWidth} />;
+      default: return null;
+    }
+  })();
+
+  if (!icon) return null;
+
+  return (
+    <span className={`model-label-icon label-${label}`} title={title}>
+      {icon}
+    </span>
+  );
+};
+
 // Types for Hugging Face API responses
 interface HFModelInfo {
   id: string;
@@ -126,9 +219,42 @@ interface GGUFQuantization {
 interface DetectedBackend {
   recipe: string;
   label: string;
+  suggestedName?: string;
   quantizations?: GGUFQuantization[];
   mmprojFiles?: string[];
+  suggestedLabels?: string[];
 }
+
+// Strip the canonical prefix (if any) to get the bare model name. Used for
+// family-regex matching and family grouping.
+const stripCanonicalPrefix = (modelName: string): string => {
+  const match = CANONICAL_PREFIXES.find(p => modelName.startsWith(p.prefix));
+  return match ? modelName.slice(match.prefix.length) : modelName;
+};
+
+const hasCanonicalPrefix = (modelName: string): boolean =>
+  CANONICAL_PREFIXES.some(p => modelName.startsWith(p.prefix));
+
+const getSourceSortRank = (modelName: string): number => {
+  const match = CANONICAL_PREFIXES.find(p => modelName.startsWith(p.prefix));
+  return match?.sourceRank ?? 0;
+};
+
+const stripSourceSuffix = (label: string): string => {
+  const match = CANONICAL_PREFIXES.find(p => label.endsWith(p.suffix));
+  return match ? label.slice(0, -match.suffix.length) : label;
+};
+
+const getFamilyMemberLabel = (modelName: string, family: ModelFamily): string => {
+  const prefixInfo = CANONICAL_PREFIXES.find(p => modelName.startsWith(p.prefix));
+  const bare = stripCanonicalPrefix(modelName);
+  const relativeName = bare.startsWith(family.displayName)
+    ? bare.slice(family.displayName.length).replace(/^[-_.]/, '')
+    : bare;
+  const label = relativeName.endsWith('-GGUF') ? relativeName.slice(0, -'-GGUF'.length) : relativeName;
+  // Keep the source suffix on collapsed family rows so shadowed sources stay distinguishable.
+  return label + (prefixInfo?.suffix ?? '');
+};
 
 function buildModelList(
   models: Array<{ name: string; info: ModelInfo }>
@@ -140,14 +266,30 @@ function buildModelList(
   for (const family of MODEL_FAMILIES) {
     const members: { label: string; name: string; info: ModelInfo }[] = [];
     for (const m of models) {
-      const match = family.regex.exec(m.name);
+      if (consumed.has(m.name)) continue;
+      if (family.recipe && m.info.recipe !== family.recipe) continue;
+      const match = family.regex.exec(stripCanonicalPrefix(m.name));
       if (match) {
-        members.push({ label: match[1], name: m.name, info: m.info });
+        members.push({ label: getFamilyMemberLabel(m.name, family), name: m.name, info: m.info });
         consumed.add(m.name);
       }
     }
     if (members.length > 1) {
-      members.sort((a, b) => parseFloat(a.label) - parseFloat(b.label));
+      members.sort((a, b) => {
+        const baseLabelA = stripSourceSuffix(a.label);
+        const baseLabelB = stripSourceSuffix(b.label);
+        const sizeA = parseFloat(baseLabelA);
+        const sizeB = parseFloat(baseLabelB);
+        if (Number.isFinite(sizeA) && Number.isFinite(sizeB) && sizeA !== sizeB) return sizeA - sizeB;
+
+        const baseCompare = baseLabelA.localeCompare(baseLabelB, undefined, { numeric: true });
+        if (baseCompare !== 0) return baseCompare;
+
+        const sourceCompare = getSourceSortRank(a.name) - getSourceSortRank(b.name);
+        if (sourceCompare !== 0) return sourceCompare;
+
+        return a.label.localeCompare(b.label, undefined, { numeric: true });
+      });
       familyItems.push({ type: 'family', family, members });
     } else {
       members.forEach(m => consumed.delete(m.name));
@@ -159,12 +301,15 @@ function buildModelList(
     .filter(m => !consumed.has(m.name))
     .map(m => ({ type: 'model' as const, name: m.name, info: m.info }));
 
-  // Merge and sort alphabetically by display name
+  // Merge and sort alphabetically by display name. User-defined entries
+  // stay below built-in entries inside each category, matching custom models.
   const allItems = [...familyItems, ...individualItems];
   allItems.sort((a, b) => {
-    const nameA = a.type === 'family' ? a.family.displayName : a.name;
-    const nameB = b.type === 'family' ? b.family.displayName : b.name;
-    return nameA.localeCompare(nameB);
+    const rankDiff = getModelListItemSortRank(a) - getModelListItemSortRank(b);
+    if (rankDiff !== 0) return rankDiff;
+    return getModelListItemSortName(a).localeCompare(getModelListItemSortName(b)) || (
+      a.type === 'model' && b.type === 'model' ? a.name.localeCompare(b.name) : 0
+    );
   });
 
   return allItems;
@@ -184,7 +329,7 @@ interface ModelJSON {
   recipe: string,
   recipe_options?: object,
   checkpoint?: string,
-  checkpoints?: string[],
+  checkpoints?: Record<string, string>,
   downloaded?: boolean,
   labels?: string[],
   size?: number,
@@ -344,18 +489,19 @@ const [searchQuery, setSearchQuery] = useState('');
     let filtered = suggestedModels;
 
     // Hide ESRGAN upscaler models (managed via the Image Generation panel)
-    filtered = filtered.filter(model => !model.info?.labels?.includes('esrgan'));
+    filtered = filtered.filter(model => !model.info?.labels?.includes('upscaling'));
 
     // Filter by downloaded status
     if (showDownloadedOnly) {
-      filtered = filtered.filter(model => modelsData[model.name]?.downloaded);
+      filtered = filtered.filter(model => isModelEffectivelyDownloaded(model.name, modelsData[model.name], modelsData));
     }
 
     // Filter by search query
     if (searchQuery.trim()) {
       const query = searchQuery.toLowerCase();
       filtered = filtered.filter(model =>
-        model.name.toLowerCase().includes(query)
+        model.name.toLowerCase().includes(query) ||
+        getModelDisplayName(model.name).toLowerCase().includes(query)
       );
     }
 
@@ -473,19 +619,19 @@ const [searchQuery, setSearchQuery] = useState('');
   };
 
   const getModelSize = (modelName: string, info: ModelInfo): number | undefined => {
-    if (!isExperienceModel(info)) {
+    if (!isCollectionModel(info)) {
       return info.size;
     }
-    const components = getExperienceComponents(info);
+    const components = getCollectionComponents(info);
     if (components.length === 0) return info.size;
     const total = components.reduce((sum, component) => sum + (modelsData[component]?.size || 0), 0);
     return total > 0 ? total : info.size;
   };
 
   const getDisplayLabelsForModel = (modelName: string, info: ModelInfo): string[] => {
-    if (isExperienceModel(info)) {
+    if (isCollectionModel(info)) {
       // Experiences intentionally show a single, consistent legend marker.
-      return ['experience'];
+      return ['collection'];
     }
     return (info.labels || []).filter((label): label is string => typeof label === 'string' && label.length > 0);
   };
@@ -495,10 +641,7 @@ const [searchQuery, setSearchQuery] = useState('');
   };
 
   const getModelLoadedState = (modelName: string, info: ModelInfo): boolean => {
-    if (isExperienceModel(info)) {
-      return isExperienceFullyLoaded(modelName, modelsData, loadedModels);
-    }
-    return loadedModels.has(modelName);
+    return isModelEffectivelyLoaded(modelName, info, modelsData, loadedModels);
   };
 
   const getModelLoadingState = (modelName: string): boolean => {
@@ -507,7 +650,7 @@ const [searchQuery, setSearchQuery] = useState('');
 
   const getCategoryLabel = (category: string): string => {
     const labels: { [key: string]: string } = {
-      'experience': 'Experience',
+      'collection': 'Lemonade',
       'reasoning': 'Reasoning',
       'coding': 'Coding',
       'vision': 'Vision',
@@ -533,9 +676,30 @@ const [searchQuery, setSearchQuery] = useState('');
     }
   };
 
-  const loadedModelEntries = Array.from(loadedModels)
-    .map(modelName => ({ modelName }))
-    .sort((a, b) => a.modelName.localeCompare(b.modelName));
+  // Merge loaded and loading models so the list shows components as they
+  // start loading, not just after /health confirms them. Loading entries
+  // get an `isLoading` flag so the UI can render a pending indicator.
+  // Skip collection entries themselves — only show component models.
+  const loadedModelEntries = (() => {
+    const entries: Array<{ modelName: string; isLoading: boolean }> = [];
+    const seen = new Set<string>();
+    for (const modelName of loadedModels) {
+      if (isCollectionModel(modelsData[modelName])) continue;
+      if (seen.has(modelName)) continue;
+      seen.add(modelName);
+      entries.push({ modelName, isLoading: false });
+    }
+    for (const modelName of loadingModels) {
+      if (isCollectionModel(modelsData[modelName])) continue;
+      if (seen.has(modelName)) continue;
+      seen.add(modelName);
+      entries.push({ modelName, isLoading: true });
+    }
+    return entries.sort((a, b) =>
+      getModelDisplayName(a.modelName).localeCompare(getModelDisplayName(b.modelName)) ||
+      a.modelName.localeCompare(b.modelName)
+    );
+  })();
 
 
 
@@ -631,6 +795,8 @@ const [searchQuery, setSearchQuery] = useState('');
               variants: { name: string; primary_file: string; files: string[]; sharded: boolean; size_bytes: number }[];
               mmproj_files: string[];
               recipe: string;
+              suggested_name?: string;
+              suggested_labels?: string[];
             } = await variantsRes.json();
             if (payload.variants && payload.variants.length > 0) {
               const quantizations: GGUFQuantization[] = payload.variants.map(v => ({
@@ -638,13 +804,18 @@ const [searchQuery, setSearchQuery] = useState('');
                 quantization: v.name,
                 size: v.size_bytes || undefined,
               }));
+              const suggestedLabels = Array.isArray(payload.suggested_labels)
+                ? payload.suggested_labels.filter((label): label is string => typeof label === 'string')
+                : [];
               setHfModelBackends((prev: Record<string, DetectedBackend | null>) => ({
                 ...prev,
                 [modelId]: {
                   recipe: payload.recipe || 'llamacpp',
                   label: 'GGUF',
+                  suggestedName: payload.suggested_name,
                   quantizations,
                   mmprojFiles: payload.mmproj_files && payload.mmproj_files.length > 0 ? payload.mmproj_files : undefined,
+                  suggestedLabels,
                 },
               }));
               if (!hfSelectedQuantizations[modelId]) {
@@ -722,11 +893,45 @@ const [searchQuery, setSearchQuery] = useState('');
         return;
       }
 
+      // Skip the download flow entirely if a collection is already complete
+      const info = modelsData[modelName];
+      if (isCollectionModel(info) && isCollectionFullyDownloaded(modelName, modelsData)) {
+        showSuccess(`"${modelName}" is already downloaded.`);
+        return;
+      }
+
+      // Do not start a second download if this renderer owns a live request or
+      // the server-owned download registry reports one. A restored UI row alone
+      // is not authoritative after reload, because it has no fetch stream or
+      // AbortController.
+      if (downloadTracker.isActive(modelName)) {
+        showWarning(`Download for "${modelName}" is already in progress.`);
+        return;
+      }
+
+      const serverDownloadActive = await downloadTracker.hasActiveServerDownload(modelName);
+      if (serverDownloadActive) {
+        showWarning(`Download for "${modelName}" is already in progress.`);
+        return;
+      }
+
+      // If the only thing left is a stale renderer-local row, remove it so the
+      // real /pull request can be sent and the server can resume from disk.
+      downloadTracker.clearStaleModelDownload(modelName);
+
       // Add to loading state to show loading indicator
       setLoadingModels(prev => new Set(prev).add(modelName));
 
+      const collectionComponents = isCollectionModel(info)
+        ? getCollectionComponents(info)
+        : undefined;
+
       // Use the single consolidated download function
-      await pullModel(modelName, { registrationData: registrationData });
+      await pullModel(modelName, {
+        registrationData,
+        collectionComponents,
+        declaredSizeGB: modelsData[modelName]?.size,
+      });
 
       await fetchCurrentLoadedModel();
       showSuccess(`Model "${modelName}" downloaded successfully.`);
@@ -769,15 +974,37 @@ const [searchQuery, setSearchQuery] = useState('');
     return `${modelId}:${quantObj?.quantization ?? selectedFilename}`;
   }, [hfSelectedQuantizations]);
 
+  const resolveHfModelName = useCallback((modelId: string, backend: DetectedBackend): string => {
+    const suggestedName = backend.suggestedName || modelId.split('/').pop() || modelId;
+    if (backend.recipe !== 'llamacpp') return suggestedName;
+
+    const selectedFilename = hfSelectedQuantizations[modelId];
+    if (!selectedFilename) return suggestedName;
+    const quantObj = backend.quantizations?.find(q => q.filename === selectedFilename);
+    const variantName = quantObj?.quantization ?? selectedFilename;
+    return `${suggestedName}-${variantName}`;
+  }, [hfSelectedQuantizations]);
+
   const handleInstallHFModel = useCallback((hfModel: HFModelInfo) => {
     const backend = hfModelBackends[hfModel.id];
     if (!backend) return;
     const checkpoint = backend.recipe === 'llamacpp'
       ? resolveGgufCheckpoint(hfModel.id, backend)
       : hfModel.id;
-    const modelName = `user.${hfModel.id.split('/').pop() ?? hfModel.id}`;
-    handleDownloadModel(modelName, { checkpoint, recipe: backend.recipe });
-  }, [hfModelBackends, resolveGgufCheckpoint, handleDownloadModel]);
+    const modelName = `user.${resolveHfModelName(hfModel.id, backend)}`;
+    const labels = new Set(backend.suggestedLabels ?? []);
+    const mmproj = backend.mmprojFiles?.[0];
+    if (mmproj) labels.add('vision');
+    handleDownloadModel(modelName, {
+      checkpoint,
+      recipe: backend.recipe,
+      mmproj,
+      labels: Array.from(labels),
+      vision: labels.has('vision'),
+      embedding: labels.has('embeddings'),
+      reranking: labels.has('reranking'),
+    });
+  }, [hfModelBackends, resolveGgufCheckpoint, resolveHfModelName, handleDownloadModel]);
 
   // Debounced HF search effect - to avoid HF API rate limit error
   useEffect(() => {
@@ -841,8 +1068,8 @@ const [searchQuery, setSearchQuery] = useState('');
         return;
       }
 
-      if (isExperienceModel(modelData)) {
-        const components = getExperienceComponents(modelData);
+      if (isCollectionModel(modelData)) {
+        const components = getCollectionComponents(modelData);
         if (components.length === 0) {
           showError(`Experience model "${modelName}" has no component models.`);
           return;
@@ -902,8 +1129,8 @@ const [searchQuery, setSearchQuery] = useState('');
         const next = new Set(prev);
         next.delete(modelName);
         const info = modelsData[modelName];
-        if (isExperienceModel(info)) {
-          getExperienceComponents(info).forEach((component) => next.delete(component));
+        if (isCollectionModel(info)) {
+          getCollectionComponents(info).forEach((component) => next.delete(component));
         }
         return next;
       });
@@ -914,8 +1141,8 @@ const [searchQuery, setSearchQuery] = useState('');
   const handleUnloadModel = async (modelName: string) => {
     try {
       const modelData = modelsData[modelName];
-      if (modelData && isExperienceModel(modelData)) {
-        const components = getExperienceComponents(modelData);
+      if (modelData && isCollectionModel(modelData)) {
+        const components = getCollectionComponents(modelData);
         for (const component of components) {
           if (!loadedModels.has(component)) continue;
           const response = await serverFetch('/unload', {
@@ -953,10 +1180,42 @@ const [searchQuery, setSearchQuery] = useState('');
     }
   };
 
+  const hasActiveDownloadForModel = (modelName: string): boolean => {
+    const relatedNames = new Set<string>([modelName]);
+    const info = modelsData[modelName];
+    if (isCollectionModel(info)) {
+      getCollectionComponents(info).forEach((component) => relatedNames.add(component));
+    }
+
+    return downloadTracker.getActiveDownloads().some((download) => {
+      if (download.status === 'completed' || download.status === 'error') return false;
+      const downloadNames = [download.modelName, ...(download.collectionComponents ?? [])];
+      return downloadNames.some((name) => relatedNames.has(name));
+    });
+  };
+
   const handleDeleteModel = async (modelName: string) => {
+    setHoveredModel(null);
+
+    await downloadTracker.hydrateFromServer().catch(() => undefined);
+
+    if (hasActiveDownloadForModel(modelName)) {
+      showWarning('A download or setup involving this model is still active. Cancel or delete it from the Download Manager first.');
+      return;
+    }
+
+    const info = modelsData[modelName];
+    const collectionComponents = isCollectionModel(info) ? getCollectionComponents(info) : [];
+    const isCollection = collectionComponents.length > 0;
+    const displayName = isCollection ? getCollectionDisplayName(modelName) : getModelDisplayName(modelName);
+
+    const message = isCollection
+      ? `"${displayName}" is an Omni Model. Deleting it removes only the Omni Model entry. Its ${collectionComponents.length} component model${collectionComponents.length === 1 ? '' : 's'} stay on disk.`
+      : `Are you sure you want to delete the model "${displayName}"? This action cannot be undone.`;
+
     const confirmed = await confirm({
-      title: 'Delete Model',
-      message: `Are you sure you want to delete the model "${modelName}"? This action cannot be undone.`,
+      title: isCollection ? 'Delete Omni Model' : 'Delete Model',
+      message,
       confirmText: 'Delete',
       cancelText: 'Cancel',
       danger: true
@@ -966,14 +1225,20 @@ const [searchQuery, setSearchQuery] = useState('');
       return;
     }
 
+    if (hasActiveDownloadForModel(modelName)) {
+      showWarning('A download or setup involving this model is still active. Cancel or delete it from the Download Manager first.');
+      return;
+    }
+
     try {
       await deleteModel(modelName);
-      // No manual modelsUpdated dispatch needed — deleteModel() handles it
+      showSuccess(isCollection
+        ? `Omni Model "${displayName}" deleted. Component models were kept.`
+        : `Model "${displayName}" deleted successfully.`);
       await fetchCurrentLoadedModel();
-      showSuccess(`Model "${modelName}" deleted successfully.`);
     } catch (error) {
       console.error('Error deleting model:', error);
-      showError(`Failed to delete model: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      showError('Failed to delete model: ' + (error instanceof Error ? error.message : 'Unknown error'));
     }
   };
 
@@ -1034,8 +1299,12 @@ const [searchQuery, setSearchQuery] = useState('');
   const showInlineFilterButton = currentView === 'models' || currentView === 'marketplace';
 
   const getModelStatus = (modelName: string) => {
-    const isDownloaded = modelsData[modelName]?.downloaded ?? false;
-    const isLoaded = loadedModels.has(modelName);
+    const info = modelsData[modelName];
+    // collections: downloaded when all components are downloaded,
+    // loaded when all components are loaded. Fall back to naive checks
+    // for regular models.
+    const isDownloaded = isModelEffectivelyDownloaded(modelName, info, modelsData);
+    const isLoaded = isModelEffectivelyLoaded(modelName, info, modelsData, loadedModels);
     const isLoading = loadingModels.has(modelName);
 
     let statusClass = 'not-downloaded';
@@ -1077,43 +1346,87 @@ const [searchQuery, setSearchQuery] = useState('');
     </button>
   );
 
-  const renderDeleteButton = (modelName: string) => (
+  const renderCustomCollectionOptionsButton = (modelName: string) => (
     <button
-      className="model-action-btn delete-btn"
-      onClick={(e) => { e.stopPropagation(); handleDeleteModel(modelName); }}
-      title="Delete model"
+      className="model-action-btn load-btn"
+      onClick={(e) => {
+        e.stopPropagation();
+        window.dispatchEvent(new CustomEvent('editCustomCollection', { detail: { collectionId: modelName } }));
+      }}
+      title="Omni Model options"
     >
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-        <polyline points="3 6 5 6 21 6" />
-        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+           xmlns="http://www.w3.org/2000/svg">
+        <path
+          d="M6.5 1.5H9.5L9.9 3.4C10.4 3.6 10.9 3.9 11.3 4.2L13.1 3.5L14.6 6L13.1 7.4C13.2 7.9 13.2 8.1 13.2 8.5C13.2 8.9 13.2 9.1 13.1 9.6L14.6 11L13.1 13.5L11.3 12.8C10.9 13.1 10.4 13.4 9.9 13.6L9.5 15.5H6.5L6.1 13.6C5.6 13.4 5.1 13.1 4.7 12.8L2.9 13.5L1.4 11L2.9 9.6C2.8 9.1 2.8 8.9 2.8 8.5C2.8 8.1 2.8 7.9 2.9 7.4L1.4 6L2.9 3.5L4.7 4.2C5.1 3.9 5.6 3.6 6.1 3.4L6.5 1.5Z"
+          stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"
+          strokeLinejoin="round"/>
+        <circle cx="8" cy="8.5" r="2.5" stroke="currentColor"
+                strokeWidth="1.2"/>
       </svg>
     </button>
   );
 
+  const renderDeleteButton = (modelName: string, title = 'Delete model') => {
+    const blockedByDownload = hasActiveDownloadForModel(modelName);
+    return (
+      <button
+        className="model-action-btn delete-btn"
+        onClick={(e) => {
+          e.stopPropagation();
+          if (blockedByDownload) {
+            showWarning('A download or setup involving this model is still active. Cancel or delete it from the Download Manager first.');
+            return;
+          }
+          handleDeleteModel(modelName);
+        }}
+        title={blockedByDownload ? 'Cancel or delete the active download first' : title}
+        disabled={blockedByDownload}
+      >
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <polyline points="3 6 5 6 21 6" />
+          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+        </svg>
+      </button>
+    );
+  };
+
   const renderActionButtonsContent = (modelName: string) => {
     const { isDownloaded, isLoaded, isLoading } = getModelStatus(modelName);
-    const isEsrgan = modelsData[modelName]?.labels?.includes('esrgan');
+    const info = modelsData[modelName];
+    const isUpscaling = info?.labels?.includes('upscaling');
+    const isCollection = isCollectionModel(info);
+    const isEditableCollection = isCollectionEditableAsCustom(info);
+    const isBuiltInCollection = isCollection && info?.suggested === true &&
+      !(info?.labels ?? []).includes('custom') &&
+      !modelName.startsWith(USER_MODEL_PREFIX) &&
+      info?.source !== 'user' && info?.source !== 'user_models' && info?.source !== 'custom';
+    const canDeleteFromRow = !isCollection || !isBuiltInCollection;
     return (
       <>
         {!isDownloaded && (
-          <button
-            className="model-action-btn download-btn"
-            onClick={(e) => { e.stopPropagation(); handleDownloadModel(modelName); }}
-            title="Download model"
-          >
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="7 10 12 15 17 10" />
-              <line x1="12" y1="15" x2="12" y2="3" />
-            </svg>
-          </button>
+          <>
+            <button
+              className="model-action-btn download-btn"
+              onClick={(e) => { e.stopPropagation(); handleDownloadModel(modelName); }}
+              title="Download model"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+            </button>
+            {canDeleteFromRow && renderDeleteButton(modelName, isCollection ? 'Delete Omni Model' : 'Delete model')}
+            {isEditableCollection && renderCustomCollectionOptionsButton(modelName)}
+          </>
         )}
-        {isDownloaded && !isLoaded && !isLoading && isEsrgan && (
+        {isDownloaded && !isLoaded && !isLoading && isUpscaling && (
           <>
             {renderDeleteButton(modelName)}
           </>
         )}
-        {isDownloaded && !isLoaded && !isLoading && !isEsrgan && (
+        {isDownloaded && !isLoaded && !isLoading && !isUpscaling && (
           <>
             <button
               className="model-action-btn load-btn"
@@ -1124,8 +1437,9 @@ const [searchQuery, setSearchQuery] = useState('');
                 <polygon points="5 3 19 12 5 21" fill="currentColor" />
               </svg>
             </button>
-            {renderDeleteButton(modelName)}
-            {renderLoadOptionsButton(modelName)}
+            {canDeleteFromRow && renderDeleteButton(modelName, isCollection ? 'Delete Omni Model' : 'Delete model')}
+            {isEditableCollection && renderCustomCollectionOptionsButton(modelName)}
+            {!isCollection && renderLoadOptionsButton(modelName)}
           </>
         )}
         {isLoaded && (
@@ -1141,8 +1455,9 @@ const [searchQuery, setSearchQuery] = useState('');
                 <path d="M5 20H19" />
               </svg>
             </button>
-            {renderDeleteButton(modelName)}
-            {renderLoadOptionsButton(modelName)}
+            {canDeleteFromRow && renderDeleteButton(modelName, isCollection ? 'Delete Omni Model' : 'Delete model')}
+            {isEditableCollection && renderCustomCollectionOptionsButton(modelName)}
+            {!isCollection && renderLoadOptionsButton(modelName)}
           </>
         )}
       </>
@@ -1164,6 +1479,21 @@ const [searchQuery, setSearchQuery] = useState('');
   ) => {
     const { isDownloaded, statusClass, statusTitle } = getModelStatus(modelName);
     const isHovered = hoveredModel === hoverKey;
+
+    // For collections, show the component list (with sizes) as a
+    // tooltip so users can see what gets downloaded/loaded.
+    let nameTooltip: string | undefined;
+    if (isCollectionModel(modelInfo)) {
+      const components = getCollectionComponents(modelInfo);
+      const lines = components.map((c) => {
+        const s = modelsData[c]?.size;
+        return s ? `• ${c} (${s.toFixed(1)} GB)` : `• ${c}`;
+      });
+      nameTooltip = `Omni Model with ${components.length} component models:\n${lines.join('\n')}`;
+    } else if (displayName || getModelDisplayName(modelName) !== modelName) {
+      nameTooltip = modelName;
+    }
+
     return (
       <div
         key={modelName}
@@ -1174,14 +1504,14 @@ const [searchQuery, setSearchQuery] = useState('');
         <div className="model-item-content">
           <div className="model-info-left">
             <span className={`model-status-indicator ${statusClass}`} title={statusTitle}>●</span>
-            <span className="model-name">{displayName ?? modelName}</span>
-            <span className="model-size">{formatSize(modelInfo.size)}</span>
+            <span className="model-name" title={nameTooltip}>{displayName ?? (isCollectionModel(modelInfo) ? getCollectionDisplayName(modelName) : getModelDisplayName(modelName))}</span>
+            <span className="model-size">{formatSize(getModelSize(modelName, modelInfo))}</span>
             {renderActionButtons(modelName, isHovered)}
           </div>
           {modelInfo.labels && modelInfo.labels.length > 0 && (
             <span className="model-labels">
-              {modelInfo.labels.map(label => (
-                <span key={label} className={`model-label label-${label}`} title={getCategoryLabel(label)} />
+              {sortModelLabelsForDisplay(modelInfo.labels).map(label => (
+                <ModalityIcon key={label} label={label} title={getCategoryLabel(label)} />
               ))}
             </span>
           )}
@@ -1218,8 +1548,8 @@ const [searchQuery, setSearchQuery] = useState('');
           <span className="model-name family-model-name">{family.displayName}</span>
           {sharedLabels && sharedLabels.length > 0 && (
             <span className="model-labels">
-              {sharedLabels.map(label => (
-                <span key={label} className={`model-label label-${label}`} title={getCategoryLabel(label)} />
+              {sortModelLabelsForDisplay(sharedLabels).map(label => (
+                <ModalityIcon key={label} label={label} title={getCategoryLabel(label)} />
               ))}
             </span>
           )}
@@ -1266,7 +1596,7 @@ const [searchQuery, setSearchQuery] = useState('');
 
   const renderBackendSetupBanner = (recipe: string) => {
     const info = getRecipeBackendInfo(recipe);
-    if (!info || info.state === 'installed') return null;
+    if (!info || info.state === 'installed' || info.state === 'update_available') return null;
     if (info.state === 'unsupported') return null;
 
     const isUpdate = info.state === 'update_required';
@@ -1306,7 +1636,8 @@ const [searchQuery, setSearchQuery] = useState('');
             </div>
 
             {shouldShowCategory(category) && (
-              <div className="model-list">
+              <>
+                <div className="model-list">
                 {organizationMode === 'recipe' && !hasModels && renderBackendSetupBanner(category)}
                 <ModelOptionsModal model={optionsModel} isOpen={showModelOptionsModal}
                                    onCancel={() => {
@@ -1325,6 +1656,7 @@ const [searchQuery, setSearchQuery] = useState('');
                   return renderModelItem(item.name, item.info, item.name);
                 })}
               </div>
+              </>
             )}
           </div>
         );
@@ -1340,6 +1672,7 @@ const [searchQuery, setSearchQuery] = useState('');
       onContentVisibilityChange(true);
     }
   };
+
 
   return (
     <div className="model-manager" style={{ width: `${width}px` }}>
@@ -1459,19 +1792,26 @@ const [searchQuery, setSearchQuery] = useState('');
             <div className="loaded-model-section widget">
               <div className="loaded-model-header">
                 <div className="loaded-model-label">ACTIVE MODELS</div>
-                <div className="loaded-model-count-pill">{loadedModelEntries.length} loaded</div>
+                <div className="loaded-model-count-pill">
+                  {loadedModelEntries.filter(e => !e.isLoading).length} loaded
+                </div>
               </div>
               {loadedModelEntries.length === 0 && <div className="loaded-model-empty">No models loaded</div>}
               <div className="loaded-model-list">
-                {loadedModelEntries.map(({ modelName }) => (
+                {loadedModelEntries.map(({ modelName, isLoading }) => (
                   <div key={modelName} className="loaded-model-info">
                     <div className="loaded-model-details">
-                      <span className="loaded-model-indicator">●</span>
-                      <span className="loaded-model-name">{modelName}</span>
+                      <span
+                        className={`loaded-model-indicator${isLoading ? ' loading' : ''}`}
+                        title={isLoading ? 'Loading' : 'Loaded'}
+                      />
+                      <span className="loaded-model-name" title={modelName}>{getModelDisplayName(modelName)}</span>
                     </div>
-                    <button className="model-action-btn unload-btn active-model-eject-button" onClick={() => handleUnloadModel(modelName)} title="Eject model">
-                      <EjectIcon />
-                    </button>
+                    {!isLoading && (
+                      <button className="model-action-btn unload-btn active-model-eject-button" onClick={() => handleUnloadModel(modelName)} title="Eject model">
+                        <EjectIcon />
+                      </button>
+                    )}
                   </div>
                 ))}
               </div>
@@ -1536,16 +1876,18 @@ const [searchQuery, setSearchQuery] = useState('');
                                     ? resolveGgufCheckpoint(hfModel.id, backend)
                                     : hfModel.id;
                                   const idLower = hfModel.id.toLowerCase();
+                                  const labels = backend.suggestedLabels ?? [];
                                   window.dispatchEvent(new CustomEvent('openAddModel', {
                                     detail: {
                                       initialValues: {
-                                        name: hfModel.id.split('/').pop() || hfModel.id,
+                                        name: resolveHfModelName(hfModel.id, backend),
                                         checkpoint,
                                         recipe: backend.recipe,
                                         mmprojOptions: backend.mmprojFiles,
-                                        vision: (backend.mmprojFiles?.length ?? 0) > 0,
-                                        reranking: idLower.includes('rerank'),
-                                        embedding: idLower.includes('embed'),
+                                        labels,
+                                        vision: labels.includes('vision') || (backend.mmprojFiles?.length ?? 0) > 0,
+                                        reranking: labels.includes('reranking') || idLower.includes('rerank'),
+                                        embedding: labels.includes('embeddings') || idLower.includes('embed'),
                                       },
                                     },
                                   }));

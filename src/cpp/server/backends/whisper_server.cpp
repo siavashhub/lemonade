@@ -5,9 +5,11 @@
 #include "lemon/audio_types.h"
 #include "lemon/utils/custom_args.h"
 #include "lemon/utils/http_client.h"
+#include "lemon/utils/path_utils.h"
 #include "lemon/utils/process_manager.h"
 #include "lemon/error_types.h"
 #include <iostream>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -32,10 +34,29 @@ namespace backends {
 
 WhisperServer::WhisperServer(const std::string& log_level, ModelManager* model_manager, BackendManager* backend_manager)
     : WrappedServer("whisper-server", log_level, model_manager, backend_manager) {
+    fs::path runtime_base = path_from_utf8(get_runtime_dir());
 
-    // Create temp directory for audio files
-    temp_dir_ = fs::temp_directory_path() / "lemonade_audio";
-    fs::create_directories(temp_dir_);
+    std::random_device rd;
+    std::uniform_int_distribution<unsigned int> dis(0, 0xFFFFFF);
+
+    std::error_code ec;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        auto nonce = static_cast<unsigned long long>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        std::ostringstream suffix;
+        suffix << "whisper-audio-" << nonce << "-" << std::hex << dis(rd);
+        fs::path candidate = runtime_base / suffix.str();
+
+        ec.clear();
+        if (fs::create_directory(candidate, ec)) {
+            temp_dir_ = candidate;
+            break;
+        }
+    }
+
+    if (temp_dir_.empty()) {
+        throw std::runtime_error("Failed to create temporary directory for WhisperServer");
+    }
 }
 
 WhisperServer::~WhisperServer() {
@@ -69,9 +90,6 @@ InstallParams WhisperServer::get_install_params(const std::string& backend, cons
 #elif defined(__linux__)
         params.repo = "lemonade-sdk/whisper.cpp-builds";
         params.filename = "whisper-" + version + "-linux-cpu-x86_64.tar.gz";
-#elif defined(__APPLE__)
-        params.repo = "ggml-org/whisper.cpp";
-        params.filename = "whisper-bin-arm64.zip";
 #else
         throw std::runtime_error("Unsupported platform for whisper.cpp");
 #endif
@@ -82,6 +100,9 @@ InstallParams WhisperServer::get_install_params(const std::string& backend, cons
 #else
         throw std::runtime_error("Vulkan whisper.cpp backend is currently supported only on Linux");
 #endif
+    } else if (backend == "metal") {
+        params.repo = "lemonade-sdk/whisper.cpp-builds";
+        params.filename = "whisper-" + version + "-darwin-metal-arm64.tar.gz";
     } else {
         throw std::runtime_error("[WhisperServer] Unknown whisper backend: " + backend);
     }
@@ -128,9 +149,24 @@ void WhisperServer::download_npu_compiled_cache(const std::string& model_path,
     LOG(INFO, "WhisperServer") << "Downloading NPU compiled cache: " << cache_filename << std::endl;
     LOG(INFO, "WhisperServer") << "From repository: " << cache_repo << std::endl;
 
+    if (cache_filename.find('/') != std::string::npos ||
+        cache_filename.find('\\') != std::string::npos ||
+        cache_filename.find("..") != std::string::npos) {
+        throw std::runtime_error("Illegal npu_cache filename: contains path traversal characters");
+    }
+
+    if (cache_repo.find("..") != std::string::npos ||
+        cache_repo.find('\\') != std::string::npos) {
+        throw std::runtime_error("Illegal npu_cache repository: contains suspicious characters");
+    }
+
     // Determine where to place the .rai file (must be in the same directory as .bin file)
     fs::path model_dir = fs::path(model_path).parent_path();
-    fs::path cache_path = model_dir / cache_filename;
+    fs::path cache_path = fs::weakly_canonical(model_dir / fs::path(cache_filename).filename());
+
+    if (cache_path.parent_path() != fs::weakly_canonical(model_dir)) {
+        throw std::runtime_error("npu_cache path escapes model directory");
+    }
 
     // Check if cache already exists
     if (fs::exists(cache_path) && !do_not_upgrade) {
@@ -184,7 +220,7 @@ void WhisperServer::load(const std::string& model_name,
     // get_device_type_from_recipe() defaults whispercpp to CPU, but npu/vulkan use different devices.
     if (whispercpp_backend == "npu") {
         device_type_ = DEVICE_NPU;
-    } else if (whispercpp_backend == "vulkan") {
+    } else if (whispercpp_backend == "vulkan" || whispercpp_backend == "metal") {
         device_type_ = DEVICE_GPU;
     } else {
         device_type_ = DEVICE_CPU;
@@ -504,7 +540,11 @@ json WhisperServer::forward_multipart_audio_request(const std::string& file_path
     const std::string url = "http://127.0.0.1:" + std::to_string(port_) + "/inference";
     LOG(DEBUG, "WhisperServer") << "Sending multipart request to " << url << std::endl;
 
-    auto res = utils::HttpClient::post_multipart(url, fields, 300);
+    // Pass 0 so HttpClient falls back to its default timeout, which is kept in
+    // sync with `global_timeout` in config.json (see server.cpp). Hard-coding 300
+    // caused long-form audio (~35+ min on slower backends) to fail regardless of
+    // the user's configuration.
+    auto res = utils::HttpClient::post_multipart(url, fields, 0);
 
     LOG(DEBUG, "WhisperServer") << "Response status: " << res.status_code << std::endl;
     LOG(DEBUG, "WhisperServer") << "Response body: " << res.body << std::endl;
@@ -591,7 +631,9 @@ json WhisperServer::forward_multipart_audio_data(const std::string& audio_data,
     const std::string url = "http://127.0.0.1:" + std::to_string(port_) + "/inference";
     LOG(DEBUG, "WhisperServer") << "Sending multipart request to " << url << " (direct data)" << std::endl;
 
-    auto res = utils::HttpClient::post_multipart(url, fields, 300);
+    // See the note on the file-path variant above: 0 inherits the configured
+    // global timeout so long transcriptions aren't artificially capped at 300s.
+    auto res = utils::HttpClient::post_multipart(url, fields, 0);
 
     LOG(DEBUG, "WhisperServer") << "Response status: " << res.status_code << std::endl;
 
@@ -607,7 +649,7 @@ json WhisperServer::forward_multipart_audio_data(const std::string& audio_data,
     }
 }
 
-// IAudioServer implementation
+// ITranscriptionServer implementation
 json WhisperServer::audio_transcriptions(const json& request) {
     try {
         // Extract audio data from request

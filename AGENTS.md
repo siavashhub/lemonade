@@ -11,10 +11,9 @@ Lemonade is a local LLM server providing GPU and NPU acceleration for running la
 ### Executables
 
 - **lemond** — Pure HTTP server. Handles REST API, routes requests to backends, manages model loading/unloading. Configured via `config.json` in the lemonade cache directory. CLI args: `[cache_dir] [--port PORT] [--host HOST]`.
-- **lemonade** — CLI client (`src/cpp/cli/`). Commands: `list`, `pull`, `delete`, `run`, `status`, `logs`, `launch`, `recipes`, `scan`, etc. Communicates with router via HTTP. Discovers running server via UDP beacon.
+- **lemonade** — CLI client (`src/cpp/cli/`). Commands: `list`, `pull`, `delete`, `run`, `status`, `logs`, `launch`, `backends`, `scan`, etc. Communicates with router via HTTP. Discovers running server via UDP beacon.
 - **LemonadeServer.exe** (Windows) — SUBSYSTEM:WINDOWS GUI app that embeds `lemond` and shows a system tray icon. Auto-starts via Windows startup folder.
 - **lemonade-tray** (macOS/Linux) — Lightweight tray client that connects to a running `lemond`. Platform code in `src/cpp/tray/platform/`.
-- **lemonade-server** — Deprecated backwards-compatibility shim. Delegates to `lemond` or `lemonade`.
 
 ### Backend Abstraction
 
@@ -25,11 +24,12 @@ Lemonade is a local LLM server providing GPU and NPU acceleration for running la
 | llama.cpp | `LlamaCppServer` | Completion, Embeddings, Reranking | GPU | LLM inference — CPU/GPU (Vulkan, ROCm, Metal) |
 | FastFlowLM | `FastFlowLMServer` | Completion, Embeddings, Reranking, Audio | NPU | NPU inference (multi-modal: LLM, ASR, embeddings, reranking) |
 | RyzenAI | `RyzenAIServer` | Completion | NPU | Hybrid NPU inference |
+| vLLM | `VLLMServer` | Completion | GPU | LLM inference — ROCm on AMD iGPU/dGPU (Linux). **Experimental**, validated only on gfx1151 (Strix Halo). |
 | whisper.cpp | `WhisperServer` | Audio | CPU | Audio transcription |
 | stable-diffusion.cpp | `SdServer` | Image | CPU | Image generation, editing, variations |
 | Kokoro | `KokoroServer` | TTS | CPU | Text-to-speech |
 
-Capability interfaces: `ICompletionServer`, `IEmbeddingsServer`, `IRerankingServer`, `IAudioServer`, `IImageServer`, `ITextToSpeechServer` (defined in `server_capabilities.h`). Use `supports_capability<T>(server)` template for runtime checks.
+Capability interfaces: `ICompletionServer`, `IEmbeddingsServer`, `IRerankingServer`, `ITranscriptionServer`, `IImageServer`, `ITextToSpeechServer` (defined in `server_capabilities.h`). Use `supports_capability<T>(server)` template for runtime checks.
 
 ### Router & Multi-Model Support
 
@@ -61,14 +61,14 @@ Optional API key auth via `LEMONADE_API_KEY` env var (regular API endpoints) or 
 
 ### Desktop & Web App
 
-- **Electron app** — React 19 + TypeScript in `src/app/`. Pure CSS (dark theme), context-based state. Key components: `ChatWindow.tsx`, `ModelManager.tsx`, `DownloadManager.tsx`, `BackendManager.tsx`. Feature panels: LLMChat, ImageGeneration, Transcription, TTS, Embedding, Reranking.
-- **Web app** — Browser-only version in `src/web-app/`. Symlinks source from `src/app/src/`. Built via CMake `BUILD_WEB_APP=ON`. Served at `/app`.
+- **Tauri app** — React 19 + TypeScript in `src/app/`, Rust host in `src/app/src-tauri/`. Uses native OS webview (WebView2 on Windows, WKWebView on macOS, webkit2gtk on Linux). Pure CSS (dark theme), context-based state. Key components: `ChatWindow.tsx`, `ModelManager.tsx`, `DownloadManager.tsx`, `BackendManager.tsx`. Feature panels: LLMChat, ImageGeneration, Transcription, TTS, Embedding, Reranking. The renderer keeps its `window.api` contract via `src/app/src/renderer/tauriShim.ts`, which maps each call to a Tauri `invoke()` or event `listen()`.
+- **Web app** — Browser-only version in `src/web-app/`. Reuses the shared renderer from `src/app/src/` via webpack's `entry`/`template` paths (no OS symlinks); the `BuildWebApp.cmake` script stages both trees side-by-side under `build/web-app-staging/` for the actual webpack build. Built via CMake `BUILD_WEB_APP=ON`. Served at `/app`. A mock `window.api` is injected by the C++ server (`src/cpp/server/server.cpp`) so the shared renderer works unchanged in the browser.
 
 ### Key Dependencies
 
 **C++ (FetchContent):** cpp-httplib, nlohmann/json, CLI11, libcurl, zstd, libwebsockets, brotli (macOS). Platform SSL: Schannel (Windows), SecureTransport (macOS), OpenSSL (Linux).
 
-**Electron:** React 19, TypeScript 5.3, Webpack 5, Electron 39, markdown-it, highlight.js, katex.
+**Desktop app:** Tauri v2 (Rust), React 19, TypeScript 5.3, Webpack 5, markdown-it, highlight.js, katex. Rust crates: `tauri`, `tauri-plugin-{opener,clipboard-manager,single-instance,deep-link}`, `tokio`, `reqwest`, `serde`.
 
 ## Build Commands
 
@@ -84,18 +84,18 @@ cmake --build --preset default          # Linux / macOS (Ninja)
 cmake --build --preset windows          # Windows (Visual Studio 2022)
 cmake --build --preset vs18             # Windows (Visual Studio 2026)
 
-# 3. Electron app (optional, requires Node.js 20+)
-cmake --build --preset default --target electron-app    # Linux / macOS
-cmake --build --preset windows --target electron-app    # Windows (VS 2022)
-cmake --build --preset vs18 --target electron-app       # Windows (VS 2026)
+# 3. Tauri desktop app (optional, requires Node.js 20+ and Rust via rustup)
+cmake --build --preset default --target tauri-app    # Linux / macOS
+cmake --build --preset windows --target tauri-app    # Windows (VS 2022)
+cmake --build --preset vs18 --target tauri-app       # Windows (VS 2026)
 
-# 4. Web app (auto-built on non-Windows; manual on Windows)
+# 4. Web app (auto-built on all platforms)
 cmake --build --preset default --target web-app         # Linux / macOS
 cmake --build --preset windows --target web-app         # Windows
 
 # 5. Windows MSI installer (WiX 5.0+ required)
 cmake --build --preset windows --target wix_installer_minimal  # server + web-app
-cmake --build --preset windows --target wix_installer_full     # server + electron + web-app
+cmake --build --preset windows --target wix_installer_full     # server + Tauri app + web-app
 
 # 6. macOS signed installer
 cmake --build --preset default --target package-macos
@@ -103,24 +103,21 @@ cmake --build --preset default --target package-macos
 # 7. Linux .deb / .rpm
 cd build && cpack            # .deb
 cd build && cpack -G RPM     # .rpm
-
-# 8. Linux AppImage
-cmake --build --preset default --target appimage
 ```
 
 CMake presets: `default` (Ninja, Release), `windows` (VS 2022), `vs18` (VS 2026), `debug` (Ninja, Debug).
 
-CMake options: `BUILD_WEB_APP` (ON by default on non-Windows), `BUILD_ELECTRON_APP` (Linux only, include Electron in deb), `LEMONADE_SYSTEMD_UNIT_NAME` (default: `lemonade-server.service`).
+CMake options: `BUILD_WEB_APP` (ON by default on all platforms), `BUILD_TAURI_APP` (Linux only, include Tauri desktop app in deb), `LEMONADE_SYSTEMD_UNIT_NAME` (default: `lemond.service`).
 
 ## Testing
 
-Integration tests in Python against a live server. Tests auto-discover the server binary from the build directory; use `--server-binary` to override.
+Integration tests in Python against a live server. Tests auto-discover the `lemonade` CLI binary from the build directory; use `--cli-binary` to override.
 
 ```bash
 pip install -r test/requirements.txt
 
 # CLI tests (no inference backend needed)
-python test/server_cli.py
+python test/server_cli2.py
 
 # Endpoint tests (no inference backend needed)
 python test/server_endpoints.py
@@ -191,6 +188,9 @@ These MUST be maintained in all changes:
 8. **Thread safety** — Router serves concurrent HTTP requests. Shared state must be properly guarded.
 9. **Ollama compatibility** — Changes to model listing or management must not break `/api/*` Ollama endpoints.
 10. **API key passthrough** — When `LEMONADE_API_KEY` is set, all API routes must enforce authentication.
+11. **Many-clients-one-server topology** — A single `lemond` can be driven by multiple desktop/tray/CLI clients, potentially on different machines. Per-client state (settings, layout, zoom, base URL, API key) MUST live locally in the client, never in `lemond`. Do not move `app_settings.json` behind an HTTP endpoint.
+12. **Web-app dependencies constrained by Debian native packaging** — `src/web-app/package.json` is kept separate from `src/app/package.json` because the native Debian package (`lemonade-server` .deb) must build using only npm modules available in Debian's `/usr/share/nodejs` (see `USE_SYSTEM_NODEJS_MODULES` in `src/web-app/webpack.config.js`). The old Electron app depended on packages Debian does not ship. Do NOT consolidate the two `package.json` files — the split is required for reproducible distro packaging.
+13. **Desktop app is on-demand; `lemond` runs independently** — On Windows, `LemonadeServer.exe` (which embeds `lemond` + tray icon) is the always-on process, auto-started via the Windows startup folder. The Tauri desktop app (`lemonade-app.exe`) is opened on demand when the user wants the UI and must not be added to startup. The desktop app must not embed or manage `lemond`'s lifecycle — it discovers the already-running server (UDP beacon for local, explicit base URL for remote) and speaks to it over HTTP.
 
 ## Contributing
 

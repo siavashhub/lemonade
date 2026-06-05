@@ -22,10 +22,21 @@ class Router;
  * State for a single realtime transcription session.
  */
 struct RealtimeSession {
+    static json default_turn_detection_config() {
+        const SimpleVAD::Config defaults;
+        return {
+            {"threshold", defaults.energy_threshold},
+            {"silence_duration_ms", defaults.min_silence_ms},
+            {"prefix_padding_ms", defaults.min_speech_ms}
+        };
+    }
+
     std::string session_id;
     std::string model;
     StreamingAudioBuffer audio_buffer;
     SimpleVAD vad;
+    json turn_detection_config;
+    std::atomic<bool> turn_detection_enabled{true};
     std::atomic<bool> session_active{true};
 
     // Callback to send messages back to the WebSocket client
@@ -33,13 +44,16 @@ struct RealtimeSession {
 
     // Timestamps for audio tracking
     int64_t audio_start_ms = 0;  // Start of current speech segment
+    std::atomic<bool> vad_speech_window_open{false};
 
     // Interim transcription state
     int64_t last_interim_transcription_ms = 0;  // When we last fired an interim transcription
     std::atomic<bool> interim_in_flight{false};  // Guard against overlapping interim requests
 
     RealtimeSession(const std::string& id)
-        : session_id(id), vad(SimpleVAD::Config{}) {}
+        : session_id(id),
+          vad(SimpleVAD::Config{}),
+          turn_detection_config(default_turn_detection_config()) {}
 };
 
 /**
@@ -118,6 +132,10 @@ private:
 
     // Generate unique session ID
     static std::string generate_session_id();
+
+    // Apply turn detection configuration to a session
+    void apply_turn_detection_config(std::shared_ptr<RealtimeSession> session,
+                                     const json& turn_detection);
 
     // Snapshot audio buffer and dispatch transcription to worker thread
     void transcribe_and_send(std::shared_ptr<RealtimeSession> session);

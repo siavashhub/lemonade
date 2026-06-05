@@ -1,13 +1,74 @@
 #include "lemon_cli/lemonade_client.h"
 #include <httplib.h>
 #include <iostream>
+#include <algorithm>
 #include <iomanip>
+#include <regex>
 #include <sstream>
 #include <nlohmann/json.hpp>
 
 namespace lemonade {
 
 using json = nlohmann::json;
+
+static const int DEFAULT_CONNECTION_TIMEOUT_MS = 30000;
+static const int DEFAULT_READ_TIMEOUT_MS = 30000;
+static const int LONG_TIMEOUT_MS = 86400000;
+
+static std::regex build_name_filter_regex(const std::string& name_filter) {
+    std::string regex_pattern;
+    regex_pattern.reserve(name_filter.size() * 2);
+
+    for (char ch : name_filter) {
+        switch (ch) {
+            case '*':
+                regex_pattern += ".*";
+                break;
+            case '\\':
+            case '^':
+            case '$':
+            case '.':
+            case '|':
+            case '?':
+            case '+':
+            case '(':
+            case ')':
+            case '[':
+            case ']':
+            case '{':
+            case '}':
+                regex_pattern += '\\';
+                regex_pattern += ch;
+                break;
+            default:
+                regex_pattern += ch;
+                break;
+        }
+    }
+
+    return std::regex(regex_pattern, std::regex_constants::ECMAScript | std::regex_constants::icase);
+}
+
+static bool starts_with(const std::string& value, const std::string& prefix) {
+    return value.rfind(prefix, 0) == 0;
+}
+
+static std::string strip_canonical_prefix(const std::string& model_name) {
+    static const std::vector<std::string> prefixes = {"user.", "extra.", "builtin."};
+    for (const auto& prefix : prefixes) {
+        if (starts_with(model_name, prefix)) {
+            return model_name.substr(prefix.size());
+        }
+    }
+    return model_name;
+}
+
+static int model_source_sort_rank(const std::string& model_name) {
+    if (starts_with(model_name, "user.")) return 1;
+    if (starts_with(model_name, "extra.")) return 2;
+    if (starts_with(model_name, "builtin.")) return 3;
+    return 0;
+}
 
 HttpError::HttpError(int status, std::string body, const std::string& message)
     : std::runtime_error(message), status_code_(status), response_body_(std::move(body)) {}
@@ -34,7 +95,7 @@ std::string LemonadeClient::normalize_host(const std::string& host) const {
 
 // Helper to create and configure httplib::Client (timeouts in milliseconds)
 static httplib::Client make_client(const std::string& host, int port, const std::string& api_key,
-                                    int connection_timeout_ms = 30000, int read_timeout_ms = 30000) {
+                                    time_t connection_timeout_ms = DEFAULT_CONNECTION_TIMEOUT_MS, time_t read_timeout_ms = DEFAULT_READ_TIMEOUT_MS) {
     httplib::Client cli(host, port);
     cli.set_connection_timeout(connection_timeout_ms / 1000, (connection_timeout_ms % 1000) * 1000);
     cli.set_read_timeout(read_timeout_ms / 1000, (read_timeout_ms % 1000) * 1000);
@@ -74,7 +135,7 @@ std::string extract_server_error_message(const HttpError& error) {
 // Overloaded make_request with configurable timeouts (in milliseconds)
 std::string LemonadeClient::make_request(const std::string& path, const std::string& method,
                                           const std::string& body, const std::string& content_type,
-                                          int connection_timeout_ms, int read_timeout_ms) const {
+                                          time_t connection_timeout_ms, time_t read_timeout_ms) const {
     std::string normalized_host = normalize_host(host_);
     httplib::Client cli = make_client(normalized_host, port_, api_key_, connection_timeout_ms, read_timeout_ms);
 
@@ -149,7 +210,7 @@ static httplib::Result handle_sse_stream(httplib::Client& cli, const std::string
 bool LemonadeClient::make_request(const std::string& path, const std::string& method,
                                    const std::string& body, const std::string& content_type,
                                    std::function<void(const std::string& event_type, const std::string& event_data)> callback,
-                                   int connection_timeout_ms, int read_timeout_ms) const {
+                                   time_t connection_timeout_ms, time_t read_timeout_ms) const {
     std::string normalized_host = normalize_host(host_);
     httplib::Client cli = make_client(normalized_host, port_, api_key_, connection_timeout_ms, read_timeout_ms);
 
@@ -293,30 +354,95 @@ std::vector<ModelInfo> LemonadeClient::get_models(bool show_all) const {
     return models;
 }
 
-int LemonadeClient::list_models(bool show_all) const {
+int LemonadeClient::list_models(bool show_all, const std::string& name_filter) const {
     try {
         std::vector<ModelInfo> models = get_models(show_all);
 
+        if (!name_filter.empty()) {
+            const std::regex filter_regex = build_name_filter_regex(name_filter);
+            models.erase(
+                std::remove_if(models.begin(), models.end(),
+                    [&](const ModelInfo& m) {
+                        return !std::regex_search(m.id, filter_regex) &&
+                               !std::regex_search(strip_canonical_prefix(m.id), filter_regex);
+                    }),
+                models.end());
+        }
+
+        std::sort(models.begin(), models.end(),
+            [](const ModelInfo& a, const ModelInfo& b) {
+                const std::string bare_a = strip_canonical_prefix(a.id);
+                const std::string bare_b = strip_canonical_prefix(b.id);
+                const int bare_compare = bare_a.compare(bare_b);
+                if (bare_compare != 0) return bare_compare < 0;
+
+                const int source_compare = model_source_sort_rank(a.id) - model_source_sort_rank(b.id);
+                if (source_compare != 0) return source_compare < 0;
+
+                return a.id < b.id;
+            });
+
         if (models.empty()) {
-            std::cout << "No models available" << std::endl;
+            std::cout << (show_all ? "No models available" : "No local models downloaded.") << std::endl;
             return 0;
         }
 
-        std::cout << std::left << std::setw(40) << "Model Name"
-                  << std::setw(12) << "Downloaded"
-                  << "Details" << std::endl;
-        std::cout << std::string(100, '-') << std::endl;
+        // Helper lambda to print a formatted table of models.
+        auto print_model_table = [](const std::vector<ModelInfo>& models) {
+            std::cout << std::left << std::setw(40) << "Model Name"
+                      << std::setw(12) << "Downloaded"
+                      << "Details" << std::endl;
+            std::cout << std::string(100, '-') << std::endl;
 
-        for (const auto& model : models) {
-            std::string downloaded = model.downloaded ? "Yes" : "No";
-            std::string details = model.recipe.empty() ? "-" : model.recipe;
+            // Model Name is the API id emitted verbatim by `/v1/models`. For each
+            // bare name, the precedence-winning source (registered > imported >
+            // builtin) shows as the bare name; any shadowed sources show as their
+            // canonical id (user.NAME / extra.NAME / builtin.NAME). Either form is
+            // valid input to `lemonade load`, `lemonade delete`, etc., so the
+            // column is always copy-paste-safe.
+            for (const auto& model : models) {
+                std::string downloaded = model.downloaded ? "Yes" : "No";
+                std::string details = model.recipe.empty() ? "-" : model.recipe;
 
-            std::cout << std::left << std::setw(40) << model.id
-                      << std::setw(12) << downloaded
-                      << details << std::endl;
+                std::cout << std::left << std::setw(40) << model.id
+                          << std::setw(12) << downloaded
+                          << details << std::endl;
+            }
+
+            std::cout << std::string(100, '-') << std::endl;
+        };
+
+        if (!show_all) {
+            print_model_table(models);
+            return 0;
         }
 
-        std::cout << std::string(100, '-') << std::endl;
+        std::vector<ModelInfo> local_models;
+        std::vector<ModelInfo> available_models;
+        for (const auto& model : models) {
+            if (model.downloaded) {
+                local_models.push_back(model);
+            } else {
+                available_models.push_back(model);
+            }
+        }
+
+        std::cout << "Local" << std::endl;
+        if (local_models.empty()) {
+            std::cout << "No local models downloaded." << std::endl;
+        } else {
+            print_model_table(local_models);
+        }
+
+        std::cout << std::endl;
+
+        std::cout << "Available for Download" << std::endl;
+        if (available_models.empty()) {
+            std::cout << "No models available for download." << std::endl;
+        } else {
+            print_model_table(available_models);
+        }
+
         return 0;
 
     } catch (const HttpError& e) {
@@ -440,7 +566,7 @@ static bool parse_sse_progress(const std::string& event_data, StreamingRequestSt
     }
 }
 
-int LemonadeClient::pull_model(const json& model_data) {
+int LemonadeClient::pull_model(const json& model_data, const std::string& display_name, bool upgrade) {
     try {
         // Validate that model field exists in model_data
         if (!model_data.contains("model_name") || !model_data["model_name"].is_string()) {
@@ -449,10 +575,19 @@ int LemonadeClient::pull_model(const json& model_data) {
         }
 
         std::string model_name = model_data["model_name"].get<std::string>();
-        std::cout << "Pulling model: " << model_name << std::endl;
+        std::string output_name = display_name.empty() ? model_name : display_name;
+        std::cout << "Pulling model: " << output_name << std::endl;
 
         json request_body = model_data;
         request_body["stream"] = true;
+
+        // Cache-first by default: an already-downloaded model is reused instead
+        // of triggering a Hugging Face update check (and a possible full
+        // re-download). Only the explicit `lemonade pull` update flow opts into
+        // an upgrade. An explicit field already in model_data wins.
+        if (!request_body.contains("do_not_upgrade")) {
+            request_body["do_not_upgrade"] = !upgrade;
+        }
 
         std::string body = request_body.dump();
 
@@ -466,8 +601,11 @@ int LemonadeClient::pull_model(const json& model_data) {
             } else if (event_type == "error") {
                 try {
                     auto error_json = json::parse(event_data);
-                    if (error_json.contains("error")) {
+                    if (error_json.contains("error") && error_json["error"].is_string()) {
                         state.error_message = error_json["error"].get<std::string>();
+                    }
+                    if (error_json.contains("code") && error_json["code"].is_string()) {
+                        state.error_code = error_json["code"].get<std::string>();
                     }
                 } catch (...) {
                     state.error_message = event_data;
@@ -475,9 +613,18 @@ int LemonadeClient::pull_model(const json& model_data) {
             } else {
                 parse_sse_progress(event_data, state);
             }
-        }, 86400000, 30000);
+        }, LONG_TIMEOUT_MS, DEFAULT_READ_TIMEOUT_MS);
 
         if (!state.success) {
+            // Wire-protocol constant; server-side definition and contract live in
+            // include/lemon/model_manager.h (kUnknownModelErrorCode). Keep in sync.
+            if (state.error_code == "unknown_model") {
+                state.error_message =
+                    "No built-in model with the name '" + model_name + "' is registered.\n\n"
+                    "If you meant a built-in model, run `lemonade list` to see available models.\n"
+                    "If you meant to add a custom model from Hugging Face, run `lemonade pull CHECKPOINT`.";
+            }
+
             if (!state.error_message.empty()) {
                 throw std::runtime_error(state.error_message);
             }
@@ -485,7 +632,7 @@ int LemonadeClient::pull_model(const json& model_data) {
             throw std::runtime_error("Model pull failed");
         }
 
-        std::cout << "Model pulled successfully: " << model_name << std::endl;
+        std::cout << "Model pulled successfully: " << output_name << std::endl;
         return 0;
     } catch (const HttpError& e) {
         std::cerr << "Error pulling model: " << extract_server_error_message(e) << std::endl;
@@ -580,7 +727,8 @@ int LemonadeClient::load_model(const std::string& model_name, const nlohmann::js
         request_body["model_name"] = model_name;
         request_body["save_options"] = save_options;
 
-        make_request("/api/v1/load", "POST", request_body.dump(), "application/json");
+        // since load can trigger a pull but doesn't send the related streaming events, we want long read timeouts.
+        make_request("/api/v1/load", "POST", request_body.dump(), "application/json", LONG_TIMEOUT_MS, LONG_TIMEOUT_MS);
 
         std::cout << "Model loaded successfully!" << std::endl;
         return 0;
@@ -762,7 +910,7 @@ int LemonadeClient::install_backend(const std::string& recipe, const std::string
             } else {
                 parse_sse_progress(event_data, state);
             }
-        }, 86400000, 30000);
+        }, LONG_TIMEOUT_MS, DEFAULT_READ_TIMEOUT_MS);
         if (!state.success) {
             if (!state.error_message.empty()) {
                 throw std::runtime_error(state.error_message);

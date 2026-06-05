@@ -1,17 +1,38 @@
 #pragma once
 
+#include <stdexcept>
 #include <string>
 #include <map>
+#include <optional>
+#include <set>
 #include <vector>
 #include <mutex>
 #include <functional>
 #include <nlohmann/json.hpp>
+#include "canonical_id.h"
 #include "model_types.h"
 #include "recipe_options.h"
 
 namespace lemon {
 
 using json = nlohmann::json;
+
+// Thrown by ModelManager::download_model when a pull request names a model
+// that (a) is not registered, (b) is not in the filtered-out registry, and
+// (c) lacks the `user.` prefix that would make it a new-model registration
+// attempt.
+//
+// CONTRACT: the /pull HTTP handler catches this type and attaches
+// {"code": kUnknownModelErrorCode, ...} to the error response. The lemonade
+// CLI keys off that code to replace the message with a friendlier one that
+// points at `lemonade list` and `lemonade pull CHECKPOINT`. The CLI inlines
+// the "unknown_model" literal to avoid pulling this server header into the
+// CLI; update cli/lemonade_client.cpp in lockstep if this constant changes.
+class UnknownModelError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+constexpr const char* kUnknownModelErrorCode = "unknown_model";
 
 // Progress information for download operations
 struct DownloadProgress {
@@ -49,11 +70,17 @@ struct ModelInfo {
     std::map<std::string, std::string> resolved_paths; // Absolute path to model file/directory on disk
     std::string recipe;
     std::vector<std::string> labels;
-    std::vector<std::string> composite_models;
+    std::vector<std::string> components;
     bool suggested = false;
     std::string source;  // "local_upload" for locally uploaded models
     bool downloaded = false;     // Whether model is downloaded and available
+    // When true, LlamaCppServer launches llama-server with `-hf <checkpoint>`
+    // instead of `-m <gguf> [--mmproj <mmproj>]`. Required for models like
+    // Qwen2.5-Omni where llama-server's manual-load path rejects audio content
+    // parts — the -hf path drives the dual-clip (vision+audio) context correctly.
+    bool hf_load = false;
     double size = 0.0;   // Model size in GB
+    int64_t max_context_window = 0;  // Static model-supported text context, when known
     RecipeOptions recipe_options;
 
     // Multi-model support fields
@@ -72,7 +99,7 @@ struct ModelInfo {
 
 class ModelManager {
 public:
-    ModelManager();
+    explicit ModelManager(const std::string& extra_models_dir = "");
 
     // Invalidate the models cache (e.g. after backend install/uninstall)
     void invalidate_models_cache();
@@ -112,8 +139,20 @@ public:
     // Get model info by name
     ModelInfo get_model_info(const std::string& model_name);
 
+    // Resolve a public model reference to its canonical internal name.
+    std::string resolve_model_name(const std::string& model_name);
+
+    // Get the public name exposed by Lemonade APIs for a canonical model name.
+    std::string get_public_model_name(const std::string& model_name);
+
     // Check if model exists (in filtered list based on system capabilities)
     bool model_exists(const std::string& model_name);
+
+    // Validate a collection (recipe="collection.omni") registration request.
+    // Returns nullopt on success, or a user-facing error message on failure.
+    // Used by /pull request validation and as a defensive guard in download_model.
+    std::optional<std::string> validate_collection_request(
+        const std::string& model_name, const nlohmann::json& model_data);
 
     // Check if model exists in the raw registry (before filtering)
     // Returns true even for NPU models on systems without NPU
@@ -145,6 +184,15 @@ public:
     void save_model_options(const ModelInfo& info);
 
 private:
+    // Cycle-detecting overload used by the collection fan-out in download_model.
+    // `visited` accumulates collection names already entered on the current
+    // call chain; re-entering one throws.
+    void download_model(const std::string& model_name,
+                       const json& model_data,
+                       bool do_not_upgrade,
+                       DownloadProgressCallback progress_callback,
+                       std::set<std::string>& visited);
+
     json load_server_models();
     json load_optional_json(const std::string& path);
     void save_user_models(const json& user_models);
@@ -186,8 +234,17 @@ private:
     // Cache of all models with their download status
     mutable std::mutex models_cache_mutex_;
     mutable std::map<std::string, ModelInfo> models_cache_;
+    mutable std::map<std::string, std::string> public_model_aliases_;  // public name -> canonical name
+    mutable std::map<std::string, std::string> canonical_public_names_;  // canonical name -> public name
     mutable std::map<std::string, std::string> filtered_out_models_;  // model_name -> filter reason
     mutable bool cache_valid_ = false;
+
+    // Refresh user_models.json on-demand when a user.* lookup misses the cache.
+    // This keeps startup cache warmup / external registry writes from causing
+    // stale hard "Model not found" failures for registered user models.
+    bool refresh_user_models_from_disk_for_lookup(const std::string& model_name);
+
+    void rebuild_public_model_aliases_locked();
 };
 
 } // namespace lemon

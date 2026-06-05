@@ -6,12 +6,13 @@ with Lemonade's inference backends.
 
 Usage:
     python test_ollama.py
-    python test_ollama.py --server-binary /path/to/lemonade-server
+    python test_ollama.py --cli-binary /path/to/lemonade
 """
 
 import base64
 import json
 import sys
+import uuid
 import requests
 
 try:
@@ -32,6 +33,7 @@ from utils.test_models import (
     SAMPLE_TOOL,
     TIMEOUT_MODEL_OPERATION,
     TIMEOUT_DEFAULT,
+    USER_MODEL_MAIN_CHECKPOINT,
 )
 
 OLLAMA_BASE_URL = f"http://localhost:{PORT}"
@@ -40,6 +42,9 @@ OLLAMA_BASE_URL = f"http://localhost:{PORT}"
 class OllamaTests(ServerTestBase):
     """Tests for Ollama-compatible API endpoints."""
 
+    # Pin sd-cpp to CPU for this no-GPU API compatibility suite.
+    additional_server_args = ["--sdcpp", "cpu"]
+    
     _model_pulled = False
 
     @classmethod
@@ -121,6 +126,11 @@ class OllamaTests(ServerTestBase):
         self.assertIn("details", data)
         self.assertIn("modelfile", data)
         self.assertIn("model_info", data)
+        self.assertIn("capabilities", data)
+        self.assertIn("completion", data["capabilities"])
+        self.assertIn("num_ctx", data["parameters"])
+        self.assertIn("llamacpp.context_length", data["model_info"])
+        self.assertGreater(data["model_info"]["llamacpp.context_length"], 0)
 
     def test_005_show_not_found(self):
         """Test /api/show returns 404 for non-existent model."""
@@ -179,7 +189,7 @@ class OllamaTests(ServerTestBase):
             f"Model name should end with ':latest', got: {model['name']}",
         )
 
-    def test_007_pull_streaming_progress(self):
+    def test_008_pull_streaming_progress(self):
         """Test /api/pull streams NDJSON progress with digest field."""
         self.ensure_model_pulled()
         response = requests.post(
@@ -308,6 +318,52 @@ class OllamaTests(ServerTestBase):
         self.assertGreater(len(chunks), 0)
         last_chunk = chunks[-1]
         self.assertTrue(last_chunk.get("done", False))
+
+    def test_010_chat_streaming_with_tools_returns_complete_tool_call(self):
+        """Test /api/chat streaming with tools returns complete Ollama tool calls."""
+        response = requests.post(
+            f"{self.base_url}/pull",
+            json={"model_name": TOOL_CALLING_MODEL, "stream": False},
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json={
+                "model": TOOL_CALLING_MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Run the calculator_calculate tool with expression set to 1+1",
+                    }
+                ],
+                "tools": [SAMPLE_TOOL],
+                "stream": True,
+                "options": {"num_predict": 64},
+            },
+            timeout=TIMEOUT_MODEL_OPERATION,
+            stream=True,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        chunks = [
+            json.loads(line.decode("utf-8")) for line in response.iter_lines() if line
+        ]
+        self.assertGreater(len(chunks), 0)
+
+        tool_chunks = [
+            chunk for chunk in chunks if chunk.get("message", {}).get("tool_calls")
+        ]
+        self.assertGreater(len(tool_chunks), 0, "Expected a tool call chunk")
+
+        tool_call = tool_chunks[0]["message"]["tool_calls"][0]
+        self.assertIn("id", tool_call)
+        self.assertEqual(tool_call["function"]["name"], SAMPLE_TOOL["function"]["name"])
+        self.assertIsInstance(tool_call["function"]["arguments"], dict)
+        self.assertIn("expression", tool_call["function"]["arguments"])
+        self.assertTrue(chunks[-1].get("done", False))
+        self.assertEqual(chunks[-1].get("done_reason"), "tool_calls")
 
     def test_011_chat_missing_model(self):
         """Test /api/chat returns 400 when model is missing."""

@@ -22,7 +22,10 @@ struct CPUInfo : DeviceInfo {
 };
 
 struct GPUInfo : DeviceInfo {
+    int index = -1;  // NVIDIA only: physical device index from nvidia-smi, when available
+    std::string uuid;  // NVIDIA only: stable GPU UUID from nvidia-smi (preferred for CUDA_VISIBLE_DEVICES)
     std::string driver_version;
+    std::string compute_capability;  // NVIDIA only: "MAJOR.MINOR" from nvidia-smi (e.g. "8.6")
     double vram_gb = 0.0;
     double virtual_gb = 0.0;
 };
@@ -60,7 +63,7 @@ public:
     virtual CPUInfo get_cpu_device() = 0;
     virtual GPUInfo get_amd_igpu_device() = 0;
     virtual std::vector<GPUInfo> get_amd_dgpu_devices() = 0;
-    virtual std::vector<GPUInfo> get_nvidia_dgpu_devices() = 0;
+    virtual std::vector<GPUInfo> get_nvidia_gpu_devices() = 0;
     virtual NPUInfo get_npu_device() = 0;
 
     // Common methods (can be overridden for detailed platform info)
@@ -102,6 +105,14 @@ public:
 
     // Device support detection
     static std::string get_rocm_arch();
+    static std::string get_cuda_arch();
+
+    // CUDA release assets are architecture-specific (sm_89, sm_120, etc.).
+    // Return the physical CUDA device indices whose compute capability matches
+    // the selected release architecture, so callers can hide incompatible GPUs
+    // with CUDA_VISIBLE_DEVICES while still using all GPUs of the same arch.
+    static std::vector<int> get_cuda_device_indices_for_arch(const std::string& arch);
+    static std::string get_cuda_visible_devices_for_arch(const std::string& arch);
 
     // Detect if the device is an iGPU
     static bool get_has_igpu();
@@ -122,7 +133,7 @@ public:
     CPUInfo get_cpu_device() override;
     GPUInfo get_amd_igpu_device() override;
     std::vector<GPUInfo> get_amd_dgpu_devices() override;
-    std::vector<GPUInfo> get_nvidia_dgpu_devices() override;
+    std::vector<GPUInfo> get_nvidia_gpu_devices() override;
     NPUInfo get_npu_device() override;
 
     // Override to add Windows-specific fields
@@ -145,6 +156,13 @@ private:
     std::string get_driver_version(const std::string& device_name);
     double get_gpu_vram_dxdiag(const std::string& gpu_name);
     double get_gpu_vram_wmi(uint64_t adapter_ram);
+    double get_nvidia_vram_smi();
+
+    // dxdiag lists every GPU in one invocation, so we run it once and
+    // serve subsequent lookups from memory.
+    bool dxdiag_cache_loaded_ = false;
+    std::vector<std::pair<std::string, double>> dxdiag_vram_cache_;  // (card_name_lower, vram_gb)
+    void load_dxdiag_cache();
 };
 
 // Linux implementation
@@ -153,7 +171,7 @@ public:
     CPUInfo get_cpu_device() override;
     GPUInfo get_amd_igpu_device() override;
     std::vector<GPUInfo> get_amd_dgpu_devices() override;
-    std::vector<GPUInfo> get_nvidia_dgpu_devices() override;
+    std::vector<GPUInfo> get_nvidia_gpu_devices() override;
     NPUInfo get_npu_device() override;
 
     // Override to add Linux-specific fields
@@ -183,7 +201,7 @@ public:
     CPUInfo get_cpu_device() override;
     GPUInfo get_amd_igpu_device() override;
     std::vector<GPUInfo> get_amd_dgpu_devices() override;
-    std::vector<GPUInfo> get_nvidia_dgpu_devices() override;
+    std::vector<GPUInfo> get_nvidia_gpu_devices() override;
     NPUInfo get_npu_device() override;
 
     // Override to add macOS-specific fields
@@ -204,12 +222,16 @@ std::unique_ptr<SystemInfo> create_system_info();
 // Returns architecture string (e.g., "gfx1150", "gfx1151", "gfx110X", "gfx120X") or empty string if not recognized
 std::string identify_rocm_arch_from_name(const std::string& device_name);
 
+// Helper to identify CUDA Compute Capability from a marketing GPU name
+// Returns an sm_XX token (e.g., "sm_75", "sm_86", "sm_120") or empty string if not recognized
+std::string identify_cuda_arch_from_name(const std::string& device_name);
+
 // Check if kernel has CWSR fix for Strix Halo
 bool needs_gfx1151_cwsr_fix();
 
 // FLM status (derived from system-info cache)
 struct FlmStatus {
-    std::string state;     // "unsupported","installable","update_required","action_required","installed"
+    std::string state;     // "unsupported","installable","update_required","action_required","installed","update_available"
     std::string version;
     std::string message;
     std::string action;

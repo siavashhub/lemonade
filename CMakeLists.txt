@@ -5,7 +5,7 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-project(lemon_cpp VERSION 10.2.0)
+project(lemon_cpp VERSION 10.6.0)
 
 # Export compile_commands.json for clangd/IntelliSense
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -28,31 +28,37 @@ endif()
 include(GNUInstallDirs)
      # Install man pages
      install(FILES
-          ${CMAKE_SOURCE_DIR}/docs/man/man1/lemonade-server.1
           ${CMAKE_SOURCE_DIR}/docs/man/man1/lemond.1
           ${CMAKE_SOURCE_DIR}/docs/man/man1/lemonade.1
           DESTINATION ${CMAKE_INSTALL_MANDIR}/man1
      )
 # ============================================================
-# Electron source paths (used by both runtime and installers)
+# Tauri app source paths (used by both runtime and installers)
 # ============================================================
-get_filename_component(ELECTRON_APP_SOURCE_DIR "${CMAKE_SOURCE_DIR}/src/app" ABSOLUTE)
-set(ELECTRON_APP_BUILD_DIR "${CMAKE_BINARY_DIR}/app")
+get_filename_component(TAURI_APP_SOURCE_DIR "${CMAKE_SOURCE_DIR}/src/app" ABSOLUTE)
+set(TAURI_APP_CARGO_DIR "${TAURI_APP_SOURCE_DIR}/src-tauri")
+set(TAURI_APP_CARGO_TARGET "${TAURI_APP_CARGO_DIR}/target/release")
+# Staging directory that mirrors the Electron layout the installers expect.
+# A post-build copy step lands the Tauri output here so downstream logic
+# (WiX fragment generation, CPack component install, etc.) doesn't need to
+# know where Cargo puts its artifacts.
+set(TAURI_APP_BUILD_DIR "${CMAKE_BINARY_DIR}/app")
 if(WIN32)
-    set(ELECTRON_APP_UNPACKED_DIR "${ELECTRON_APP_BUILD_DIR}/win-unpacked")
-    set(ELECTRON_EXE_NAME "lemonade-app.exe")
+    set(TAURI_APP_UNPACKED_DIR "${TAURI_APP_BUILD_DIR}")
+    set(TAURI_EXE_NAME "lemonade-app.exe")
 elseif(APPLE)
-    set(ELECTRON_APP_UNPACKED_DIR "${ELECTRON_APP_BUILD_DIR}/mac-arm64")
-    set(ELECTRON_EXE_NAME "lemonade-app.app")
+    set(TAURI_APP_UNPACKED_DIR "${TAURI_APP_BUILD_DIR}")
+    set(TAURI_EXE_NAME "lemonade-app.app")
 else()
-    set(ELECTRON_APP_UNPACKED_DIR "${ELECTRON_APP_BUILD_DIR}/linux-unpacked")
-    set(ELECTRON_EXE_NAME "lemonade-app")
+    set(TAURI_APP_UNPACKED_DIR "${TAURI_APP_BUILD_DIR}")
+    set(TAURI_EXE_NAME "lemonade-app")
 endif()
 
 # ============================================================
 # Web App source paths
 # ============================================================
 get_filename_component(WEB_APP_SOURCE_DIR "${CMAKE_SOURCE_DIR}/src/web-app" ABSOLUTE)
+get_filename_component(APP_SOURCE_DIR "${CMAKE_SOURCE_DIR}/src/app" ABSOLUTE)
 set(WEB_APP_BUILD_DIR "${CMAKE_BINARY_DIR}/resources/web-app")
 
 # When ON, use system-provided Node.js modules (for example, webpack and distro-packaged JS deps)
@@ -80,11 +86,15 @@ find_package(nlohmann_json ${MIN_NLOHMANN_JSON_VERSION} QUIET)
 if(PkgConfig_FOUND)
     pkg_check_modules(CURL QUIET libcurl>=${MIN_CURL_VERSION})
     pkg_check_modules(ZSTD QUIET libzstd>=${MIN_ZSTD_VERSION})
-    pkg_check_modules(HTTPLIB QUIET cpp-httplib>=${MIN_HTTPLIB_VERSION})
+    # Debian ships the package as `cpp-httplib`, Nixpkgs as `httplib` — search
+    # both. No IMPORTED_TARGET: we build our own interface target below so we
+    # can skip the .pc Cflags (see there for why).
+    pkg_search_module(HTTPLIB QUIET
+        cpp-httplib>=${MIN_HTTPLIB_VERSION}
+        httplib>=${MIN_HTTPLIB_VERSION})
     pkg_check_modules(LWS QUIET libwebsockets>=${MIN_LWS_VERSION})
 endif()
 find_path(CLI11_INCLUDE_DIRS "CLI/CLI.hpp")
-find_path(HTTPLIB_INCLUDE_DIRS "httplib.h")
 # Verify CLI11 version if found
 if(CLI11_INCLUDE_DIRS)
     if(EXISTS "${CLI11_INCLUDE_DIRS}/CLI/Version.hpp")
@@ -311,6 +321,22 @@ if(NOT USE_SYSTEM_HTTPLIB)
             ${zstd_SOURCE_DIR}/lib/common
         )
     endif()
+else()
+    # System cpp-httplib: a local interface target carrying the include dirs
+    # and link lib (empty for a header-only install like Nixpkgs, the compiled
+    # .so on Debian). We deliberately skip HTTPLIB_CFLAGS_OTHER: the .pc Cflags
+    # carry cpp-httplib's feature macros (-DCPPHTTPLIB_OPENSSL_SUPPORT, etc.),
+    # which would flip on header features needing link deps (libcrypto) we
+    # don't provide. Created at top level, so it is visible to the cli/tray
+    # subdirs added later.
+    add_library(lemonade-httplib INTERFACE)
+    target_include_directories(lemonade-httplib INTERFACE ${HTTPLIB_INCLUDE_DIRS})
+    if(HTTPLIB_LINK_LIBRARIES)
+        target_link_libraries(lemonade-httplib INTERFACE ${HTTPLIB_LINK_LIBRARIES})
+    else()
+        target_link_libraries(lemonade-httplib INTERFACE ${HTTPLIB_LIBRARIES})
+        target_link_directories(lemonade-httplib INTERFACE ${HTTPLIB_LIBRARY_DIRS})
+    endif()
 endif()
 
 # === libwebsockets (for WebSocket support) ===
@@ -420,7 +446,7 @@ if(WIN32)
     )
 
     set(WIX_PRODUCT_WXS "${CMAKE_CURRENT_BINARY_DIR}/installer/Product.wxs")
-    set(WIX_FRAGMENT_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/installer/generate_electron_fragment.py")
+    set(WIX_FRAGMENT_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/installer/generate_tauri_fragment.py")
 
     # Find WiX Toolset 5.0+ (unified 'wix' command) and Python for fragment generation
     find_program(WIX_EXECUTABLE wix)
@@ -441,9 +467,9 @@ if(WIN32)
         file(TO_NATIVE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/lemonade.msi" WIX_FULL_OUTPUT_NATIVE)
         file(TO_NATIVE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp" WIX_CPP_SOURCE_DIR_NATIVE)
         file(TO_NATIVE_PATH "${CMAKE_BINARY_DIR}" WIX_BUILD_DIR_NATIVE)
-        file(TO_NATIVE_PATH "${ELECTRON_APP_UNPACKED_DIR}" WIX_ELECTRON_SOURCE_NATIVE)
-        set(WIX_ELECTRON_FRAGMENT "${CMAKE_CURRENT_BINARY_DIR}/installer/ElectronAppFragment.wxs")
-        file(TO_NATIVE_PATH "${WIX_ELECTRON_FRAGMENT}" WIX_ELECTRON_FRAGMENT_NATIVE)
+        file(TO_NATIVE_PATH "${TAURI_APP_UNPACKED_DIR}" WIX_TAURI_SOURCE_NATIVE)
+        set(WIX_TAURI_FRAGMENT "${CMAKE_CURRENT_BINARY_DIR}/installer/TauriAppFragment.wxs")
+        file(TO_NATIVE_PATH "${WIX_TAURI_FRAGMENT}" WIX_TAURI_FRAGMENT_NATIVE)
 
 
         # Web app fragment paths
@@ -472,7 +498,7 @@ if(WIN32)
                 -d SourceDir="${WIX_SOURCE_DIR_NATIVE}"
                 -d CppSourceDir="${WIX_CPP_SOURCE_DIR_NATIVE}"
                 -d BuildDir="${WIX_BUILD_DIR_NATIVE}"
-                -d IncludeElectron=0
+                -d IncludeTauriApp=0
                 -d IncludeWebApp=1
                 -d WebAppSourceDir="${WIX_WEBAPP_SOURCE_NATIVE}"
                 -out "${WIX_MINIMAL_OUTPUT_NATIVE}"
@@ -486,9 +512,9 @@ if(WIN32)
 
         set(WIX_INSTALLER_TARGETS wix_installer_minimal)
 
-        # Full installer (server + Electron app + web-app)
+        # Full installer (server + Tauri app + web-app)
         add_custom_target(wix_installer_full
-            COMMAND ${CMAKE_COMMAND} -E echo "Building WiX MSI installer (with Electron app)..."
+            COMMAND ${CMAKE_COMMAND} -E echo "Building WiX MSI installer (with Tauri app)..."
             # Generate web-app fragment
             COMMAND ${Python3_EXECUTABLE} ${WIX_FRAGMENT_SCRIPT}
                 --source "${WEB_APP_BUILD_DIR}"
@@ -496,31 +522,31 @@ if(WIN32)
                 --component-group "WebAppComponents"
                 --root-id "WebAppDir"
                 --path-variable "WebAppSourceDir"
-            # Generate Electron app fragment
+            # Generate Tauri app fragment
             COMMAND ${Python3_EXECUTABLE} ${WIX_FRAGMENT_SCRIPT}
-                --source "${ELECTRON_APP_UNPACKED_DIR}"
-                --output "${WIX_ELECTRON_FRAGMENT}"
-                --component-group "ElectronAppComponents"
-                --root-id "ElectronAppDir"
-                --path-variable "ElectronSourceDir"
+                --source "${TAURI_APP_UNPACKED_DIR}"
+                --output "${WIX_TAURI_FRAGMENT}"
+                --component-group "TauriAppComponents"
+                --root-id "TauriAppDir"
+                --path-variable "TauriSourceDir"
             COMMAND ${WIX_EXECUTABLE} build
                 -arch x64
                 -ext WixToolset.UI.wixext
                 -d SourceDir="${WIX_SOURCE_DIR_NATIVE}"
                 -d CppSourceDir="${WIX_CPP_SOURCE_DIR_NATIVE}"
                 -d BuildDir="${WIX_BUILD_DIR_NATIVE}"
-                -d IncludeElectron=1
+                -d IncludeTauriApp=1
                 -d IncludeWebApp=1
-                -d ElectronSourceDir="${WIX_ELECTRON_SOURCE_NATIVE}"
+                -d TauriSourceDir="${WIX_TAURI_SOURCE_NATIVE}"
                 -d WebAppSourceDir="${WIX_WEBAPP_SOURCE_NATIVE}"
                 -out "${WIX_FULL_OUTPUT_NATIVE}"
                 "${WIX_PRODUCT_WXS_NATIVE}"
-                "${WIX_ELECTRON_FRAGMENT_NATIVE}"
+                "${WIX_TAURI_FRAGMENT_NATIVE}"
                 "${WIX_WEBAPP_FRAGMENT_NATIVE}"
             COMMAND ${CMAKE_COMMAND} -E echo "MSI installer created: lemonade.msi"
             DEPENDS ${EXECUTABLE_NAME}
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-            COMMENT "Building WiX MSI installer (with Electron app)"
+            COMMENT "Building WiX MSI installer (with Tauri app)"
         )
 
         list(APPEND WIX_INSTALLER_TARGETS wix_installer_full)
@@ -550,6 +576,7 @@ include_directories(
 # ============================================================
 set(SOURCES_CORE
     src/cpp/server/server.cpp
+    src/cpp/server/collection_orchestrator.cpp
     src/cpp/server/router.cpp
     src/cpp/server/cli_parser.cpp
     src/cpp/server/config_file.cpp
@@ -575,6 +602,7 @@ set(SOURCES_CORE
     src/cpp/server/backends/whisper_server.cpp
     src/cpp/server/backends/kokoro_server.cpp
     src/cpp/server/backends/sd_server.cpp
+    src/cpp/server/backends/vllm_server.cpp
     src/cpp/server/backends/backend_utils.cpp
     src/cpp/server/backend_manager.cpp
     src/cpp/server/ollama_api.cpp
@@ -633,7 +661,7 @@ endif()
 target_link_libraries(lemonade-server-core PUBLIC nlohmann_json::nlohmann_json)
 
 if(USE_SYSTEM_HTTPLIB)
-    target_link_libraries(lemonade-server-core PUBLIC cpp-httplib)
+    target_link_libraries(lemonade-server-core PUBLIC lemonade-httplib)
 else()
     target_link_libraries(lemonade-server-core PUBLIC httplib::httplib)
 endif()
@@ -657,10 +685,6 @@ if(USE_SYSTEM_ZSTD)
     target_include_directories(lemonade-server-core PUBLIC ${ZSTD_INCLUDE_DIRS})
     target_link_directories(lemonade-server-core PUBLIC ${ZSTD_LIBRARY_DIRS})
     target_compile_options(lemonade-server-core PUBLIC ${ZSTD_CFLAGS_OTHER})
-endif()
-
-if(USE_SYSTEM_HTTPLIB AND HTTPLIB_INCLUDE_DIRS)
-    target_include_directories(lemonade-server-core PUBLIC ${HTTPLIB_INCLUDE_DIRS})
 endif()
 
 # libwebsockets for the realtime and log-stream WebSocket server
@@ -701,7 +725,7 @@ elseif(UNIX)
     if(PkgConfig_FOUND)
         pkg_check_modules(SYSTEMD QUIET libsystemd)
         if(SYSTEMD_FOUND)
-            set(LEMONADE_SYSTEMD_UNIT_NAME "lemonade-server.service" CACHE STRING
+            set(LEMONADE_SYSTEMD_UNIT_NAME "lemond.service" CACHE STRING
                 "Systemd unit name to match for journald log mode (overridable at runtime via LEMONADE_SYSTEMD_UNIT env var)")
             target_include_directories(lemonade-server-core PUBLIC ${SYSTEMD_INCLUDE_DIRS})
             target_link_libraries(lemonade-server-core PUBLIC ${SYSTEMD_LIBRARIES})
@@ -713,6 +737,8 @@ elseif(UNIX)
 
     # Link libcap for capability management on Linux
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_libraries(lemonade-server-core PRIVATE ${CMAKE_DL_LIBS})
+
         if(PkgConfig_FOUND)
             pkg_check_modules(LIBCAP QUIET libcap)
             if(LIBCAP_FOUND)
@@ -739,12 +765,19 @@ target_link_libraries(${EXECUTABLE_NAME} PRIVATE lemonade-server-core)
 #   - server_models.json (model registry)
 #   - backend_versions.json (backend version configuration)
 #   - defaults.json (default config values)
+#   - bench_scenarios.json (benchmark scenarios)
 
 # Collect resource files for dependency tracking
 file(GLOB_RECURSE RESOURCE_FILES
     CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/resources/*"
 )
+
+# The Omni tool definitions are authored in the frontend tree and are the single
+# source of truth (the desktop app imports them directly). Stage a copy into the
+# resources tree so the C++ server reads the same file via get_resource_path.
+set(TOOL_DEFINITIONS_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/app/src/renderer/utils/toolDefinitions.json")
 
 # Create a custom target that depends on resource files
 # This ensures resources are copied when source files change
@@ -753,8 +786,11 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/resources
         ${CMAKE_BINARY_DIR}/resources
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${TOOL_DEFINITIONS_SRC}
+        ${CMAKE_BINARY_DIR}/resources/toolDefinitions.json
     COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/resources.stamp
-    DEPENDS ${RESOURCE_FILES}
+    DEPENDS ${RESOURCE_FILES} ${TOOL_DEFINITIONS_SRC}
     COMMENT "Copying resources to build directory"
 )
 
@@ -774,10 +810,10 @@ add_custom_command(TARGET ${EXECUTABLE_NAME} POST_BUILD
 add_dependencies(${EXECUTABLE_NAME} copy_resources)
 
 # ============================================================
-# Electron App Integration (Cross-Platform)
+# Tauri App Integration (Cross-Platform)
 # ============================================================
 
-# Find Node.js and npm for building the Electron app
+# Find Node.js and npm for the renderer bundle, and Cargo for the Rust host.
 find_program(NODE_EXECUTABLE node)
 # On Windows, npm is a batch file (npm.cmd), so we need to find it explicitly
 # or invoke it through cmd.exe to avoid MSBuild custom build step issues
@@ -787,81 +823,135 @@ else()
     find_program(NPM_EXECUTABLE npm)
 endif()
 
-# Custom target to build the Electron app (must be called manually)
-if(NODE_EXECUTABLE AND NPM_EXECUTABLE)
+find_program(CARGO_EXECUTABLE cargo HINTS "$ENV{HOME}/.cargo/bin" "$ENV{USERPROFILE}/.cargo/bin")
+find_program(RUSTC_EXECUTABLE rustc HINTS "$ENV{HOME}/.cargo/bin" "$ENV{USERPROFILE}/.cargo/bin")
+
+# Custom target to build the Tauri app (must be called manually)
+if(NODE_EXECUTABLE AND NPM_EXECUTABLE AND CARGO_EXECUTABLE)
     if(WIN32)
-        set(ELECTRON_BUILD_TARGET "build:win")
         # On Windows, wrap npm calls with cmd /c to handle batch file execution properly
         set(NPM_COMMAND cmd /c "${NPM_EXECUTABLE}")
-    elseif(APPLE)
-        set(ELECTRON_BUILD_TARGET "build:mac")
-        set(NPM_COMMAND "${NPM_EXECUTABLE}")
     else()
-        set(ELECTRON_BUILD_TARGET "build:linux")
         set(NPM_COMMAND "${NPM_EXECUTABLE}")
     endif()
 
-    set(ELECTRON_BUILD_SOURCE_DIR "${CMAKE_BINARY_DIR}/app-src")
-    set(ELECTRON_APP_OUTPUT "${ELECTRON_APP_UNPACKED_DIR}/${ELECTRON_EXE_NAME}")
+    set(TAURI_APP_OUTPUT "${TAURI_APP_UNPACKED_DIR}/${TAURI_EXE_NAME}")
 
-    file(GLOB_RECURSE ELECTRON_APP_SOURCES
+    file(GLOB_RECURSE TAURI_APP_SOURCES
         CONFIGURE_DEPENDS
-        "${ELECTRON_APP_SOURCE_DIR}/src/*"
-        "${ELECTRON_APP_SOURCE_DIR}/assets/*"
-        "${ELECTRON_APP_SOURCE_DIR}/*.json"
-        "${ELECTRON_APP_SOURCE_DIR}/*.js"
-        "${ELECTRON_APP_SOURCE_DIR}/*.ts"
-        "${ELECTRON_APP_SOURCE_DIR}/*.tsx"
-        "${ELECTRON_APP_SOURCE_DIR}/*.css"
-        "${ELECTRON_APP_SOURCE_DIR}/*.html"
+        "${TAURI_APP_SOURCE_DIR}/src/*"
+        "${TAURI_APP_SOURCE_DIR}/src-tauri/src/*"
+        "${TAURI_APP_SOURCE_DIR}/src-tauri/Cargo.toml"
+        "${TAURI_APP_SOURCE_DIR}/src-tauri/tauri.conf.json"
+        "${TAURI_APP_SOURCE_DIR}/src-tauri/capabilities/*.json"
+        "${TAURI_APP_SOURCE_DIR}/assets/*"
+        "${TAURI_APP_SOURCE_DIR}/*.json"
+        "${TAURI_APP_SOURCE_DIR}/*.js"
+        "${TAURI_APP_SOURCE_DIR}/*.ts"
+        "${TAURI_APP_SOURCE_DIR}/*.tsx"
+        "${TAURI_APP_SOURCE_DIR}/*.css"
+        "${TAURI_APP_SOURCE_DIR}/*.html"
     )
-    list(FILTER ELECTRON_APP_SOURCES EXCLUDE REGEX "[/\\\\](node_modules|dist|dist-app)[/\\\\]")
+    list(FILTER TAURI_APP_SOURCES EXCLUDE REGEX "[/\\\\](node_modules|dist|target)[/\\\\]")
+
+    # On macOS we need the .app bundle for productbuild; on Linux/Windows we
+    # just need the bare executable and can skip Tauri's own bundlers.
+    # Each platform has a dedicated `npm run build:*` script in src/app/package.json
+    # so we can use the same `npm run <script>` invocation pattern as the
+    # previous electron-app target (which MSBuild custom-commands handle cleanly —
+    # `npm exec --` with cmd /c chaining breaks MSBuild's VCEnd label).
+    if(APPLE)
+        set(TAURI_BUILD_SCRIPT "build:mac")
+        set(TAURI_BUILD_OUTPUT_SOURCE "${TAURI_APP_CARGO_TARGET}/bundle/macos/lemonade-app.app")
+        set(TAURI_COPY_COMMAND ${CMAKE_COMMAND} -E copy_directory "${TAURI_BUILD_OUTPUT_SOURCE}" "${TAURI_APP_UNPACKED_DIR}/lemonade-app.app")
+    else()
+        set(TAURI_BUILD_SCRIPT "build:nobundle")
+        if(WIN32)
+            set(TAURI_BUILD_OUTPUT_SOURCE "${TAURI_APP_CARGO_TARGET}/lemonade-app.exe")
+        else()
+            set(TAURI_BUILD_OUTPUT_SOURCE "${TAURI_APP_CARGO_TARGET}/lemonade-app")
+        endif()
+        set(TAURI_COPY_COMMAND ${CMAKE_COMMAND} -E copy "${TAURI_BUILD_OUTPUT_SOURCE}" "${TAURI_APP_OUTPUT}")
+    endif()
+
+    # `tauri build` shells out to `cargo` (e.g. `cargo metadata` at startup),
+    # so cargo MUST be on PATH for the npm subprocess. CI sets this on every
+    # platform via dtolnay/rust-toolchain@stable. For local developers we
+    # also inject CARGO_EXECUTABLE's directory into PATH for the build
+    # subprocess, so a developer who has Rust installed but hasn't sourced
+    # rustup's env in their current shell still gets a working build.
+    #
+    # IMPORTANT: this PATH injection is gated on NOT WIN32. On Windows,
+    # MSBuild's custom-build cmd-file generator can't handle the nested
+    # `cmake -E env ... cmake -E chdir ... cmd /c npm.cmd run ...` shape —
+    # it produces a `The system cannot find the batch label specified -
+    # VCEnd` error (the same MSBuild quirk that commit 2b515ceb already had
+    # to dance around). Windows builds rely on cargo being on the parent
+    # shell's PATH, which CI satisfies and local Windows developers get
+    # automatically because rustup-init.exe updates the user PATH.
+    get_filename_component(TAURI_CARGO_BIN_DIR "${CARGO_EXECUTABLE}" DIRECTORY)
+    if(WIN32)
+        set(TAURI_BUILD_COMMAND
+            ${CMAKE_COMMAND} -E chdir "${TAURI_APP_SOURCE_DIR}" ${NPM_COMMAND} run ${TAURI_BUILD_SCRIPT})
+    else()
+        set(TAURI_BUILD_COMMAND
+            ${CMAKE_COMMAND} -E env "PATH=${TAURI_CARGO_BIN_DIR}:$ENV{PATH}"
+            ${CMAKE_COMMAND} -E chdir "${TAURI_APP_SOURCE_DIR}" ${NPM_COMMAND} run ${TAURI_BUILD_SCRIPT})
+    endif()
 
     # Note: On Windows, NPM_COMMAND uses 'cmd /c' wrapper to handle npm.cmd batch file
     # Note: Avoid shell-special characters in echo messages (no parentheses, etc.)
     add_custom_command(
-        OUTPUT "${ELECTRON_APP_OUTPUT}"
-        COMMAND ${CMAKE_COMMAND} -E echo "Copying Electron app source to build directory..."
-        COMMAND ${CMAKE_COMMAND} -E remove_directory "${ELECTRON_BUILD_SOURCE_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${ELECTRON_BUILD_SOURCE_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory "${ELECTRON_APP_SOURCE_DIR}" "${ELECTRON_BUILD_SOURCE_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E echo "Installing npm dependencies..."
-        COMMAND ${CMAKE_COMMAND} -E chdir "${ELECTRON_BUILD_SOURCE_DIR}" ${NPM_COMMAND} ci
-        COMMAND ${CMAKE_COMMAND} -E echo "Building Electron app for current platform..."
-        COMMAND ${CMAKE_COMMAND} -E chdir "${ELECTRON_BUILD_SOURCE_DIR}" ${NPM_COMMAND} run ${ELECTRON_BUILD_TARGET} -- --config.directories.output=${ELECTRON_APP_BUILD_DIR}
-        DEPENDS ${ELECTRON_APP_SOURCES}
-        COMMENT "Building Electron app with npm"
+        OUTPUT "${TAURI_APP_OUTPUT}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${TAURI_APP_UNPACKED_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E echo "============================================================"
+        COMMAND ${CMAKE_COMMAND} -E echo "Building Tauri desktop app (cargo + webpack)"
+        COMMAND ${CMAKE_COMMAND} -E echo "First build downloads ~80 Rust crates and compiles them with"
+        COMMAND ${CMAKE_COMMAND} -E echo "LTO; expect several minutes the first time. Incremental"
+        COMMAND ${CMAKE_COMMAND} -E echo "rebuilds are much faster. For UI iteration, prefer:"
+        COMMAND ${CMAKE_COMMAND} -E echo "    cd src/app && npm run dev"
+        COMMAND ${CMAKE_COMMAND} -E echo "============================================================"
+        COMMAND ${CMAKE_COMMAND} -E echo "Installing npm dependencies for Tauri app..."
+        COMMAND ${CMAKE_COMMAND} -E chdir "${TAURI_APP_SOURCE_DIR}" ${NPM_COMMAND} ci --ignore-scripts
+        COMMAND ${CMAKE_COMMAND} -E echo "Compiling Rust host and bundling renderer..."
+        COMMAND ${TAURI_BUILD_COMMAND}
+        COMMAND ${CMAKE_COMMAND} -E echo "Staging Tauri build output into ${TAURI_APP_UNPACKED_DIR}..."
+        COMMAND ${TAURI_COPY_COMMAND}
+        DEPENDS ${TAURI_APP_SOURCES}
+        COMMENT "Building Tauri app with cargo + webpack"
         WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
         VERBATIM
     )
 
-    add_custom_target(electron-app
-        DEPENDS "${ELECTRON_APP_OUTPUT}"
+    add_custom_target(tauri-app
+        DEPENDS "${TAURI_APP_OUTPUT}"
     )
 
     message(STATUS "Node.js found: ${NODE_EXECUTABLE}")
     message(STATUS "npm found: ${NPM_EXECUTABLE}")
+    message(STATUS "Cargo found: ${CARGO_EXECUTABLE}")
     if(WIN32)
-        message(STATUS "Electron app can be built with: cmake --build --preset windows --target electron-app")
+        message(STATUS "Tauri app can be built with: cmake --build --preset windows --target tauri-app")
     else()
-        message(STATUS "Electron app can be built with: cmake --build --preset default --target electron-app")
+        message(STATUS "Tauri app can be built with: cmake --build --preset default --target tauri-app")
     endif()
 else()
-    message(STATUS "Node.js or npm not found - Electron app build target disabled")
-    message(STATUS "Install Node.js to enable: https://nodejs.org/")
+    if(NOT CARGO_EXECUTABLE)
+        message(STATUS "Cargo not found - Tauri app build target disabled")
+        message(STATUS "Install Rust via https://rustup.rs to enable")
+    endif()
+    if(NOT NODE_EXECUTABLE OR NOT NPM_EXECUTABLE)
+        message(STATUS "Node.js or npm not found - Tauri app build target disabled")
+        message(STATUS "Install Node.js to enable: https://nodejs.org/")
+    endif()
 endif()
 
 # ============================================================
 # Web App Integration (Cross-Platform)
 # ============================================================
 
-# On Windows, disable automatic build by default (can be enabled with -DBUILD_WEB_APP=ON)
-# On other platforms, enable automatic build by default (can be disabled with -DBUILD_WEB_APP=OFF)
-if(WIN32)
-    option(BUILD_WEB_APP "Build the Web app automatically" OFF)
-else()
-    option(BUILD_WEB_APP "Build the Web app automatically" ON)
-endif()
+# Enable automatic web app build on all platforms (can be disabled with -DBUILD_WEB_APP=OFF)
+option(BUILD_WEB_APP "Build the Web app automatically" ON)
 
 # Check if webpack is available for system-package mode
 if(USE_SYSTEM_NODEJS_MODULES)
@@ -881,12 +971,16 @@ endif()
 if(CAN_BUILD_WEB_APP AND BUILD_WEB_APP)
     # Create a stamp file to track build state
     set(WEB_APP_STAMP "${CMAKE_CURRENT_BINARY_DIR}/web-app.stamp")
-    set(WEB_APP_BUILD_SOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/web-app-src")
+    set(WEB_APP_BUILD_STAGING_DIR "${CMAKE_CURRENT_BINARY_DIR}/web-app-staging")
 
-    # Get all source files in src/web-app (excluding node_modules and dist)
+    # Track sources from BOTH src/app (the shared renderer) and src/web-app
+    # (this build's package.json + webpack config) so the staged copies
+    # rebuild whenever either tree changes.
     file(GLOB_RECURSE WEB_APP_SOURCES
         CONFIGURE_DEPENDS
-        "${WEB_APP_SOURCE_DIR}/src/*"
+        "${APP_SOURCE_DIR}/src/*"
+        "${APP_SOURCE_DIR}/assets/*"
+        "${APP_SOURCE_DIR}/styles/*"
         "${WEB_APP_SOURCE_DIR}/*.json"
         "${WEB_APP_SOURCE_DIR}/*.js"
         "${WEB_APP_SOURCE_DIR}/*.ts"
@@ -898,8 +992,9 @@ if(CAN_BUILD_WEB_APP AND BUILD_WEB_APP)
     add_custom_command(
         OUTPUT ${WEB_APP_STAMP}
         COMMAND ${CMAKE_COMMAND}
+            -DAPP_SOURCE_DIR=${APP_SOURCE_DIR}
             -DWEB_APP_SOURCE_DIR=${WEB_APP_SOURCE_DIR}
-            -DWEB_APP_BUILD_SOURCE_DIR=${WEB_APP_BUILD_SOURCE_DIR}
+            -DWEB_APP_BUILD_STAGING_DIR=${WEB_APP_BUILD_STAGING_DIR}
             -DWEB_APP_BUILD_DIR=${WEB_APP_BUILD_DIR}
             -DNPM_EXECUTABLE=${NPM_EXECUTABLE}
             -DWEBPACK_EXECUTABLE=${WEBPACK_EXECUTABLE}
@@ -915,7 +1010,7 @@ if(CAN_BUILD_WEB_APP AND BUILD_WEB_APP)
 
     message(STATUS "Web app will be built automatically (disable with -DBUILD_WEB_APP=OFF)")
 
-    if (NOT WIN32 AND NOT APPLE AND NOT BUILD_ELECTRON_APP)
+    if (NOT WIN32 AND NOT APPLE AND NOT BUILD_TAURI_APP)
         # Install .desktop file for web app
         install(FILES ${CMAKE_SOURCE_DIR}/data/lemonade-web-app.desktop
             DESTINATION share/applications
@@ -931,7 +1026,7 @@ if(CAN_BUILD_WEB_APP AND BUILD_WEB_APP)
                 )
             ")
         endif()
-        install(FILES ${CMAKE_SOURCE_DIR}/src/web-app/assets/logo.svg
+        install(FILES ${CMAKE_SOURCE_DIR}/src/app/assets/logo.svg
             DESTINATION share/pixmaps
             RENAME lemonade-app.svg
         )
@@ -978,13 +1073,14 @@ endif()
 # Add manual web-app target for platforms where automatic build is disabled.
 # Reuse the shared build script so WiX/MSBuild gets output under ${WEB_APP_BUILD_DIR}.
 if(CAN_BUILD_WEB_APP AND NOT BUILD_WEB_APP)
-    set(WEB_APP_BUILD_SOURCE_DIR_MANUAL "${CMAKE_CURRENT_BINARY_DIR}/web-app-manual-src")
+    set(WEB_APP_BUILD_STAGING_DIR_MANUAL "${CMAKE_CURRENT_BINARY_DIR}/web-app-manual-staging")
     set(WEB_APP_MANUAL_STAMP "${CMAKE_CURRENT_BINARY_DIR}/web-app-manual.stamp")
 
     add_custom_target(web-app
         COMMAND ${CMAKE_COMMAND}
+            -DAPP_SOURCE_DIR=${APP_SOURCE_DIR}
             -DWEB_APP_SOURCE_DIR=${WEB_APP_SOURCE_DIR}
-            -DWEB_APP_BUILD_SOURCE_DIR=${WEB_APP_BUILD_SOURCE_DIR_MANUAL}
+            -DWEB_APP_BUILD_STAGING_DIR=${WEB_APP_BUILD_STAGING_DIR_MANUAL}
             -DWEB_APP_BUILD_DIR=${WEB_APP_BUILD_DIR}
             -DNPM_EXECUTABLE=${NPM_EXECUTABLE}
             -DWEBPACK_EXECUTABLE=${WEBPACK_EXECUTABLE}
@@ -1017,7 +1113,9 @@ if(APPLE)
         if(DEFINED ENV{DEVELOPER_ID_APPLICATION_IDENTITY})
             set(SIGNING_IDENTITY "$ENV{DEVELOPER_ID_APPLICATION_IDENTITY}")
         else()
-            set(SIGNING_IDENTITY "BBC1E1924FF481293CF0928B5DFFF8A6419D7DA0")
+            # Ad-hoc sign so local dev builds work without an Apple Developer cert.
+            # Distribution builds set DEVELOPER_ID_APPLICATION_IDENTITY explicitly.
+            set(SIGNING_IDENTITY "-")
         endif()
     endif()
 
@@ -1055,9 +1153,6 @@ add_subdirectory(src/cpp/tray)
 # Add CLI application subdirectory
 add_subdirectory(src/cpp/cli)
 
-# Add legacy shim (backwards-compatible lemonade-server)
-add_subdirectory(src/cpp/legacy-cli)
-
 # Wire WiX installer targets to the binaries and frontend artifacts they package.
 # Doing this after the subdirectories are added ensures MSBuild gets real project refs.
 if(WIN32 AND WIX_EXECUTABLE)
@@ -1068,9 +1163,6 @@ if(WIN32 AND WIX_EXECUTABLE)
     endif()
     if(TARGET lemonade)
         list(APPEND WIX_PACKAGED_TARGETS lemonade)
-    endif()
-    if(TARGET lemonade-server)
-        list(APPEND WIX_PACKAGED_TARGETS lemonade-server)
     endif()
     if(TARGET ${EXECUTABLE_NAME})
         list(APPEND WIX_PACKAGED_TARGETS ${EXECUTABLE_NAME})
@@ -1086,8 +1178,8 @@ if(WIN32 AND WIX_EXECUTABLE)
     endif()
 
     if(TARGET wix_installer_full)
-        if(TARGET electron-app)
-            add_dependencies(wix_installer_full electron-app)
+        if(TARGET tauri-app)
+            add_dependencies(wix_installer_full tauri-app)
         endif()
         if(TARGET web-app)
             add_dependencies(wix_installer_full web-app)
@@ -1110,22 +1202,21 @@ if(APPLE)
             COMMENT "Signing ${EXECUTABLE_NAME} with Hardened Runtime"
             VERBATIM
         )
-        # Note: 'lemonade-server' is signed at install time below (line ~1110)
     endif()
 
-    # Prepare Electron App
-    set(ELECTRON_BUILD_COPY "${CMAKE_BINARY_DIR}/lemonade-app.app")
-    add_custom_target(prepare_electron_app
-        COMMAND ${CMAKE_COMMAND} -E remove_directory "${ELECTRON_BUILD_COPY}"
-        COMMAND cp -R "${ELECTRON_APP_BUILD_DIR}/mac-arm64/lemonade-app.app" "${CMAKE_BINARY_DIR}/" || cp -R "${ELECTRON_APP_BUILD_DIR}/mac/lemonade-app.app" "${CMAKE_BINARY_DIR}/" || cp -R "${ELECTRON_APP_BUILD_DIR}/lemonade-app.app" "${CMAKE_BINARY_DIR}/" || echo "Warning: Could not find lemonade-app.app in ${ELECTRON_APP_BUILD_DIR}"
-        COMMENT "Copying Electron App..."
-        DEPENDS electron-app
+    # Prepare Tauri App
+    set(TAURI_APP_BUILD_COPY "${CMAKE_BINARY_DIR}/lemonade-app.app")
+    add_custom_target(prepare_tauri_app
+        COMMAND ${CMAKE_COMMAND} -E remove_directory "${TAURI_APP_BUILD_COPY}"
+        COMMAND cp -R "${TAURI_APP_UNPACKED_DIR}/lemonade-app.app" "${CMAKE_BINARY_DIR}/" || echo "Warning: Could not find lemonade-app.app in ${TAURI_APP_UNPACKED_DIR}"
+        COMMENT "Copying Tauri App..."
+        DEPENDS tauri-app
     )
 
     set(CPACK_PRE_BUILD_SCRIPTS "${CMAKE_BINARY_DIR}/cpack_prebuild.cmake")
     file(WRITE "${CMAKE_BINARY_DIR}/cpack_prebuild.cmake"
-        "message(STATUS \"Pre-build: Ensuring Electron app is prepared...\")\n"
-        "execute_process(COMMAND ${CMAKE_COMMAND} --build \"${CMAKE_BINARY_DIR}\" --target prepare_electron_app)\n"
+        "message(STATUS \"Pre-build: Ensuring Tauri app is prepared...\")\n"
+        "execute_process(COMMAND ${CMAKE_COMMAND} --build \"${CMAKE_BINARY_DIR}\" --target prepare_tauri_app)\n"
     )
 
     # INSTALLATION (Component Structure)
@@ -1164,24 +1255,6 @@ if(APPLE)
         endif()
     endif()
 
-    # Legacy shim -> /usr/local/bin
-    if(TARGET lemonade-server)
-        install(TARGETS lemonade-server RUNTIME DESTINATION "bin" COMPONENT Runtime)
-
-        # Sign the legacy shim after installation (Release builds only)
-        if(CMAKE_BUILD_TYPE STREQUAL "Release")
-            install(CODE "
-                execute_process(
-                    COMMAND codesign --force --options runtime --timestamp --entitlements \"${ENTITLEMENTS_PATH}\" --sign \"${SIGNING_IDENTITY}\" -v \"${CMAKE_BINARY_DIR}/_CPack_Packages/Darwin/productbuild/Lemonade-${PROJECT_VERSION}-Darwin/Runtime/usr/local/bin/lemonade-server\"
-                    RESULT_VARIABLE SIGN_RESULT
-                )
-                if(NOT SIGN_RESULT EQUAL 0)
-                    message(FATAL_ERROR \"Failed to sign lemonade-server\")
-                endif()
-            " COMPONENT Runtime)
-        endif()
-    endif()
-
     # CLI -> /usr/local/bin
     if(TARGET lemonade)
         install(TARGETS lemonade RUNTIME DESTINATION "bin" COMPONENT Runtime)
@@ -1204,7 +1277,7 @@ if(APPLE)
     install(DIRECTORY ${CMAKE_BINARY_DIR}/resources/ DESTINATION "/Library/Application Support/Lemonade/resources" COMPONENT Resources)
 
     # App Bundle -> /Applications
-    install(DIRECTORY "${ELECTRON_BUILD_COPY}"
+    install(DIRECTORY "${TAURI_APP_BUILD_COPY}"
         DESTINATION "/Applications"
         USE_SOURCE_PERMISSIONS
         COMPONENT Applications
@@ -1246,7 +1319,7 @@ if(APPLE)
     set(CPACK_POSTFLIGHT_RUNTIME_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/postinst-full-mac")
     include(CPack)
 
-    set(PACKAGE_DEPENDS prepare_electron_app ${EXECUTABLE_NAME})
+    set(PACKAGE_DEPENDS prepare_tauri_app ${EXECUTABLE_NAME})
 
     add_custom_target(package-macos
         DEPENDS ${PACKAGE_DEPENDS}
@@ -1283,7 +1356,6 @@ if(UNIX AND NOT APPLE)
     set(CPACK_PACKAGE_DESCRIPTION "A lightweight, high-performance local LLM server with support for multiple backends including llama.cpp, FastFlowLM, and RyzenAI.")
 
     # Only install our executables (not curl/development files)
-    # Note: lemonade-server installation is handled in tray/CMakeLists.txt
     install(TARGETS ${EXECUTABLE_NAME}
         RUNTIME DESTINATION bin
     )
@@ -1307,13 +1379,13 @@ if(UNIX AND NOT APPLE)
 
     # Configure systemd service file (uses CMAKE_INSTALL_FULL_* variables)
     configure_file(
-        ${CMAKE_SOURCE_DIR}/data/lemonade-server.service.in
-        ${CMAKE_BINARY_DIR}/lemonade-server.service
+        ${CMAKE_SOURCE_DIR}/data/lemond.service.in
+        ${CMAKE_BINARY_DIR}/lemond.service
         @ONLY
     )
 
     # Install systemd service file
-    install(FILES ${CMAKE_BINARY_DIR}/lemonade-server.service
+    install(FILES ${CMAKE_BINARY_DIR}/lemond.service
         DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/systemd/system
     )
     # Create symlink in standard systemd search path only if not installing to /usr
@@ -1323,11 +1395,28 @@ if(UNIX AND NOT APPLE)
             file(MAKE_DIRECTORY \"\$ENV{DESTDIR}/usr/lib/systemd/system\")
             execute_process(
                 COMMAND ${CMAKE_COMMAND} -E create_symlink
-                    ${CMAKE_INSTALL_PREFIX}/lib/systemd/system/lemonade-server.service
-                    \"\$ENV{DESTDIR}/usr/lib/systemd/system/lemonade-server.service\"
+                    ${CMAKE_INSTALL_PREFIX}/lib/systemd/system/lemond.service
+                    \"\$ENV{DESTDIR}/usr/lib/systemd/system/lemond.service\"
             )
         ")
     endif()
+
+    # Install sysusers.d snippet so the 'lemonade' system user is created
+    install(FILES ${CMAKE_SOURCE_DIR}/data/lemonade.sysusers
+        DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/sysusers.d
+        RENAME lemonade.conf
+    )
+
+    # Configure + install the user-mode systemd unit
+    configure_file(
+        ${CMAKE_SOURCE_DIR}/data/lemond-user.service.in
+        ${CMAKE_BINARY_DIR}/lemond-user.service
+        @ONLY
+    )
+    install(FILES ${CMAKE_BINARY_DIR}/lemond-user.service
+        DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/systemd/user
+        RENAME lemond.service
+    )
 
     # Install secrets.conf for LEMONADE_API_KEY (still loaded via EnvironmentFile)
     install(FILES ${CMAKE_SOURCE_DIR}/data/secrets.conf
@@ -1385,53 +1474,35 @@ if(UNIX AND NOT APPLE)
         message(STATUS "KaTeX fonts not found at ${KATEX_FONTS_DIR}, using bundled fonts")
     endif()
 
-    # Check if Electron app is available for full package
-    option(BUILD_ELECTRON_APP "Build and include Electron app in deb package" OFF)
+    # Check if Tauri app is available for full package
+    option(BUILD_TAURI_APP "Build and include Tauri desktop app in deb package" OFF)
 
-    # Build electron app if requested and target is available
-    if(BUILD_ELECTRON_APP AND TARGET electron-app)
-        message(STATUS "BUILD_ELECTRON_APP is ON - building Electron app...")
+    # Build Tauri app if requested and target is available
+    if(BUILD_TAURI_APP AND TARGET tauri-app)
+        message(STATUS "BUILD_TAURI_APP is ON - building Tauri app...")
         execute_process(
-            COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target electron-app
-            RESULT_VARIABLE ELECTRON_BUILD_RESULT
+            COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target tauri-app
+            RESULT_VARIABLE TAURI_BUILD_RESULT
         )
-        if(NOT ELECTRON_BUILD_RESULT EQUAL 0)
-            message(FATAL_ERROR "Failed to build Electron app")
+        if(NOT TAURI_BUILD_RESULT EQUAL 0)
+            message(FATAL_ERROR "Failed to build Tauri app")
         endif()
     endif()
 
-    if(BUILD_ELECTRON_APP AND EXISTS "${ELECTRON_APP_UNPACKED_DIR}/${ELECTRON_EXE_NAME}")
-        message(STATUS "Electron app found at ${ELECTRON_APP_UNPACKED_DIR}")
-        message(STATUS "Building full deb package with Electron app")
+    if(BUILD_TAURI_APP AND EXISTS "${TAURI_APP_UNPACKED_DIR}/${TAURI_EXE_NAME}")
+        message(STATUS "Tauri app found at ${TAURI_APP_UNPACKED_DIR}")
+        message(STATUS "Building full deb package with Tauri app")
 
         # Full package name
         set(CPACK_PACKAGE_NAME "lemonade-server")
 
-        # Install Electron app
-        install(DIRECTORY "${ELECTRON_APP_UNPACKED_DIR}/"
+        # Install the Tauri app binary (single file, unlike Electron's directory tree)
+        install(PROGRAMS "${TAURI_APP_UNPACKED_DIR}/${TAURI_EXE_NAME}"
             DESTINATION share/lemonade-server/app
-            USE_SOURCE_PERMISSIONS
-            PATTERN "*.so" PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
         )
 
         if (NOT WIN32 AND NOT APPLE)
-            if (EXISTS "${ELECTRON_APP_UNPACKED_DIR}/chrome-sandbox")
-                install(FILES "${ELECTRON_APP_UNPACKED_DIR}/chrome-sandbox"
-                    DESTINATION share/lemonade-server/app
-                    PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE SETUID
-                )
-            endif()
-
-            if (EXISTS "${ELECTRON_APP_UNPACKED_DIR}/chrome_crashpad_handler")
-                install(FILES "${ELECTRON_APP_UNPACKED_DIR}/chrome_crashpad_handler"
-                    DESTINATION share/lemonade-server/app
-                    PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
-                )
-            endif()
-        endif()
-
-        if (NOT WIN32 AND NOT APPLE)
-            # Install .desktop file for electron app
+            # Install .desktop file for the Tauri app
             install(FILES ${CMAKE_SOURCE_DIR}/data/lemonade-app.desktop
                 DESTINATION share/applications
             )
@@ -1468,14 +1539,14 @@ if(UNIX AND NOT APPLE)
                     file(MAKE_DIRECTORY \"\$ENV{DESTDIR}/usr/bin\")
                     execute_process(
                         COMMAND ${CMAKE_COMMAND} -E create_symlink
-                            \"\${CMAKE_INSTALL_PREFIX}/share/lemonade-server/app/lemonade\"
+                            \"\${CMAKE_INSTALL_PREFIX}/share/lemonade-server/app/lemonade-app\"
                             \"\$ENV{DESTDIR}/usr/bin/lemonade-app\"
                     )
                 ")
             else()
                 install(CODE "
                     file(CREATE_LINK
-                        \"\${CMAKE_INSTALL_PREFIX}/share/lemonade-server/app/lemonade\"
+                        \"\${CMAKE_INSTALL_PREFIX}/share/lemonade-server/app/lemonade-app\"
                         \"\${CMAKE_INSTALL_PREFIX}/bin/lemonade-app\"
                         SYMBOLIC)
                 ")
@@ -1489,58 +1560,6 @@ if(UNIX AND NOT APPLE)
     # RPM specific variables defined within
     include(${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/CPackRPM.cmake)
     include(CPack)
-
-    # ============================================================
-    # AppImage Build Target (Linux only)
-    # ============================================================
-    option(BUILD_APPIMAGE "Build the AppImage automatically" OFF)
-
-    if(NODE_EXECUTABLE AND NPM_EXECUTABLE)
-        # Set the build directory and source directory for AppImage
-        set(APPIMAGE_BUILD_SOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/app-appimage-src")
-        set(APPIMAGE_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/app-appimage")
-
-        if(BUILD_APPIMAGE)
-            add_custom_target(appimage ALL
-                COMMAND ${CMAKE_COMMAND} -E echo "Copying Electron app source to AppImage build directory..."
-                COMMAND ${CMAKE_COMMAND} -E remove_directory "${APPIMAGE_BUILD_SOURCE_DIR}"
-                COMMAND ${CMAKE_COMMAND} -E make_directory "${APPIMAGE_BUILD_SOURCE_DIR}"
-                COMMAND ${CMAKE_COMMAND} -E copy_directory "${ELECTRON_APP_SOURCE_DIR}" "${APPIMAGE_BUILD_SOURCE_DIR}"
-                COMMAND ${CMAKE_COMMAND} -E echo "Setting version to ${PROJECT_VERSION}..."
-                COMMAND ${CMAKE_COMMAND} -E chdir "${APPIMAGE_BUILD_SOURCE_DIR}" ${NPM_COMMAND} version ${PROJECT_VERSION} --no-git-tag-version --allow-same-version
-                COMMAND ${CMAKE_COMMAND} -E echo "Installing npm dependencies for AppImage build..."
-                COMMAND ${CMAKE_COMMAND} -E chdir "${APPIMAGE_BUILD_SOURCE_DIR}" ${NPM_COMMAND} ci
-                COMMAND ${CMAKE_COMMAND} -E echo "Building AppImage with electron-builder..."
-                COMMAND ${CMAKE_COMMAND} -E chdir "${APPIMAGE_BUILD_SOURCE_DIR}" ${NPM_COMMAND} run build:renderer:prod
-                COMMAND ${CMAKE_COMMAND} -E chdir "${APPIMAGE_BUILD_SOURCE_DIR}" ${NPM_EXECUTABLE} exec -- electron-builder --linux AppImage --config.directories.output=${APPIMAGE_BUILD_DIR}
-                COMMAND ${CMAKE_COMMAND} -E echo "AppImage build complete. Output in ${APPIMAGE_BUILD_DIR}"
-                COMMENT "Building Electron app as AppImage"
-                WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-            )
-            message(STATUS "AppImage will be built automatically (disable with -DBUILD_APPIMAGE=OFF)")
-        else()
-            add_custom_target(appimage
-                COMMAND ${CMAKE_COMMAND} -E echo "Copying Electron app source to AppImage build directory..."
-                COMMAND ${CMAKE_COMMAND} -E remove_directory "${APPIMAGE_BUILD_SOURCE_DIR}"
-                COMMAND ${CMAKE_COMMAND} -E make_directory "${APPIMAGE_BUILD_SOURCE_DIR}"
-                COMMAND ${CMAKE_COMMAND} -E copy_directory "${ELECTRON_APP_SOURCE_DIR}" "${APPIMAGE_BUILD_SOURCE_DIR}"
-                COMMAND ${CMAKE_COMMAND} -E echo "Setting version to ${PROJECT_VERSION}..."
-                COMMAND ${CMAKE_COMMAND} -E chdir "${APPIMAGE_BUILD_SOURCE_DIR}" ${NPM_COMMAND} version ${PROJECT_VERSION} --no-git-tag-version --allow-same-version
-                COMMAND ${CMAKE_COMMAND} -E echo "Installing npm dependencies for AppImage build..."
-                COMMAND ${CMAKE_COMMAND} -E chdir "${APPIMAGE_BUILD_SOURCE_DIR}" ${NPM_COMMAND} ci
-                COMMAND ${CMAKE_COMMAND} -E echo "Building AppImage with electron-builder..."
-                COMMAND ${CMAKE_COMMAND} -E chdir "${APPIMAGE_BUILD_SOURCE_DIR}" ${NPM_COMMAND} run build:renderer:prod
-                COMMAND ${CMAKE_COMMAND} -E chdir "${APPIMAGE_BUILD_SOURCE_DIR}" ${NPM_EXECUTABLE} exec -- electron-builder --linux AppImage --config.directories.output=${APPIMAGE_BUILD_DIR}
-                COMMAND ${CMAKE_COMMAND} -E echo "AppImage build complete. Output in ${APPIMAGE_BUILD_DIR}"
-                COMMENT "Building Electron app as AppImage"
-                WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-            )
-            message(STATUS "AppImage automatic build disabled (enable with -DBUILD_APPIMAGE=ON)")
-            message(STATUS "AppImage can be built manually with: cmake --build . --target appimage")
-        endif()
-    else()
-        message(STATUS "Node.js or npm not found - AppImage build target disabled")
-    endif()
 endif()
 
 # ============================================================
@@ -1556,6 +1575,17 @@ endif()
 
 if(WIN32)
     set(EMBEDDABLE_PLATFORM "windows-x64")
+elseif(APPLE)
+    if(DEFINED CMAKE_OSX_ARCHITECTURES AND CMAKE_OSX_ARCHITECTURES)
+        set(_embeddable_arch "${CMAKE_OSX_ARCHITECTURES}")
+    else()
+        set(_embeddable_arch "${CMAKE_HOST_SYSTEM_PROCESSOR}")
+    endif()
+    if(_embeddable_arch STREQUAL "arm64")
+        set(EMBEDDABLE_PLATFORM "macos-arm64")
+    else()
+        set(EMBEDDABLE_PLATFORM "macos-x64")
+    endif()
 else()
     set(EMBEDDABLE_PLATFORM "ubuntu-x64")
 endif()
@@ -1596,6 +1626,12 @@ add_custom_target(embeddable
         "${EMBEDDABLE_STAGING_DIR}/resources/"
     COMMAND ${CMAKE_COMMAND} -E copy
         "$<TARGET_FILE_DIR:lemond>/resources/defaults.json"
+        "${EMBEDDABLE_STAGING_DIR}/resources/"
+    COMMAND ${CMAKE_COMMAND} -E copy
+        "$<TARGET_FILE_DIR:lemond>/resources/bench_scenarios.json"
+        "${EMBEDDABLE_STAGING_DIR}/resources/"
+    COMMAND ${CMAKE_COMMAND} -E copy
+        "$<TARGET_FILE_DIR:lemond>/resources/toolDefinitions.json"
         "${EMBEDDABLE_STAGING_DIR}/resources/"
 
     # Create archive

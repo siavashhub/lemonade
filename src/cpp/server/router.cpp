@@ -5,6 +5,7 @@
 #include "lemon/backends/whisper_server.h"
 #include "lemon/backends/kokoro_server.h"
 #include "lemon/backends/sd_server.h"
+#include "lemon/backends/vllm_server.h"
 #include "lemon/server_capabilities.h"
 #include "lemon/error_types.h"
 #include "lemon/recipe_options.h"
@@ -37,6 +38,10 @@ WrappedServer* Router::find_server_by_model_name(const std::string& model_name) 
         }
     }
     return nullptr;
+}
+
+std::string Router::resolve_model_name(const std::string& model_name) const {
+    return model_name.empty() ? model_name : model_manager_->resolve_model_name(model_name);
 }
 
 WrappedServer* Router::get_most_recent_server() const {
@@ -159,14 +164,14 @@ void Router::evict_server(WrappedServer* server) {
 void Router::evict_all_servers() {
     LOG(INFO, "Router") << "Evicting all models (" << loaded_servers_.size() << " total)" << std::endl;
 
-    // Wait for all servers to finish
+    // Wait for all servers to finish (with timeout to prevent infinite hang).
     for (const auto& server : loaded_servers_) {
-        server->wait_until_not_busy();
+        server->wait_until_not_busy(EVICTION_TIMEOUT);
     }
 
     // Unload all
     for (const auto& server : loaded_servers_) {
-    LOG(INFO, "Router") << "Unloading: " << server->get_model_name() << std::endl;
+        LOG(INFO, "Router") << "Unloading: " << server->get_model_name() << std::endl;
         server->unload();
     }
 
@@ -179,29 +184,32 @@ std::unique_ptr<WrappedServer> Router::create_backend_server(const ModelInfo& mo
     std::string log_level = config_->log_level();
 
     if (model_info.recipe == "whispercpp") {
-    LOG(DEBUG, "Router") << "Creating WhisperServer backend" << std::endl;
+        LOG(DEBUG, "Router") << "Creating WhisperServer backend" << std::endl;
         new_server = std::make_unique<backends::WhisperServer>(log_level, model_manager_, backend_manager_);
     } else if (model_info.recipe == "kokoro") {
-    LOG(DEBUG, "Router") << "Creating Kokoro backend" << std::endl;
+        LOG(DEBUG, "Router") << "Creating Kokoro backend" << std::endl;
         new_server = std::make_unique<backends::KokoroServer>(log_level, model_manager_, backend_manager_);
     } else if (model_info.recipe == "sd-cpp") {
-    LOG(DEBUG, "Router") << "Creating SDServer backend" << std::endl;
+        LOG(DEBUG, "Router") << "Creating SDServer backend" << std::endl;
         new_server = std::make_unique<backends::SDServer>(log_level, model_manager_, backend_manager_);
     } else if (model_info.recipe == "flm") {
-    LOG(DEBUG, "Router") << "Creating FastFlowLM backend" << std::endl;
+        LOG(DEBUG, "Router") << "Creating FastFlowLM backend" << std::endl;
         new_server = std::make_unique<backends::FastFlowLMServer>(log_level, model_manager_, backend_manager_);
     } else if (model_info.recipe == "ryzenai-llm") {
-    LOG(DEBUG, "Router") << "Creating RyzenAI-Server backend" << std::endl;
+        LOG(DEBUG, "Router") << "Creating RyzenAI-Server backend" << std::endl;
 
         std::string model_path = model_info.resolved_path();
-    LOG(DEBUG, "Router") << "Using model path: " << model_path << std::endl;
+        LOG(DEBUG, "Router") << "Using model path: " << model_path << std::endl;
 
         auto* ryzenai_server = new RyzenAIServer(model_info.model_name,
                                                   log_level == "debug", model_manager_, backend_manager_);
         ryzenai_server->set_model_path(model_path);
         new_server.reset(ryzenai_server);
+    } else if (model_info.recipe == "vllm") {
+        LOG(DEBUG, "Router") << "Creating vLLM backend" << std::endl;
+        new_server = std::make_unique<backends::VLLMServer>(log_level, model_manager_, backend_manager_);
     } else {
-    LOG(DEBUG, "Router") << "Creating LlamaCpp backend" << std::endl;
+        LOG(DEBUG, "Router") << "Creating LlamaCpp backend" << std::endl;
         new_server = std::make_unique<backends::LlamaCppServer>(log_level, model_manager_, backend_manager_);
     }
 
@@ -211,14 +219,20 @@ std::unique_ptr<WrappedServer> Router::create_backend_server(const ModelInfo& mo
 void Router::load_model(const std::string& model_name,
                        const ModelInfo& model_info,
                        RecipeOptions options,
-                       bool do_not_upgrade) {
-    RecipeOptions default_opt = RecipeOptions(model_info.recipe, config_->recipe_options());
+                       bool do_not_upgrade,
+                       bool allow_reload_on_option_change) {
+    const std::string canonical_model_name = resolve_model_name(model_name);
+    const std::string backend_option = model_info.recipe + "_backend";
 
-    // Resolve settings: load overrides take precedence over per-model overrides which take precedence over defaults
-        RecipeOptions effective_options = options.inherit(model_info.recipe_options.inherit(default_opt));
+    RecipeOptions tentative = options.inherit(model_info.recipe_options.inherit(
+    RecipeOptions(model_info.recipe, config_->recipe_options(""))));
+    const std::string backend = tentative.get_option(backend_option).get<std::string>();
+
+    // Second pass: rebuild defaults using the resolved backend
+    RecipeOptions default_opt = RecipeOptions(model_info.recipe, config_->recipe_options(backend));
+    RecipeOptions effective_options = options.inherit(model_info.recipe_options.inherit(default_opt));
 
     LOG(DEBUG, "Router") << "Effective settings: " << effective_options.to_log_string() << std::endl;
-
 
     // LOAD SERIALIZATION STRATEGY (from spec: point #2 in Additional Considerations)
     std::unique_lock<std::mutex> lock(load_mutex_);
@@ -232,7 +246,7 @@ void Router::load_model(const std::string& model_name,
     // Mark that we're now loading (prevents concurrent loads)
     is_loading_ = true;
 
-    LOG(DEBUG, "Router") << "Loading model: " << model_name
+    LOG(DEBUG, "Router") << "Loading model: " << canonical_model_name
             << " (checkpoint: " << model_info.checkpoint()
             << ", recipe: " << model_info.recipe
             << ", type: " << model_type_to_string(model_info.type)
@@ -240,13 +254,20 @@ void Router::load_model(const std::string& model_name,
 
     try {
         // Check if model is already loaded
-        WrappedServer* existing = find_server_by_model_name(model_name);
+        WrappedServer* existing = find_server_by_model_name(canonical_model_name);
         if (existing) {
-        LOG(INFO, "Router") << "Model already loaded, updating access time" << std::endl;
-            existing->update_access_time();
-            is_loading_ = false;
-            load_cv_.notify_all();
-            return;
+            if (allow_reload_on_option_change &&
+                existing->get_recipe_options().to_json() != effective_options.to_json()) {
+                LOG(INFO, "Router") << "Options changed, reloading model: " << canonical_model_name << std::endl;
+                evict_server(existing);
+                // Fall through to create and load with new options
+            } else {
+                LOG(INFO, "Router") << "Model already loaded, updating access time" << std::endl;
+                existing->update_access_time();
+                is_loading_ = false;
+                load_cv_.notify_all();
+                return;
+            }
         }
 
         // Determine model type and device
@@ -257,7 +278,7 @@ void Router::load_model(const std::string& model_name,
         int max_models = config_->max_loaded_models();
 
         // NPU EXCLUSIVITY CHECK (recipe-aware rules)
-        // FLM can run up to 3 concurrent NPU processes (1 LLM + 1 audio + 1 embedding)
+        // FLM can run up to 3 concurrent NPU processes (1 LLM + 1 transcription + 1 embedding)
         // RyzenAI and WhisperCpp lock the entire NPU exclusively
         if (device_type & DEVICE_NPU) {
             if (model_info.recipe == "ryzenai-llm" || model_info.recipe == "whispercpp") {
@@ -278,7 +299,7 @@ void Router::load_model(const std::string& model_name,
                         evict_server(exclusive_server);
                     }
                 }
-                // 2. Evict FLM of the SAME model type (max 1 per type: 1 LLM, 1 audio, 1 embed)
+                // 2. Evict FLM of the SAME model type (max 1 per type: 1 LLM, 1 transcription, 1 embed)
                 WrappedServer* same_type_flm = find_flm_server_by_type(model_type);
                 if (same_type_flm) {
                     LOG(INFO, "Router") << "FLM " << model_type_to_string(model_type)
@@ -301,7 +322,7 @@ void Router::load_model(const std::string& model_name,
         if (max_models != -1 && current_count >= max_models) {
             WrappedServer* lru = find_lru_server_by_type(model_type);
             if (lru) {
-            LOG(INFO, "Router") << "Slot limit reached for type "
+                LOG(INFO, "Router") << "Slot limit reached for type "
                           << model_type_to_string(model_type)
                           << ", evicting LRU: " << lru->get_model_name() << std::endl;
                 evict_server(lru);
@@ -312,25 +333,25 @@ void Router::load_model(const std::string& model_name,
         std::unique_ptr<WrappedServer> new_server = create_backend_server(model_info);
 
         // Set model metadata
-        new_server->set_model_metadata(model_name, model_info.checkpoint(), model_type, device_type, effective_options);
+        new_server->set_model_metadata(canonical_model_name, model_info.checkpoint(), model_type, device_type, effective_options);
         new_server->update_access_time();
 
         // CRITICAL: Release lock before slow backend startup
         lock.unlock();
 
         // Load the backend (this can take 30-60 seconds)
-    LOG(DEBUG, "Router") << "Starting backend (this may take a moment)..." << std::endl;
+        LOG(DEBUG, "Router") << "Starting backend (this may take a moment)..." << std::endl;
         bool load_success = false;
         std::string error_message;
 
         try {
-            new_server->load(model_name, model_info, effective_options, do_not_upgrade);
+            new_server->load(canonical_model_name, model_info, effective_options, do_not_upgrade);
             load_success = true;
-        LOG(DEBUG, "Router") << "Backend started successfully" << std::endl;
+            LOG(DEBUG, "Router") << "Backend started successfully" << std::endl;
         } catch (const std::exception& e) {
             error_message = e.what();
             load_success = false;
-        LOG(ERROR, "Router") << "Backend load failed: " << error_message << std::endl;
+            LOG(ERROR, "Router") << "Backend load failed: " << error_message << std::endl;
         }
 
         lock.lock();
@@ -348,7 +369,7 @@ void Router::load_model(const std::string& model_name,
             is_loading_ = false;
             load_cv_.notify_all();
 
-        LOG(INFO, "Router") << "Model loaded successfully. Total loaded: "
+            LOG(INFO, "Router") << "Model loaded successfully. Total loaded: "
                       << loaded_servers_.size() << std::endl;
         } else {
             // ERROR HANDLING (from spec: Error Handling section)
@@ -361,12 +382,12 @@ void Router::load_model(const std::string& model_name,
             load_cv_.notify_all();
 
             if (is_file_not_found) {
-            LOG(ERROR, "Router") << "File not found error, NOT evicting other models" << std::endl;
+                LOG(ERROR, "Router") << "File not found error, NOT evicting other models" << std::endl;
                 throw std::runtime_error(error_message);
             }
 
             // Nuclear option: evict all models and retry
-        LOG(WARNING, "Router") << "Load failed with non-file-not-found error, "
+            LOG(WARNING, "Router") << "Load failed with non-file-not-found error, "
                       << "evicting all models and retrying..." << std::endl;
 
             evict_all_servers();
@@ -376,14 +397,14 @@ void Router::load_model(const std::string& model_name,
 
             // Create new server for retry
             std::unique_ptr<WrappedServer> retry_server = create_backend_server(model_info);
-            retry_server->set_model_metadata(model_name, model_info.checkpoint(), model_type, device_type, effective_options);
+            retry_server->set_model_metadata(canonical_model_name, model_info.checkpoint(), model_type, device_type, effective_options);
             retry_server->update_access_time();
 
             lock.unlock();
 
-        LOG(DEBUG, "Router") << "Retrying backend load..." << std::endl;
+            LOG(DEBUG, "Router") << "Retrying backend load..." << std::endl;
             try {
-                retry_server->load(model_name, model_info, effective_options, do_not_upgrade);
+                retry_server->load(canonical_model_name, model_info, effective_options, do_not_upgrade);
 
                 lock.lock();
 
@@ -391,19 +412,19 @@ void Router::load_model(const std::string& model_name,
                 is_loading_ = false;
                 load_cv_.notify_all();
 
-            LOG(DEBUG, "Router") << "Retry successful!" << std::endl;
+                LOG(DEBUG, "Router") << "Retry successful!" << std::endl;
             } catch (const std::exception& retry_error) {
                 lock.lock();
                 is_loading_ = false;
                 load_cv_.notify_all();
 
-            LOG(ERROR, "Router") << "Retry also failed: " << retry_error.what() << std::endl;
+                LOG(ERROR, "Router") << "Retry also failed: " << retry_error.what() << std::endl;
                 throw;
             }
         }
 
     } catch (const std::exception& e) {
-    LOG(ERROR, "Router") << "Failed to load model: " << e.what() << std::endl;
+        LOG(ERROR, "Router") << "Failed to load model: " << e.what() << std::endl;
 
         if (!lock.owns_lock()) {
             lock.lock();
@@ -420,12 +441,13 @@ void Router::unload_model(const std::string& model_name) {
 
     if (model_name.empty()) {
         // Unload all models
-    LOG(INFO, "Router") << "Unload all models called" << std::endl;
+        LOG(INFO, "Router") << "Unload all models called" << std::endl;
         evict_all_servers();
     } else {
         // Unload specific model
-    LOG(INFO, "Router") << "Unload model called: " << model_name << std::endl;
-        WrappedServer* server = find_server_by_model_name(model_name);
+        LOG(INFO, "Router") << "Unload model called: " << model_name << std::endl;
+        std::string canonical_model_name = resolve_model_name(model_name);
+        WrappedServer* server = find_server_by_model_name(canonical_model_name);
         if (!server) {
             throw std::runtime_error("Model not loaded: " + model_name);
         }
@@ -436,7 +458,7 @@ void Router::unload_model(const std::string& model_name) {
 std::string Router::get_loaded_model() const {
     std::lock_guard<std::mutex> lock(load_mutex_);
     WrappedServer* server = get_most_recent_server();
-    return server ? server->get_model_name() : "";
+    return server ? model_manager_->get_public_model_name(server->get_model_name()) : "";
 }
 
 std::string Router::get_loaded_recipe() const {
@@ -455,11 +477,12 @@ json Router::get_all_loaded_models() const {
 
     for (const auto& server : loaded_servers_) {
         json model_info;
-        model_info["model_name"] = server->get_model_name();
+        model_info["model_name"] = model_manager_->get_public_model_name(server->get_model_name());
         model_info["checkpoint"] = server->get_checkpoint();
         model_info["type"] = model_type_to_string(server->get_model_type());
         model_info["device"] = device_type_to_string(server->get_device_type());
         model_info["backend_url"] = server->get_address();  // For debugging port issues
+        model_info["pid"] = server->get_process_id();
         RecipeOptions recipe_options =  server->get_recipe_options();
         model_info["recipe"] = recipe_options.get_recipe();
         model_info["recipe_options"] = recipe_options.to_json();
@@ -482,7 +505,7 @@ json Router::get_max_model_limits() const {
         {"llm", max},
         {"embedding", max},
         {"reranking", max},
-        {"audio", max},
+        {"transcription", max},
         {"image", max},
         {"tts", max}
     };
@@ -495,12 +518,12 @@ bool Router::is_model_loaded() const {
 
 bool Router::is_model_loaded(const std::string& model_name) const {
     std::lock_guard<std::mutex> lock(load_mutex_);
-    return find_server_by_model_name(model_name) != nullptr;
+    return find_server_by_model_name(resolve_model_name(model_name)) != nullptr;
 }
 
 RecipeOptions Router::get_model_recipe_options(const std::string& model_name) const {
     std::lock_guard<std::mutex> lock(load_mutex_);
-    auto* server = find_server_by_model_name(model_name);
+    auto* server = find_server_by_model_name(resolve_model_name(model_name));
     if (server) return server->get_recipe_options();
     return RecipeOptions();
 }
@@ -509,7 +532,7 @@ ModelType Router::get_model_type(const std::string& model_name) const {
     std::lock_guard<std::mutex> lock(load_mutex_);
     WrappedServer* server = model_name.empty()
         ? get_most_recent_server()
-        : find_server_by_model_name(model_name);
+        : find_server_by_model_name(resolve_model_name(model_name));
     return server ? server->get_model_type() : ModelType::LLM;
 }
 
@@ -537,7 +560,7 @@ auto Router::execute_inference(const json& request, Func&& inference_func) -> de
             return ErrorResponse::from_exception(InvalidRequestException("No model specified in request"));
         }
 
-        server = find_server_by_model_name(requested_model);
+        server = find_server_by_model_name(resolve_model_name(requested_model));
         if (!server) {
             return ErrorResponse::from_exception(ModelNotLoadedException(requested_model));
         }
@@ -575,18 +598,18 @@ void Router::execute_streaming(const std::string& request_body, httplib::DataSin
             }
         } catch (...) {
             // If JSON parsing fails, fall back to most recent server
-        LOG(DEBUG, "Router") << "Failed to parse request body for model extraction" << std::endl;
+            LOG(DEBUG, "Router") << "Failed to parse request body for model extraction" << std::endl;
         }
 
         // Find requested model - no fallback to avoid silent misrouting
         if (requested_model.empty()) {
-        LOG(ERROR, "Router") << "No model specified in streaming request" << std::endl;
+            LOG(ERROR, "Router") << "No model specified in streaming request" << std::endl;
             std::string error_msg = "data: {\"error\":{\"message\":\"No model specified in request\",\"type\":\"invalid_request_error\"}}\n\n";
             sink.write(error_msg.c_str(), error_msg.size());
             return;
         }
 
-        server = find_server_by_model_name(requested_model);
+        server = find_server_by_model_name(resolve_model_name(requested_model));
         if (!server) {
             std::string error_msg = "data: {\"error\":{\"message\":\"Model not loaded: " + requested_model + "\",\"type\":\"model_not_loaded\"}}\n\n";
             sink.write(error_msg.c_str(), error_msg.size());
@@ -642,6 +665,117 @@ json Router::reranking(const json& request) {
     });
 }
 
+json Router::get_slots() {
+    WrappedServer* server = nullptr;
+    ISlotsServer* slots_server = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(load_mutex_);
+        server = get_most_recent_server();
+        if (!server) {
+            return ErrorResponse::from_exception(
+                ModelNotLoadedException("No models loaded")
+            );
+        }
+
+        // Check if server supports slots capability
+        slots_server = dynamic_cast<ISlotsServer*>(server);
+        if (!slots_server) {
+            return ErrorResponse::from_exception(
+                UnsupportedOperationException("Slots", device_type_to_string(server->get_device_type()))
+            );
+        }
+
+        // Mark as busy and update access time
+        server->set_busy(true);
+        server->update_access_time();
+    } // Lock released here
+
+    // Execute without holding lock (but busy flag prevents eviction)
+    try {
+        auto response = slots_server->get_slots();
+        server->set_busy(false);
+        return response;
+    } catch (...) {
+        server->set_busy(false);
+        throw;
+    }
+}
+
+json Router::slots_action(int slot_id, const std::string& action, const json& request_body) {
+    WrappedServer* server = nullptr;
+    ISlotsServer* slots_server = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(load_mutex_);
+        server = get_most_recent_server();
+        if (!server) {
+            return ErrorResponse::from_exception(
+                ModelNotLoadedException("No models loaded")
+            );
+        }
+
+        // Check if server supports slots capability
+        slots_server = dynamic_cast<ISlotsServer*>(server);
+        if (!slots_server) {
+            return ErrorResponse::from_exception(
+                UnsupportedOperationException("Slots", device_type_to_string(server->get_device_type()))
+            );
+        }
+
+        // Mark as busy and update access time
+        server->set_busy(true);
+        server->update_access_time();
+    } // Lock released here
+
+    // Execute without holding lock (but busy flag prevents eviction)
+    try {
+        auto response = slots_server->slots_action(slot_id, action, request_body);
+        server->set_busy(false);
+        return response;
+    } catch (...) {
+        server->set_busy(false);
+        throw;
+    }
+}
+
+json Router::tokenize(const json& request_body) {
+    WrappedServer* server = nullptr;
+    ITokenizerServer* tokenizer_server = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(load_mutex_);
+        server = get_most_recent_server();
+        if (!server) {
+            return ErrorResponse::from_exception(
+                ModelNotLoadedException("No models loaded")
+            );
+        }
+
+        // Check if server supports tokenize capability
+        tokenizer_server = dynamic_cast<ITokenizerServer*>(server);
+        if (!tokenizer_server) {
+            return ErrorResponse::from_exception(
+                UnsupportedOperationException("Tokenization", device_type_to_string(server->get_device_type()))
+            );
+        }
+
+        // Mark as busy and update access time
+        server->set_busy(true);
+        server->update_access_time();
+    } // Lock released here
+
+    // Execute without holding lock (but busy flag prevents eviction)
+    try {
+        auto response = tokenizer_server->tokenize(request_body);
+        server->set_busy(false);
+        return response;
+    } catch (...) {
+        server->set_busy(false);
+        throw;
+    }
+}
+
 json Router::responses(const json& request) {
     return execute_inference(request, [&](WrappedServer* server) {
         return server->responses(request);
@@ -650,13 +784,13 @@ json Router::responses(const json& request) {
 
 json Router::audio_transcriptions(const json& request) {
     return execute_inference(request, [&](WrappedServer* server) {
-        auto audio_server = dynamic_cast<IAudioServer*>(server);
-        if (!audio_server) {
+        auto transcription_server = dynamic_cast<ITranscriptionServer*>(server);
+        if (!transcription_server) {
             return ErrorResponse::from_exception(
                 UnsupportedOperationException("Audio transcription", device_type_to_string(server->get_device_type()))
             );
         }
-        return audio_server->audio_transcriptions(request);
+        return transcription_server->audio_transcriptions(request);
     });
 }
 

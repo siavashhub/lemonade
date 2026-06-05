@@ -49,6 +49,55 @@ std::string RealtimeSessionManager::generate_session_id() {
     return id;
 }
 
+void RealtimeSessionManager::apply_turn_detection_config(
+    std::shared_ptr<RealtimeSession> session,
+    const json& turn_detection) {
+    if (turn_detection.is_null()) {
+        session->turn_detection_enabled = false;
+        session->turn_detection_config = nullptr;
+        session->vad.reset();
+        session->vad_speech_window_open = false;
+        session->last_interim_transcription_ms = 0;
+        return;
+    }
+
+    SimpleVAD::Config vad_config;
+    if (session->turn_detection_config.is_object()) {
+        vad_config.energy_threshold = session->turn_detection_config.value(
+            "threshold",
+            vad_config.energy_threshold
+        );
+        vad_config.min_silence_ms = session->turn_detection_config.value(
+            "silence_duration_ms",
+            vad_config.min_silence_ms
+        );
+        vad_config.min_speech_ms = session->turn_detection_config.value(
+            "prefix_padding_ms",
+            vad_config.min_speech_ms
+        );
+    }
+
+    if (turn_detection.is_object()) {
+        if (turn_detection.contains("threshold")) {
+            vad_config.energy_threshold = turn_detection["threshold"].get<float>();
+        }
+        if (turn_detection.contains("silence_duration_ms")) {
+            vad_config.min_silence_ms = turn_detection["silence_duration_ms"].get<int>();
+        }
+        if (turn_detection.contains("prefix_padding_ms")) {
+            vad_config.min_speech_ms = turn_detection["prefix_padding_ms"].get<int>();
+        }
+    }
+
+    session->vad.set_config(vad_config);
+    session->turn_detection_config = {
+        {"threshold", vad_config.energy_threshold},
+        {"silence_duration_ms", vad_config.min_silence_ms},
+        {"prefix_padding_ms", vad_config.min_speech_ms}
+    };
+    session->turn_detection_enabled = true;
+}
+
 std::string RealtimeSessionManager::create_session(
     std::function<void(const json&)> send_callback,
     const json& config
@@ -65,20 +114,7 @@ std::string RealtimeSessionManager::create_session(
 
     // Configure VAD if specified
     if (config.contains("turn_detection")) {
-        const auto& td = config["turn_detection"];
-        SimpleVAD::Config vad_config;
-
-        if (td.contains("threshold")) {
-            vad_config.energy_threshold = td["threshold"].get<float>();
-        }
-        if (td.contains("silence_duration_ms")) {
-            vad_config.min_silence_ms = td["silence_duration_ms"].get<int>();
-        }
-        if (td.contains("prefix_padding_ms")) {
-            vad_config.min_speech_ms = td["prefix_padding_ms"].get<int>();
-        }
-
-        session->vad.set_config(vad_config);
+        apply_turn_detection_config(session, config["turn_detection"]);
     }
 
     {
@@ -114,20 +150,7 @@ void RealtimeSessionManager::update_session(const std::string& session_id, const
     }
 
     if (config.contains("turn_detection")) {
-        const auto& td = config["turn_detection"];
-        SimpleVAD::Config vad_config;
-
-        if (td.contains("threshold")) {
-            vad_config.energy_threshold = td["threshold"].get<float>();
-        }
-        if (td.contains("silence_duration_ms")) {
-            vad_config.min_silence_ms = td["silence_duration_ms"].get<int>();
-        }
-        if (td.contains("prefix_padding_ms")) {
-            vad_config.min_speech_ms = td["prefix_padding_ms"].get<int>();
-        }
-
-        session->vad.set_config(vad_config);
+        apply_turn_detection_config(session, config["turn_detection"]);
     }
 
     // Send session updated message (OpenAI-compatible)
@@ -136,7 +159,8 @@ void RealtimeSessionManager::update_session(const std::string& session_id, const
             {"type", "session.updated"},
             {"session", {
                 {"id", session_id},
-                {"model", session->model}
+                {"model", session->model},
+                {"turn_detection", session->turn_detection_config}
             }}
         };
         session->send_message(updated_msg);
@@ -159,8 +183,10 @@ void RealtimeSessionManager::append_audio(const std::string& session_id, const s
                   << "ms (" << session->audio_buffer.sample_count() << " samples)" << std::endl;
     }
 
-    // Process VAD with recent audio
-    process_vad(session);
+    // In manual-commit mode, buffer audio only and skip server-side VAD/interim work.
+    if (session->turn_detection_enabled.load()) {
+        process_vad(session);
+    }
 }
 
 void RealtimeSessionManager::process_vad(std::shared_ptr<RealtimeSession> session) {
@@ -188,6 +214,7 @@ void RealtimeSessionManager::process_vad(std::shared_ptr<RealtimeSession> sessio
         case SimpleVAD::Event::SpeechStart: {
             LOG(DEBUG, "RealtimeSession") << "VAD: SpeechStart detected" << std::endl;
             session->audio_start_ms = session->vad.speech_start_ms();
+            session->vad_speech_window_open = true;
             session->last_interim_transcription_ms = 0;  // Reset interim tracking for new utterance
 
             if (session->send_message) {
@@ -213,6 +240,7 @@ void RealtimeSessionManager::process_vad(std::shared_ptr<RealtimeSession> sessio
             }
 
             // Trigger final transcription (clears buffer)
+            session->vad_speech_window_open = false;
             transcribe_and_send(session);
             break;
         }
@@ -282,7 +310,30 @@ void RealtimeSessionManager::transcribe_interim(std::shared_ptr<RealtimeSession>
 
 void RealtimeSessionManager::commit_audio(const std::string& session_id) {
     auto session = get_session(session_id);
-    if (!session || session->audio_buffer.empty()) {
+    if (!session) {
+        return;
+    }
+
+    if (session->turn_detection_enabled.load() && !session->vad_speech_window_open.load()) {
+        if (!session->audio_buffer.empty()) {
+            LOG(DEBUG, "RealtimeSession")
+                << "Ignoring commit with no active VAD speech window; clearing buffered audio"
+                << std::endl;
+        }
+        session->audio_buffer.clear();
+        session->vad.reset();
+        session->last_interim_transcription_ms = 0;
+
+        if (session->send_message) {
+            json msg = {
+                {"type", "input_audio_buffer.cleared"}
+            };
+            session->send_message(msg);
+        }
+        return;
+    }
+
+    if (session->audio_buffer.empty()) {
         return;
     }
 
@@ -295,6 +346,7 @@ void RealtimeSessionManager::commit_audio(const std::string& session_id) {
     }
 
     // Trigger transcription
+    session->vad_speech_window_open = false;
     transcribe_and_send(session);
 }
 
@@ -306,6 +358,7 @@ void RealtimeSessionManager::clear_audio(const std::string& session_id) {
 
     session->audio_buffer.clear();
     session->vad.reset();
+    session->vad_speech_window_open = false;
 
     if (session->send_message) {
         json msg = {
@@ -325,6 +378,7 @@ void RealtimeSessionManager::transcribe_and_send(std::shared_ptr<RealtimeSession
     std::string model = session->model;
     session->audio_buffer.clear();
     session->vad.reset();
+    session->vad_speech_window_open = false;
     session->last_interim_transcription_ms = 0;  // Reset for next utterance
 
     // Dispatch transcription to worker thread so it doesn't block the WebSocket callback

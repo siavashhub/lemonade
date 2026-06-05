@@ -1,11 +1,14 @@
 #include "lemon/runtime_config.h"
 #include "lemon/system_info.h"
+#include "lemon/utils/aixlog.hpp"
+#include "lemon/utils/path_utils.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
 #include <stdexcept>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -27,7 +30,7 @@ RuntimeConfig* RuntimeConfig::global() {
 }
 
 static const std::vector<std::string> s_backend_names = {
-    "llamacpp", "whispercpp", "sdcpp", "flm", "ryzenai", "kokoro"
+    "llamacpp", "whispercpp", "sdcpp", "flm", "vllm", "ryzenai", "kokoro"
 };
 
 static bool is_backend_name(const std::string& key) {
@@ -36,12 +39,35 @@ static bool is_backend_name(const std::string& key) {
 
 // Backends that have a selectable "backend" key
 static const std::vector<std::string> s_selectable_backends = {
-    "llamacpp", "whispercpp", "sdcpp"
+    "llamacpp", "whispercpp", "sdcpp", "vllm"
 };
 
 static bool has_backend_selection(const std::string& config_section) {
     return std::find(s_selectable_backends.begin(), s_selectable_backends.end(),
                      config_section) != s_selectable_backends.end();
+}
+
+static std::pair<json, std::string> normalize_config_set_changes(const json& changes) {
+    json normalized = changes;
+    std::string message;
+
+    if (normalized.contains("rocm")) {
+        if (normalized.contains("rocm_channel") && normalized["rocm_channel"] != normalized["rocm"]) {
+            throw std::invalid_argument(
+                "Ambiguous ROCm channel settings: use only 'rocm_channel'");
+        }
+        normalized["rocm_channel"] = normalized["rocm"];
+        normalized.erase("rocm");
+    }
+
+    if (normalized.contains("rocm_channel") && normalized["rocm_channel"].is_string() &&
+        normalized["rocm_channel"].get<std::string>() == "preview") {
+        normalized["rocm_channel"] = "stable";
+        message = "rocm_channel=preview is deprecated; using rocm_channel=stable";
+        LOG(WARNING) << message << std::endl;
+    }
+
+    return {normalized, message};
 }
 
 std::string RuntimeConfig::config_section_to_recipe(const std::string& config_section) {
@@ -80,13 +106,29 @@ void RuntimeConfig::validate_backend_choice(const std::string& config_section,
 void RuntimeConfig::validate_bin_path(const std::string& config_section,
                                        const std::string& key,
                                        const std::string& value) {
-    if (value.empty() || value == "builtin") return;
+    // Reserved keywords:
+    //   ""        — alias for "builtin"
+    //   "builtin" — use the version pinned by lemonade in backend_versions.json
+    //   "latest"  — resolve to the most-recent upstream release at lemond start
+    if (value.empty() || value == "builtin" || value == "latest") return;
 
-    if (!fs::exists(value)) {
-        throw std::invalid_argument(
-            "'" + config_section + "." + key + "' path does not exist: " + value
-            + ". Set to \"builtin\" to use the default binary.");
+    // Absolute-path values are treated as user-supplied binary directories and
+    // must exist. Relative-looking values intentionally fall through to the
+    // version-tag branch so backend pins are not interpreted relative to
+    // lemond's launch directory.
+    if (utils::looks_like_path(value)) {
+        if (!fs::exists(value)) {
+            throw std::invalid_argument(
+                "'" + config_section + "." + key + "' path does not exist: " + value
+                + ". Use \"builtin\", \"latest\", a version tag (e.g. \"b8664\"),"
+                  " or a path to a pre-downloaded binary.");
+        }
+        return;
     }
+
+    // Anything else is treated as an upstream release tag (e.g. "b8664",
+    // "v1.8.2") and accepted verbatim. The download step surfaces a clear
+    // error if the tag does not exist on GitHub.
 }
 
 RuntimeConfig::RuntimeConfig(const json& config)
@@ -160,6 +202,11 @@ bool RuntimeConfig::offline() const {
     return config_["offline"].get<bool>();
 }
 
+bool RuntimeConfig::no_fetch_executables() const {
+    std::shared_lock lock(mutex_);
+    return config_["no_fetch_executables"].get<bool>();
+}
+
 bool RuntimeConfig::disable_model_filtering() const {
     std::shared_lock lock(mutex_);
     return config_["disable_model_filtering"].get<bool>();
@@ -168,6 +215,20 @@ bool RuntimeConfig::disable_model_filtering() const {
 bool RuntimeConfig::enable_dgpu_gtt() const {
     std::shared_lock lock(mutex_);
     return config_["enable_dgpu_gtt"].get<bool>();
+}
+
+std::string RuntimeConfig::rocm_channel() const {
+    std::shared_lock lock(mutex_);
+    return config_["rocm_channel"].get<std::string>();
+}
+
+std::string RuntimeConfig::rocm_channel_for_recipe(const std::string& recipe) const {
+    std::string channel = rocm_channel();
+    // sd-cpp currently has no nightly artifacts; use stable builds.
+    if (recipe == "sd-cpp" && channel == "nightly") {
+        return "stable";
+    }
+    return channel;
 }
 
 json RuntimeConfig::backend_config(const std::string& backend_name) const {
@@ -214,7 +275,7 @@ double RuntimeConfig::backend_double(const std::string& backend,
     return 0.0;
 }
 
-json RuntimeConfig::recipe_options() const {
+json RuntimeConfig::recipe_options(const std::string& backend) const {
     std::shared_lock lock(mutex_);
     json result = json::object();
 
@@ -225,22 +286,37 @@ json RuntimeConfig::recipe_options() const {
         return val;
     };
 
+    const std::string backend_args = backend + "_args";
+
     if (config_.contains("llamacpp")) {
         const auto& lc = config_["llamacpp"];
         if (lc.contains("backend")) result["llamacpp_backend"] = resolve_auto(lc["backend"]);
-        if (lc.contains("args")) result["llamacpp_args"] = lc["args"];
+        if (lc.contains(backend_args) && lc[backend_args] != "") {
+            result["llamacpp_args"] = lc[backend_args];
+        } else if (lc.contains("args")) {
+            result["llamacpp_args"] = lc["args"];
+        }
+        if (lc.contains("device")) result["llamacpp_device"] = lc["device"];
     }
 
     if (config_.contains("whispercpp")) {
         const auto& wc = config_["whispercpp"];
         if (wc.contains("backend")) result["whispercpp_backend"] = resolve_auto(wc["backend"]);
-        if (wc.contains("args")) result["whispercpp_args"] = wc["args"];
+        if (wc.contains(backend_args) && wc[backend_args] != "") {
+            result["whispercpp_args"] = wc[backend_args];
+        } else if (wc.contains("args")) {
+            result["whispercpp_args"] = wc["args"];
+        }
     }
 
     if (config_.contains("sdcpp")) {
         const auto& sd = config_["sdcpp"];
         if (sd.contains("backend")) result["sd-cpp_backend"] = resolve_auto(sd["backend"]);
-        if (sd.contains("args")) result["sdcpp_args"] = sd["args"];
+        if (sd.contains(backend_args) && sd[backend_args] != "") {
+            result["sdcpp_args"] = sd[backend_args];
+        } else if (sd.contains("args")) {
+            result["sdcpp_args"] = sd["args"];
+        }
         if (sd.contains("steps")) result["steps"] = sd["steps"];
         if (sd.contains("cfg_scale")) result["cfg_scale"] = sd["cfg_scale"];
         if (sd.contains("width")) result["width"] = sd["width"];
@@ -250,6 +326,12 @@ json RuntimeConfig::recipe_options() const {
     if (config_.contains("flm")) {
         const auto& flm = config_["flm"];
         if (flm.contains("args")) result["flm_args"] = flm["args"];
+    }
+
+    if (config_.contains("vllm")) {
+        const auto& vl = config_["vllm"];
+        if (vl.contains("backend")) result["vllm_backend"] = resolve_auto(vl["backend"]);
+        if (vl.contains("args")) result["vllm_args"] = vl["args"];
     }
 
     if (config_.contains("ctx_size")) result["ctx_size"] = config_["ctx_size"];
@@ -301,6 +383,7 @@ void RuntimeConfig::validate(const std::string& key, const json& value) const {
             throw std::invalid_argument("'" + key + "' must be a string");
         }
     } else if (key == "no_broadcast" || key == "offline" ||
+               key == "no_fetch_executables" ||
                key == "disable_model_filtering" || key == "enable_dgpu_gtt") {
         if (!value.is_boolean()) {
             throw std::invalid_argument("'" + key + "' must be a boolean");
@@ -335,6 +418,14 @@ void RuntimeConfig::validate(const std::string& key, const json& value) const {
         if (value.get<int>() < 1) {
             throw std::invalid_argument("'config_version' must be >= 1");
         }
+    } else if (key == "rocm_channel") {
+        if (!value.is_string()) {
+            throw std::invalid_argument("'rocm_channel' must be a string");
+        }
+        std::string channel = value.get<std::string>();
+        if (channel != "stable" && channel != "nightly") {
+            throw std::invalid_argument("'rocm_channel' must be either 'stable', or 'nightly'");
+        }
     } else if (is_backend_name(key)) {
         if (!value.is_object()) {
             throw std::invalid_argument("'" + key + "' must be an object");
@@ -356,7 +447,12 @@ void RuntimeConfig::validate_backend(const std::string& backend, const std::stri
         }
         validate_backend_choice(backend, value.get<std::string>());
     }
-    else if (key == "args") {
+    else if (key == "args" || key.find("_args") != std::string::npos) {
+        if (!value.is_string()) {
+            throw std::invalid_argument("'" + backend + "." + key + "' must be a string");
+        }
+    }
+    else if (key == "device") {
         if (!value.is_string()) {
             throw std::invalid_argument("'" + backend + "." + key + "' must be a string");
         }
@@ -393,31 +489,29 @@ void RuntimeConfig::validate_backend(const std::string& backend, const std::stri
     }
 }
 
-void RuntimeConfig::apply_changes(const json& changes, std::vector<std::string>& changed_keys) {
+void RuntimeConfig::apply_changes(const json& changes, json& applied_diff) {
     for (auto& [key, value] : changes.items()) {
         if (value.is_object() && is_backend_name(key)) {
-            // Merge nested backend changes
+            // Merge nested backend changes; record per-sub-key diffs.
             if (!config_.contains(key)) {
                 config_[key] = json::object();
             }
             for (auto& [sub_key, sub_value] : value.items()) {
                 if (!config_[key].contains(sub_key) || config_[key][sub_key] != sub_value) {
                     config_[key][sub_key] = sub_value;
-                    changed_keys.push_back(key);  // Track that this backend section changed
+                    if (!applied_diff.contains(key)) {
+                        applied_diff[key] = json::object();
+                    }
+                    applied_diff[key][sub_key] = sub_value;
                 }
             }
         } else {
             if (!config_.contains(key) || config_[key] != value) {
                 config_[key] = value;
-                changed_keys.push_back(key);
+                applied_diff[key] = value;
             }
         }
     }
-
-    // Deduplicate changed_keys
-    std::sort(changed_keys.begin(), changed_keys.end());
-    changed_keys.erase(std::unique(changed_keys.begin(), changed_keys.end()),
-                       changed_keys.end());
 }
 
 json RuntimeConfig::set(const json& changes, ConfigSideEffectCallback side_effect_cb) {
@@ -425,30 +519,36 @@ json RuntimeConfig::set(const json& changes, ConfigSideEffectCallback side_effec
         throw std::invalid_argument("Request body must be a non-empty JSON object");
     }
 
+    auto [normalized_changes, message] = normalize_config_set_changes(changes);
+
     // Validate all keys before acquiring write lock
-    for (auto& [key, value] : changes.items()) {
+    for (auto& [key, value] : normalized_changes.items()) {
         validate(key, value);
     }
 
-    std::vector<std::string> changed_keys;
+    json applied_diff = json::object();
     json updated = json::object();
 
     {
         std::unique_lock lock(mutex_);
-        apply_changes(changes, changed_keys);
+        apply_changes(normalized_changes, applied_diff);
 
         // Build updated response
-        for (auto& [key, value] : changes.items()) {
+        for (auto& [key, value] : normalized_changes.items()) {
             updated[key] = value;
         }
     } // Lock released
 
     // Execute side effects outside the lock
-    if (side_effect_cb && !changed_keys.empty()) {
-        side_effect_cb(changed_keys);
+    if (side_effect_cb && !applied_diff.empty()) {
+        side_effect_cb(applied_diff);
     }
 
-    return {{"status", "success"}, {"updated", updated}};
+    json response = {{"status", "success"}, {"updated", updated}};
+    if (!message.empty()) {
+        response["message"] = message;
+    }
+    return response;
 }
 
 json RuntimeConfig::snapshot() const {

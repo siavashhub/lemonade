@@ -28,6 +28,14 @@ std::string get_resource_path(const std::string& relative_path);
 bool is_safe_executable_path(const std::string& path);
 
 /**
+ * Heuristic: does this string look like a filesystem path (vs. a keyword or
+ * version tag)? Returns true if it contains a path separator or is absolute.
+ * Used to disambiguate `*_bin` config values like "b8664" (version tag) from
+ * "/opt/llama" (path). Existence is NOT checked here.
+ */
+bool looks_like_path(const std::string& v);
+
+/**
  * Find the FLM executable (flm.exe on Windows, flm on Unix).
  * Uses SearchPathA on Windows (same API as CreateProcessA) to search PATH,
  * then falls back to the default installation directory.
@@ -106,9 +114,11 @@ std::string get_hf_cache_dir();
 
 /**
  * Returns a per-user runtime directory for lemonade's PID/lock/log files.
+ * On macOS, uses the system temporary directory and creates a lemonade
+ * subdirectory.
  * On Unix, uses $XDG_RUNTIME_DIR/lemonade when $XDG_RUNTIME_DIR is set,
- * exists, and is writable (creates the subdirectory if needed).
- * Falls back to /tmp when XDG_RUNTIME_DIR is unset or unusable (e.g. CI).
+ * exists, and is writable (creates the subdirectory if needed); otherwise
+ * throws.
  * On Windows, returns the system temp directory.
  */
 std::string get_runtime_dir();
