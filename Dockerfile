@@ -24,11 +24,7 @@ COPY . /app
 WORKDIR /app
 
 # Build the project
-# Normalize source mtimes first to avoid Ninja "manifest still dirty" loops
-# caused by file(GLOB) re-detecting sources newer than build.ninja on some
-# filesystems (notably Docker Desktop on Windows/WSL2).
 RUN rm -rf build && \
-    find /app -exec touch -t 200001010000 {} + && \
     cmake --preset default && \
     cmake --build --preset default web-app
 
