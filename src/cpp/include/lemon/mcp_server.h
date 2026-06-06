@@ -68,6 +68,7 @@ private:
     json tool_transcribe_audio(const json& arguments);
     json tool_generate_speech(const json& arguments);
     json tool_generate_image(const json& arguments);
+    json tool_list_models(const json& arguments);
 
     // Static descriptors used by `tools/list`. Each tool's input JSON Schema
     // is embedded as a literal here to keep the dependency graph minimal.

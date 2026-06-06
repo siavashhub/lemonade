@@ -275,6 +275,8 @@ json McpServer::handle_tools_call(const json& params, const json& id) {
             result = tool_generate_speech(arguments);
         } else if (tool_name == "lemonade_generate_image") {
             result = tool_generate_image(arguments);
+        } else if (tool_name == "lemonade_list_models") {
+            result = tool_list_models(arguments);
         } else {
             // Per MCP spec, unknown-tool errors are returned as a successful
             // result with isError=true (so the client model can recover),
@@ -578,6 +580,113 @@ json McpServer::tool_generate_image(const json& arguments) {
     };
 }
 
+json McpServer::tool_list_models(const json& arguments) {
+    // Returns a structured catalogue so the client model can pick the right
+    // name to pass to `lemonade_chat` / `lemonade_embed` / etc. without
+    // guessing. The `loaded` array lists what is in memory RIGHT NOW (which
+    // is what a model wants to discover first, to avoid triggering downloads
+    // or evictions of unrelated models).
+    const bool include_available = arguments.value("include_available", true);
+    const bool include_suggested = arguments.value("include_suggested", true);
+
+    json loaded = router_->get_all_loaded_models();
+
+    auto downloaded = model_manager_->get_downloaded_models();
+
+    json available = json::array();
+    if (include_available) {
+        // Only list downloaded models by default — listing the full registry
+        // (hundreds of entries) would blow up context for the client model.
+        for (const auto& [model_id, info] : downloaded) {
+            json entry = {
+                {"model_name", model_id},
+                {"recipe", info.recipe},
+                {"downloaded", info.downloaded},
+                {"suggested", info.suggested},
+                {"labels", info.labels},
+            };
+            if (info.size > 0.0) entry["size_gb"] = info.size;
+            available.push_back(std::move(entry));
+        }
+    }
+
+    // Suggested-but-not-downloaded: what the user is invited to `pull` next.
+    // Distinct from `available` so the client can clearly tell the user
+    // "you don't have a good model loaded yet; consider pulling X".
+    json suggested_to_pull = json::array();
+    if (include_suggested) {
+        for (const auto& [model_id, info] : model_manager_->get_supported_models()) {
+            if (!info.suggested) continue;
+            if (downloaded.count(model_id)) continue;  // Already in `available`.
+            json entry = {
+                {"model_name", model_id},
+                {"recipe", info.recipe},
+                {"labels", info.labels},
+            };
+            if (info.size > 0.0) entry["size_gb"] = info.size;
+            suggested_to_pull.push_back(std::move(entry));
+        }
+    }
+
+    // Pick a recommended default: an LLM that's already loaded if possible,
+    // otherwise the most recently loaded model of any type. This is what the
+    // client should pass to `lemonade_chat` if it has no other preference.
+    std::string recommended;
+    for (const auto& m : loaded) {
+        if (m.value("type", std::string()) == "llm") {
+            recommended = m.value("model_name", std::string());
+            break;
+        }
+    }
+    if (recommended.empty() && !loaded.empty()) {
+        recommended = loaded.back().value("model_name", std::string());
+    }
+
+    json payload = {
+        {"loaded", std::move(loaded)},
+        {"available", std::move(available)},
+        {"suggested_to_pull", std::move(suggested_to_pull)},
+        {"recommended_chat_model", recommended},
+    };
+
+    // Lead with a human-readable summary so the client model can act on it
+    // without parsing JSON; follow with the full structured payload.
+    std::string summary;
+    if (payload["loaded"].empty()) {
+        summary = "No models are currently loaded. ";
+    } else {
+        summary = "Loaded models: ";
+        bool first = true;
+        for (const auto& m : payload["loaded"]) {
+            if (!first) summary += ", ";
+            summary += m.value("model_name", std::string());
+            summary += " (" + m.value("type", std::string()) + ")";
+            first = false;
+        }
+        summary += ". ";
+    }
+    if (!recommended.empty()) {
+        summary += "Use `" + recommended + "` for chat unless the user asks otherwise.";
+    } else if (!payload["suggested_to_pull"].empty()) {
+        summary += "No loaded LLM. Suggested models to pull: ";
+        bool first = true;
+        for (const auto& m : payload["suggested_to_pull"]) {
+            if (!first) summary += ", ";
+            summary += m.value("model_name", std::string());
+            first = false;
+        }
+        summary += ".";
+    }
+
+    return json{
+        {"content", json::array({
+            text_content_block(summary),
+            text_content_block(payload.dump()),
+        })},
+        {"isError", false},
+    };
+}
+
 // =============================================================================
 // Tool catalogue (consumed by tools/list)
 // =============================================================================
@@ -585,17 +694,43 @@ json McpServer::tool_generate_image(const json& arguments) {
 json McpServer::tools_descriptor() {
     return json::array({
         {
+            {"name", "lemonade_list_models"},
+            {"description",
+             "List models known to the Lemonade server. ALWAYS call this "
+             "first if you don't already know the exact model name to use "
+             "for chat/embed/transcribe/etc — passing a wrong name to the "
+             "other tools may trigger a multi-GB download. Returns a summary "
+             "text block plus a JSON block with `{loaded: [...], available: "
+             "[...], suggested_to_pull: [...], recommended_chat_model: "
+             "\"...\"}`. `loaded` is models currently in memory; `available` "
+             "is models already downloaded to disk (each entry includes a "
+             "`suggested` boolean); `suggested_to_pull` is curated models "
+             "the user could download next; `recommended_chat_model` is the "
+             "best loaded LLM to use for `lemonade_chat`."},
+            {"inputSchema", {
+                {"type", "object"},
+                {"properties", {
+                    {"include_available", {{"type", "boolean"},
+                                           {"description", "Include downloaded-but-not-loaded models in the response. Default true."}}},
+                    {"include_suggested", {{"type", "boolean"},
+                                           {"description", "Include the curated `suggested_to_pull` list of recommended models not yet downloaded. Default true."}}},
+                }},
+            }},
+        },
+        {
             {"name", "lemonade_chat"},
             {"description",
              "Chat completion against a locally hosted LLM. Pass a `messages` "
              "array (OpenAI chat format) and the model name. Returns the "
-             "assistant text response."},
+             "assistant text response. If you don't know which model name to "
+             "use, call `lemonade_list_models` first — passing a model that "
+             "isn't loaded may trigger a multi-GB download."},
             {"inputSchema", {
                 {"type", "object"},
                 {"required", json::array({"model", "messages"})},
                 {"properties", {
                     {"model",       {{"type", "string"},
-                                     {"description", "Lemonade model name (e.g. Qwen3-0.6B-GGUF)"}}},
+                                     {"description", "Lemonade model name. Call `lemonade_list_models` to see what is loaded."}}},
                     {"messages",    {{"type", "array"},
                                      {"description", "OpenAI-format chat messages"},
                                      {"items", {{"type", "object"}}}}},
