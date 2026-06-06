@@ -24,7 +24,11 @@ COPY . /app
 WORKDIR /app
 
 # Build the project
+# Normalize source mtimes first to avoid Ninja "manifest still dirty" loops
+# caused by file(GLOB) re-detecting sources newer than build.ninja on some
+# filesystems (notably Docker Desktop on Windows/WSL2).
 RUN rm -rf build && \
+    find /app -exec touch -t 200001010000 {} + && \
     cmake --preset default && \
     cmake --build --preset default web-app
 
@@ -79,6 +83,10 @@ RUN FLM_VERSION=$(jq -r '.flm.npu' ./resources/backend_versions.json) && \
 
 # Make executables executable
 RUN chmod +x ./lemond ./lemonade
+
+# Expose the lemond/lemonade binaries on PATH so `docker exec` users can run
+# them (e.g. `lemonade list`, `lemonade pull`) without needing the full path.
+ENV PATH="/opt/lemonade:${PATH}"
 
 # Create necessary directories
 RUN mkdir -p /opt/lemonade/llama/cpu \
