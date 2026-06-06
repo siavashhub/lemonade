@@ -585,6 +585,37 @@ json McpServer::tool_generate_image(const json& arguments) {
     const std::string model = extract_string_arg(arguments, "model");
     const std::string prompt = extract_string_arg(arguments, "prompt");
 
+    // Optional disk-output mode. The MCP server is documented as same-machine
+    // only, and MCP image content blocks (inline base64 PNGs) cost tens of
+    // thousands of tokens per image and surface as opaque resource URIs in
+    // some clients (e.g. VS Code) that the agent then has to round-trip back
+    // out to disk. Letting the caller name the destination skips both
+    // problems — symmetric with `lemonade_transcribe_audio`'s `audio_path`.
+    const bool has_output_path = arguments.contains("output_path") &&
+                                 arguments["output_path"].is_string();
+    const bool has_output_dir  = arguments.contains("output_dir") &&
+                                 arguments["output_dir"].is_string();
+    if (has_output_path && has_output_dir) {
+        throw std::runtime_error(
+            "Provide at most one of `output_path` or `output_dir`, not both.");
+    }
+    std::filesystem::path output_path;
+    std::filesystem::path output_dir;
+    if (has_output_path) {
+        output_path = arguments["output_path"].get<std::string>();
+        if (!output_path.is_absolute()) {
+            throw std::runtime_error(
+                "`output_path` must be an absolute path: " + output_path.string());
+        }
+    }
+    if (has_output_dir) {
+        output_dir = arguments["output_dir"].get<std::string>();
+        if (!output_dir.is_absolute()) {
+            throw std::runtime_error(
+                "`output_dir` must be an absolute path: " + output_dir.string());
+        }
+    }
+
     ensure_loaded_(model);
 
     json router_request = {
@@ -606,20 +637,95 @@ json McpServer::tool_generate_image(const json& arguments) {
         throw std::runtime_error(response["error"].value("message", "image generation failed"));
     }
 
-    json content = json::array();
+    std::vector<std::string> b64_images;
     if (response.contains("data") && response["data"].is_array()) {
         for (const auto& entry : response["data"]) {
             if (!entry.contains("b64_json") || !entry["b64_json"].is_string()) continue;
+            b64_images.push_back(entry["b64_json"].get<std::string>());
+        }
+    }
+    if (b64_images.empty()) {
+        throw std::runtime_error("Image generation returned no images");
+    }
+
+    // Inline mode (no path requested): original behavior — return MCP image
+    // content blocks with inline base64.
+    if (!has_output_path && !has_output_dir) {
+        json content = json::array();
+        for (const auto& b64 : b64_images) {
             content.push_back({
                 {"type", "image"},
-                {"data", entry["b64_json"]},
+                {"data", b64},
                 {"mimeType", "image/png"},
             });
         }
+        return json{
+            {"content", std::move(content)},
+            {"isError", false},
+        };
     }
-    if (content.empty()) {
-        throw std::runtime_error("Image generation returned no images");
+
+    // Disk mode: decode and write the PNG(s), then return path(s) as text.
+    if (has_output_path && b64_images.size() > 1) {
+        throw std::runtime_error(
+            "`output_path` only supports a single image; use `output_dir` "
+            "when n > 1.");
     }
+
+    std::vector<std::filesystem::path> written;
+    written.reserve(b64_images.size());
+    std::error_code ec;
+    if (has_output_dir) {
+        std::filesystem::create_directories(output_dir, ec);
+        if (ec) {
+            throw std::runtime_error(
+                "Failed to create output_dir " + output_dir.string() + ": " + ec.message());
+        }
+    } else {
+        auto parent = output_path.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent, ec);
+            if (ec) {
+                throw std::runtime_error(
+                    "Failed to create parent of output_path " + parent.string() + ": " + ec.message());
+            }
+        }
+    }
+
+    for (size_t i = 0; i < b64_images.size(); ++i) {
+        std::filesystem::path dest = has_output_path
+            ? output_path
+            : output_dir / ("image_" + std::to_string(i) + ".png");
+        std::string bytes = utils::JsonUtils::base64_decode(b64_images[i]);
+        if (bytes.empty()) {
+            throw std::runtime_error("Decoded image is empty (index " + std::to_string(i) + ")");
+        }
+        std::ofstream out(dest, std::ios::binary);
+        if (!out) {
+            throw std::runtime_error("Failed to open for writing: " + dest.string());
+        }
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        if (!out) {
+            throw std::runtime_error("Failed to write: " + dest.string());
+        }
+        written.push_back(std::filesystem::absolute(dest, ec));
+        if (ec) written.back() = dest;  // Fall back to as-given.
+    }
+
+    std::string summary = (written.size() == 1)
+        ? ("Wrote image to: " + written[0].string())
+        : ("Wrote " + std::to_string(written.size()) + " images:");
+    json content = json::array();
+    content.push_back(text_content_block(summary));
+    if (written.size() > 1) {
+        for (const auto& p : written) {
+            content.push_back(text_content_block(p.string()));
+        }
+    }
+    // Structured payload for programmatic callers.
+    json paths = json::array();
+    for (const auto& p : written) paths.push_back(p.string());
+    content.push_back(text_content_block(json{{"paths", std::move(paths)}}.dump()));
 
     return json{
         {"content", std::move(content)},
@@ -864,13 +970,26 @@ json McpServer::tools_descriptor() {
             {"name", "lemonade_generate_image"},
             {"description",
              "Generate one or more images from a text prompt with a locally "
-             "hosted image model. Always returns base64-encoded PNGs."},
+             "hosted image model. The Lemonade MCP server always runs on the "
+             "same machine as the caller, so PREFER writing the result "
+             "directly to disk by passing `output_path` (single image) or "
+             "`output_dir` (one or more). When you do, the tool returns the "
+             "absolute file path(s) as text — no base64 round-trip, no "
+             "client-specific resource URIs, and dramatically fewer tokens. "
+             "Only omit both arguments when you genuinely need the image "
+             "inline (e.g. to render it to the user in a chat UI); in that "
+             "case the tool returns MCP image content blocks with "
+             "base64-encoded PNGs."},
             {"inputSchema", {
                 {"type", "object"},
                 {"required", json::array({"model", "prompt"})},
                 {"properties", {
                     {"model",  {{"type", "string"}}},
                     {"prompt", {{"type", "string"}}},
+                    {"output_path", {{"type", "string"},
+                                     {"description", "Absolute path of the PNG file to write. Only valid when n == 1. Parent directory is created if needed. Preferred over inline base64."}}},
+                    {"output_dir",  {{"type", "string"},
+                                     {"description", "Absolute path of a directory to write image_0.png, image_1.png, ... into. Use this when n > 1. Directory is created if needed."}}},
                     {"size",   {{"type", "string"},
                                 {"description", "e.g. 512x512, 1024x1024"}}},
                     {"n",      {{"type", "integer"}, {"minimum", 1}}},
