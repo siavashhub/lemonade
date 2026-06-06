@@ -42,6 +42,39 @@ std::string extract_string_arg(const json& args, const char* key) {
     return args[key].get<std::string>();
 }
 
+// Some MCP clients (notably Claude Desktop) emit chat messages in
+// Anthropic's content-block form — `content: [{type:"text", text:"..."}]` —
+// instead of OpenAI's plain-string form. llama.cpp's chat endpoint silently
+// returns empty content when it sees the array form, which surfaces to the
+// user as a tool that "runs without errors but returns no output". Flatten
+// any text blocks back into a single string before forwarding.
+json normalize_messages(const json& messages) {
+    if (!messages.is_array()) return messages;
+    json out = json::array();
+    for (const auto& msg : messages) {
+        if (!msg.is_object() || !msg.contains("content") || !msg["content"].is_array()) {
+            out.push_back(msg);
+            continue;
+        }
+        json normalized = msg;
+        std::string text;
+        for (const auto& block : msg["content"]) {
+            if (block.is_string()) {
+                text += block.get<std::string>();
+            } else if (block.is_object() && block.value("type", std::string()) == "text" &&
+                       block.contains("text") && block["text"].is_string()) {
+                text += block["text"].get<std::string>();
+            }
+            // Non-text blocks (image, tool_use, tool_result, ...) are dropped:
+            // local LLM backends here don't accept multimodal/tool-call inputs
+            // anyway, and leaving them in produces the empty-response failure.
+        }
+        normalized["content"] = text;
+        out.push_back(std::move(normalized));
+    }
+    return out;
+}
+
 }  // namespace
 
 McpServer::McpServer(Router* router, ModelManager* model_manager, EnsureLoadedFn ensure_loaded)
@@ -283,7 +316,7 @@ json McpServer::tool_chat(const json& arguments) {
     // request/response, and any streaming output would be wasted.
     json openai_request = {
         {"model", model},
-        {"messages", arguments["messages"]},
+        {"messages", normalize_messages(arguments["messages"])},
         {"stream", false},
     };
 
