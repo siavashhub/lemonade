@@ -1,6 +1,9 @@
 #include "lemon/mcp_server.h"
 
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -440,8 +443,52 @@ json McpServer::tool_embed(const json& arguments) {
 
 json McpServer::tool_transcribe_audio(const json& arguments) {
     const std::string model = extract_string_arg(arguments, "model");
-    const std::string audio_b64 = extract_string_arg(arguments, "audio_base64");
-    const std::string filename = arguments.value("filename", std::string("audio.wav"));
+
+    // Accept either a local file path (preferred — this server only ever runs
+    // on the same machine as the caller, so shipping multi-MB WAVs through a
+    // base64-encoded JSON-RPC argument is wasteful) or inline base64. Agents
+    // overwhelmingly reach for `audio_path` first; if we only accepted
+    // `audio_base64`, the typical first attempt was to jam the path string
+    // into that field and get an "Empty audio data" failure downstream.
+    std::string audio_data;
+    std::string filename = arguments.value("filename", std::string());
+    const bool has_path = arguments.contains("audio_path") && arguments["audio_path"].is_string();
+    const bool has_b64  = arguments.contains("audio_base64") && arguments["audio_base64"].is_string();
+    if (!has_path && !has_b64) {
+        throw std::runtime_error(
+            "Provide either `audio_path` (path to a local audio file) or "
+            "`audio_base64` (base64-encoded audio bytes).");
+    }
+    if (has_path) {
+        const std::string path = arguments["audio_path"].get<std::string>();
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec) || ec) {
+            throw std::runtime_error("audio_path not found: " + path);
+        }
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            throw std::runtime_error("Failed to open audio_path: " + path);
+        }
+        std::ostringstream buf;
+        buf << in.rdbuf();
+        audio_data = buf.str();
+        if (audio_data.empty()) {
+            throw std::runtime_error("audio_path is empty: " + path);
+        }
+        if (filename.empty()) {
+            filename = std::filesystem::path(path).filename().string();
+        }
+    } else {
+        audio_data = utils::JsonUtils::base64_decode(arguments["audio_base64"].get<std::string>());
+        if (audio_data.empty()) {
+            throw std::runtime_error(
+                "audio_base64 decoded to zero bytes. If you meant to pass a "
+                "file path, use the `audio_path` argument instead.");
+        }
+        if (filename.empty()) {
+            filename = "audio.wav";
+        }
+    }
 
     ensure_loaded_(model);
 
@@ -449,7 +496,7 @@ json McpServer::tool_transcribe_audio(const json& arguments) {
     // (matching how handle_audio_transcriptions stuffs the multipart upload).
     json router_request = {
         {"model", model},
-        {"file_data", utils::JsonUtils::base64_decode(audio_b64)},
+        {"file_data", std::move(audio_data)},
         {"filename", filename},
     };
     for (const char* key : {"language", "prompt", "response_format", "temperature"}) {
@@ -769,18 +816,25 @@ json McpServer::tools_descriptor() {
         {
             {"name", "lemonade_transcribe_audio"},
             {"description",
-             "Transcribe an audio clip with a Whisper-class model. Audio must "
-             "be base64-encoded. Returns the transcript as the first text "
-             "block, followed by the full OpenAI-shaped JSON response."},
+             "Transcribe an audio clip with a Whisper-class model. The "
+             "Lemonade MCP server always runs on the same machine as the "
+             "caller, so prefer `audio_path` (an absolute path to a local "
+             "audio file: wav, mp3, m4a, ogg, flac, webm). Use "
+             "`audio_base64` only when you genuinely have audio bytes in "
+             "memory and no path on disk. Exactly one of the two must be "
+             "provided. Returns the transcript as the first text block, "
+             "followed by the full OpenAI-shaped JSON response."},
             {"inputSchema", {
                 {"type", "object"},
-                {"required", json::array({"model", "audio_base64"})},
+                {"required", json::array({"model"})},
                 {"properties", {
                     {"model",         {{"type", "string"}}},
+                    {"audio_path",    {{"type", "string"},
+                                       {"description", "Absolute path to a local audio file. Preferred over audio_base64."}}},
                     {"audio_base64",  {{"type", "string"},
-                                       {"description", "Audio file bytes, base64-encoded"}}},
+                                       {"description", "Audio file bytes, base64-encoded. Only use when you already have raw bytes in memory."}}},
                     {"filename",      {{"type", "string"},
-                                       {"description", "Hint for content type (e.g. \"clip.wav\")"}}},
+                                       {"description", "Optional override for the upload filename; used to infer content type. Defaults to the basename of audio_path."}}},
                     {"language",      {{"type", "string"}}},
                     {"prompt",        {{"type", "string"}}},
                     {"response_format", {{"type", "string"},
