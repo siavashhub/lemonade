@@ -323,10 +323,21 @@ json McpServer::tool_chat(const json& arguments) {
     // Forward common optional knobs verbatim.
     for (const char* key : {"temperature", "top_p", "max_tokens", "stop",
                             "seed", "presence_penalty", "frequency_penalty",
-                            "tools", "tool_choice", "response_format"}) {
+                            "tools", "tool_choice", "response_format",
+                            "chat_template_kwargs"}) {
         if (arguments.contains(key)) {
             openai_request[key] = arguments[key];
         }
+    }
+
+    // Reasoning models (Qwen3, DeepSeek-R1, ...) emit a <think> block by
+    // default. For MCP tool calls this is doubly bad: clients send small
+    // max_tokens budgets that get consumed by the think block (leaving
+    // `content` empty), and the reasoning trace is discarded by the caller
+    // anyway. Disable thinking by default; allow callers to opt back in via
+    // chat_template_kwargs.enable_thinking=true.
+    if (!openai_request.contains("chat_template_kwargs")) {
+        openai_request["chat_template_kwargs"] = {{"enable_thinking", false}};
     }
 
     json response = router_->chat_completion(openai_request);
@@ -338,13 +349,28 @@ json McpServer::tool_chat(const json& arguments) {
     // calls, attach them as a second text block (JSON-stringified) so MCP
     // clients can see them — MCP doesn't have a first-class tool_call content
     // type, so embedding as JSON text is the standard convention.
+    //
+    // Reasoning-model fallback: Qwen3 and similar models split output into
+    // `content` (final answer) and `reasoning_content` (the <think> block).
+    // When a small max_tokens budget is exhausted before the model exits the
+    // thinking phase, `content` is empty. Returning empty text to the MCP
+    // client looks like a broken server, so fall back to reasoning_content
+    // (with a marker) instead of silently dropping the output.
     std::string assistant_text;
+    std::string reasoning_text;
+    std::string finish_reason;
     json tool_calls;
     if (response.contains("choices") && response["choices"].is_array() &&
         !response["choices"].empty()) {
-        const auto& message = response["choices"][0].value("message", json::object());
+        const auto& choice = response["choices"][0];
+        finish_reason = choice.value("finish_reason", std::string());
+        const auto& message = choice.value("message", json::object());
         if (message.contains("content") && message["content"].is_string()) {
             assistant_text = message["content"].get<std::string>();
+        }
+        if (message.contains("reasoning_content") &&
+            message["reasoning_content"].is_string()) {
+            reasoning_text = message["reasoning_content"].get<std::string>();
         }
         if (message.contains("tool_calls")) {
             tool_calls = message["tool_calls"];
@@ -352,7 +378,16 @@ json McpServer::tool_chat(const json& arguments) {
     }
 
     json content = json::array();
-    content.push_back(text_content_block(assistant_text));
+    if (assistant_text.empty() && !reasoning_text.empty()) {
+        // No final answer — surface the reasoning so the client sees something
+        // useful (and a hint that max_tokens was likely too small).
+        std::string note = "[reasoning only";
+        if (finish_reason == "length") note += "; finish_reason=length";
+        note += "]\n";
+        content.push_back(text_content_block(note + reasoning_text));
+    } else {
+        content.push_back(text_content_block(assistant_text));
+    }
     if (!tool_calls.is_null() && !tool_calls.empty()) {
         content.push_back(text_content_block(
             std::string("tool_calls: ") + tool_calls.dump()));
@@ -574,6 +609,8 @@ json McpServer::tools_descriptor() {
                                      {"items", {{"type", "object"}}}}},
                     {"tool_choice", {{"description", "auto | none | required | {type: function, ...}"}}},
                     {"response_format", {{"type", "object"}}},
+                    {"chat_template_kwargs", {{"type", "object"},
+                                              {"description", "Pass-through kwargs for the model's chat template (e.g. {\"enable_thinking\": true} to enable reasoning blocks; disabled by default for MCP)"}}},
                 }},
             }},
         },
