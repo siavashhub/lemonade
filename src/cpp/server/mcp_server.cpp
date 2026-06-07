@@ -3,6 +3,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -616,6 +617,18 @@ json McpServer::tool_omni(const json& arguments) {
         }
     }
 
+    // Serialize concurrent lemonade_omni invocations process-wide. The
+    // planner emits jinja-templated chat completions with a long system
+    // prompt + multiple tool definitions; llama-server (Vulkan + MTP draft
+    // + mmproj) can crash when several such requests land on it in
+    // parallel. The crash is silent and lemond doesn't notice the dead
+    // child, so follow-up calls surface as `CURL error: Couldn't connect
+    // to server`. A function-local mutex keeps a single planner in flight
+    // and avoids the trigger entirely; other MCP tools fan out to separate
+    // backends and are unaffected.
+    static std::mutex omni_serial_mutex;
+    std::lock_guard<std::mutex> omni_lock(omni_serial_mutex);
+
     // ensure_loaded_ dispatches to ensure_collection_loaded() under the hood
     // when the recipe is `collection.omni`, so this pulls down + loads every
     // component (planner LLM, image model, TTS voice, ...).
@@ -638,6 +651,38 @@ json McpServer::tool_omni(const json& arguments) {
     CollectionOrchestrator orchestrator(*router_, *model_manager_, ensure_loaded_);
     CollectionOrchestrator::ChatParts parts =
         orchestrator.chat_completion_parts(openai_request, info);
+
+    // Recover from a backend that died between requests. The router's
+    // liveness check is handle-presence only, so a crashed subprocess stays
+    // registered as loaded and `forward_request` hits a closed port. If we
+    // see a transport-level failure, evict the collection's components and
+    // retry the orchestrator once.
+    auto looks_like_backend_died = [](const std::string& msg) {
+        static constexpr const char* kMarkers[] = {
+            "CURL error",
+            "Network error",
+            "Couldn't connect",
+            "Failure when receiving",
+        };
+        for (const char* marker : kMarkers) {
+            if (msg.find(marker) != std::string::npos) return true;
+        }
+        return false;
+    };
+    if (!parts.ok && looks_like_backend_died(parts.error_message)) {
+        LOG(WARNING, "McpServer")
+            << "Omni: backend looks dead (" << parts.error_message
+            << "); evicting components and retrying once" << std::endl;
+        for (const auto& component : info.components) {
+            try {
+                router_->unload_model(component);
+            } catch (const std::exception&) {
+                // Not loaded -> nothing to evict, fine.
+            }
+        }
+        ensure_loaded_(model);
+        parts = orchestrator.chat_completion_parts(openai_request, info);
+    }
 
     if (!parts.ok) {
         return json{
