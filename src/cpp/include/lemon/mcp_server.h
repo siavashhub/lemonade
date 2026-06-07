@@ -16,8 +16,8 @@ using json = nlohmann::json;
 
 // MCP gateway: JSON-RPC 2.0 over HTTP (Streamable HTTP transport, spec 2025-06-18).
 //
-// /mcp is an INTENTIONAL EXCEPTION to the quad-prefix invariant (AGENTS.md #1):
-// the MCP spec mandates a single endpoint URL. Same precedent as Ollama and Anthropic.
+// /mcp is an INTENTIONAL EXCEPTION to the quad-prefix invariant:
+// the MCP spec mandates a single endpoint URL.
 class McpServer : public std::enable_shared_from_this<McpServer> {
 public:
     using EnsureLoadedFn = std::function<void(const std::string&)>;
