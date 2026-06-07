@@ -161,7 +161,7 @@ class McpGatewayTests(ServerTestBase):
         self.assertEqual(body["result"], {})
 
     def test_012_tools_list(self):
-        """tools/list must include the four gateway tools, each with a schema."""
+        """tools/list must include the five gateway tools, each with a schema."""
         response = _post({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
         body = response.json()
         tools = body["result"]["tools"]
@@ -171,12 +171,21 @@ class McpGatewayTests(ServerTestBase):
             "lemonade_chat",
             "lemonade_transcribe_audio",
             "lemonade_generate_image",
+            "lemonade_omni",
         }
         self.assertTrue(expected.issubset(names), f"missing tools: {expected - names}")
         for tool in tools:
             self.assertIn("description", tool)
             self.assertIn("inputSchema", tool)
             self.assertEqual(tool["inputSchema"]["type"], "object")
+
+        # lemonade_omni's only required arg is `messages`; `model` is optional
+        # so callers can fall back to the default (LMX-Omni-5.5B-Lite).
+        omni = next(t for t in tools if t["name"] == "lemonade_omni")
+        required = set(omni["inputSchema"].get("required", []))
+        self.assertEqual(required, {"messages"})
+        self.assertIn("model", omni["inputSchema"]["properties"])
+        self.assertIn("output_dir", omni["inputSchema"]["properties"])
 
     # ---------------------------------------------------------------------
     # tools/call error paths
@@ -208,6 +217,52 @@ class McpGatewayTests(ServerTestBase):
         )
         body = response.json()
         self.assertTrue(body["result"]["isError"])
+
+    def test_022_omni_rejects_non_collection_model(self):
+        """
+        lemonade_omni must reject a plain LLM (recipe != collection.omni) with
+        isError=true, pointing the caller at lemonade_chat. Uses the tiny test
+        model that's already pulled in setUpClass — no extra download.
+        """
+        response = _post(
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "lemonade_omni",
+                    "arguments": {
+                        "model": ENDPOINT_TEST_MODEL,
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                },
+            }
+        )
+        body = response.json()
+        self.assertTrue(body["result"]["isError"], msg=str(body))
+        text = body["result"]["content"][0]["text"]
+        self.assertIn("Omni collection", text)
+        self.assertIn("lemonade_chat", text)
+
+    def test_023_omni_rejects_unknown_model(self):
+        """Unknown model name must surface as isError=true, not a 404."""
+        response = _post(
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "lemonade_omni",
+                    "arguments": {
+                        "model": "definitely-not-a-real-model",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                },
+            }
+        )
+        body = response.json()
+        self.assertTrue(body["result"]["isError"], msg=str(body))
+        self.assertIn("Unknown model", body["result"]["content"][0]["text"])
 
     # ---------------------------------------------------------------------
     # Live tool invocations

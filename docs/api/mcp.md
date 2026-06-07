@@ -110,6 +110,34 @@ Generate one or more PNGs from a prompt. **Prefer writing to disk** via `output_
 
 When disk paths are provided, returns text block(s) with the absolute path(s). Otherwise, returns one inline image content block per image (`{"type":"image", "data":"<base64>", "mimeType":"image/png"}`).
 
+### `lemonade_omni`
+
+One-shot multimodal turn against a **Lemonade Omni collection** (a model bundle that pairs a planner LLM with an image model, an image-edit model, and a TTS voice under a single `collection.omni` recipe — see [the Omni docs](../dev/lemonade-omni.md)). The server runs the orchestrator's internal tool-calling loop, executes the collection's `generate_image` / `edit_image` / `text_to_speech` tools by routing to the bundled components, and returns the result as a text block plus native MCP `image` / `audio` content blocks — one per artifact, in the order they were produced.
+
+`model` is **optional** and defaults to `LMX-Omni-5.5B-Lite` (smaller and faster). Pass `model` explicitly to opt into a larger collection (e.g. `LMX-Omni-52B-Halo` on capable hardware) or any other `collection.omni` model surfaced by `lemonade_list_models`. The collection is downloaded on first use and may be multi-GB.
+
+Use `lemonade_chat` instead when you only need plain-text LLM output and don't want the planner-loop overhead.
+
+```json
+{
+  "name": "lemonade_omni",
+  "arguments": {
+    "messages": [
+      {"role": "user", "content": "Generate an image of a lemon car, then read out a one-line description."}
+    ],
+    "output_dir": "C:/out/omni"
+  }
+}
+```
+
+**Disk vs. inline output.** A single Omni turn can produce both images and audio in arbitrary order. Pass an absolute `output_dir` to write each artifact to disk as `omni_0.<ext>`, `omni_1.<ext>`, ... (the tool returns one text block per artifact with its absolute path, plus a JSON-stringified `paths` array). This is strongly preferred over inline base64 for the same reasons documented under `lemonade_generate_image` — and is the **only** way to get audio out on clients that don't render `audio` content blocks.
+
+When `output_dir` is omitted, artifacts are inlined as MCP content blocks: `{"type":"image", "data":"<base64>", "mimeType":"image/png"}` and `{"type":"audio", "data":"<base64>", "mimeType":"audio/mpeg"}`.
+
+If the planner emits app-defined tool calls (those you passed in via `tools`/`tool_choice`), an extra text block `tool_calls: <json>` is appended, matching `lemonade_chat`'s passthrough semantics.
+
+Passing a non-collection model (e.g. a plain LLM) returns `isError: true` with a hint to use `lemonade_chat`.
+
 ## Error model
 
 | Code | Meaning |

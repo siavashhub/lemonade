@@ -40,6 +40,7 @@ private:
     json tool_chat(const json& arguments);
     json tool_transcribe_audio(const json& arguments);
     json tool_generate_image(const json& arguments);
+    json tool_omni(const json& arguments);
     json tool_list_models(const json& arguments);
 
     static json tools_descriptor();

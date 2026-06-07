@@ -10,6 +10,8 @@
 
 #include <lemon/utils/aixlog.hpp>
 
+#include "lemon/collection_orchestrator.h"
+#include "lemon/model_types.h"
 #include "lemon/utils/json_utils.h"
 #include "lemon/version.h"
 
@@ -25,6 +27,11 @@ constexpr int kJsonRpcInternalError   = -32603;
 
 constexpr const char* kMcpProtocolVersion = "2025-06-18";
 constexpr const char* kServerName = "lemonade-mcp";
+
+// Default model for `lemonade_omni`: the smaller of the two stock Omni
+// collections (~5.5B). The 52B "Halo" build is preferable on capable hardware
+// but is a multi-GB download; users opt into it by passing `model` explicitly.
+constexpr const char* kDefaultOmniModel = "LMX-Omni-5.5B-Lite";
 
 bool is_notification(const json& message) {
     return !message.contains("id");
@@ -236,6 +243,8 @@ json McpServer::handle_tools_call(const json& params, const json& id) {
             result = tool_transcribe_audio(arguments);
         } else if (tool_name == "lemonade_generate_image") {
             result = tool_generate_image(arguments);
+        } else if (tool_name == "lemonade_omni") {
+            result = tool_omni(arguments);
         } else if (tool_name == "lemonade_list_models") {
             result = tool_list_models(arguments);
         } else {
@@ -557,6 +566,181 @@ json McpServer::tool_generate_image(const json& arguments) {
     };
 }
 
+json McpServer::tool_omni(const json& arguments) {
+    // `model` is optional — default to LMX-Omni-5.5B-Lite. The 52B "Halo"
+    // build is preferable on capable hardware but is a multi-GB download,
+    // so users opt into it (or any other collection) explicitly.
+    const std::string model = arguments.contains("model") && arguments["model"].is_string()
+                                  ? arguments["model"].get<std::string>()
+                                  : std::string(kDefaultOmniModel);
+
+    if (!arguments.contains("messages") || !arguments["messages"].is_array()) {
+        throw std::runtime_error("Missing or non-array argument: messages");
+    }
+
+    if (!model_manager_->model_exists(model)) {
+        return json{
+            {"content", json::array({text_content_block(
+                "Unknown model '" + model +
+                "'. Call `lemonade_list_models` to discover available Omni "
+                "collections (recipe = collection.omni), or omit `model` to "
+                "use the default (" + std::string(kDefaultOmniModel) + ").")})},
+            {"isError", true},
+        };
+    }
+
+    ModelInfo info = model_manager_->get_model_info(model);
+    if (!is_collection_recipe(info.recipe)) {
+        return json{
+            {"content", json::array({text_content_block(
+                "Model '" + model + "' is not an Omni collection (recipe='" +
+                info.recipe + "'). Use `lemonade_chat` for plain LLMs, or "
+                "pass an Omni collection name (e.g. " +
+                std::string(kDefaultOmniModel) + ").")})},
+            {"isError", true},
+        };
+    }
+
+    // Optional disk-output mode. MCP image/audio content blocks cost tens of
+    // thousands of tokens per artifact; the same disk-mode reasoning as
+    // `lemonade_generate_image` applies, plus a single Omni turn can emit
+    // mixed media (one image + one TTS clip), so we only accept `output_dir`.
+    const bool has_output_dir = arguments.contains("output_dir") &&
+                                arguments["output_dir"].is_string();
+    std::filesystem::path output_dir;
+    if (has_output_dir) {
+        output_dir = arguments["output_dir"].get<std::string>();
+        if (!output_dir.is_absolute()) {
+            throw std::runtime_error(
+                "`output_dir` must be an absolute path: " + output_dir.string());
+        }
+    }
+
+    // ensure_loaded_ dispatches to ensure_collection_loaded() under the hood
+    // when the recipe is `collection.omni`, so this pulls down + loads every
+    // component (planner LLM, image model, TTS voice, ...).
+    ensure_loaded_(model);
+
+    json openai_request = {
+        {"model", model},
+        {"messages", normalize_messages(arguments["messages"])},
+        {"stream", false},
+    };
+    for (const char* key : {"temperature", "top_p", "max_tokens", "stop",
+                            "seed", "presence_penalty", "frequency_penalty",
+                            "tools", "tool_choice", "response_format",
+                            "chat_template_kwargs"}) {
+        if (arguments.contains(key)) {
+            openai_request[key] = arguments[key];
+        }
+    }
+
+    CollectionOrchestrator orchestrator(*router_, *model_manager_, ensure_loaded_);
+    CollectionOrchestrator::ChatParts parts =
+        orchestrator.chat_completion_parts(openai_request, info);
+
+    if (!parts.ok) {
+        return json{
+            {"content", json::array({text_content_block(
+                std::string("Omni run failed: ") + parts.error_message)})},
+            {"isError", true},
+        };
+    }
+
+    // Disk mode: create the directory once, up front, so artifact writes
+    // below get a clean error if it's invalid.
+    if (has_output_dir && !parts.artifacts.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(output_dir, ec);
+        if (ec) {
+            throw std::runtime_error(
+                "Failed to create output_dir " + output_dir.string() + ": " + ec.message());
+        }
+    }
+
+    json content = json::array();
+
+    // Text first — always emit a block (possibly empty) so clients that index
+    // by position see a consistent shape.
+    content.push_back(text_content_block(parts.final_text));
+
+    auto extension_for = [](const std::string& mime) -> std::string {
+        if (mime == "image/png")  return ".png";
+        if (mime == "image/jpeg") return ".jpg";
+        if (mime == "audio/mpeg") return ".mp3";
+        if (mime == "audio/wav")  return ".wav";
+        return ".bin";
+    };
+
+    json written_paths = json::array();
+    for (size_t i = 0; i < parts.artifacts.size(); ++i) {
+        const auto& artifact = parts.artifacts[i];
+
+        if (has_output_dir) {
+            std::filesystem::path dest =
+                output_dir / ("omni_" + std::to_string(i) + extension_for(artifact.mime));
+            std::string bytes = utils::JsonUtils::base64_decode(artifact.data);
+            if (bytes.empty()) {
+                throw std::runtime_error(
+                    "Decoded artifact is empty (index " + std::to_string(i) + ")");
+            }
+            std::ofstream out(dest, std::ios::binary);
+            if (!out) {
+                throw std::runtime_error("Failed to open for writing: " + dest.string());
+            }
+            out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            if (!out) {
+                throw std::runtime_error("Failed to write: " + dest.string());
+            }
+            std::error_code ec;
+            auto abs = std::filesystem::absolute(dest, ec);
+            if (ec) abs = dest;
+            content.push_back(text_content_block(
+                artifact.type + " -> " + abs.string()));
+            written_paths.push_back(abs.string());
+            continue;
+        }
+
+        // Inline mode: native MCP image/audio content blocks. Non-Open-WebUI
+        // clients (Claude Desktop, Inspector, ...) cannot render markdown
+        // data URIs, so these blocks — not the orchestrator's rendered
+        // chat.completion content — are the right transport.
+        if (artifact.type == "image") {
+            content.push_back({
+                {"type", "image"},
+                {"data", artifact.data},
+                {"mimeType", artifact.mime},
+            });
+        } else if (artifact.type == "audio") {
+            content.push_back({
+                {"type", "audio"},
+                {"data", artifact.data},
+                {"mimeType", artifact.mime},
+            });
+        } else {
+            // Unknown artifact kind — fall back to text rather than dropping it.
+            content.push_back(text_content_block(
+                "[unrenderable artifact type=" + artifact.type +
+                " mime=" + artifact.mime + "]"));
+        }
+    }
+
+    if (has_output_dir) {
+        content.push_back(text_content_block(
+            json{{"paths", std::move(written_paths)}}.dump()));
+    }
+
+    if (parts.app_tool_calls.is_array() && !parts.app_tool_calls.empty()) {
+        content.push_back(text_content_block(
+            std::string("tool_calls: ") + parts.app_tool_calls.dump()));
+    }
+
+    return json{
+        {"content", std::move(content)},
+        {"isError", false},
+    };
+}
+
 json McpServer::tool_list_models(const json& arguments) {
     const bool include_available = arguments.value("include_available", true);
     const bool include_suggested = arguments.value("include_suggested", true);
@@ -748,6 +932,45 @@ json McpServer::tools_descriptor() {
                     {"seed",   {{"type", "integer"}}},
                     {"steps",  {{"type", "integer"}}},
                     {"cfg_scale", {{"type", "number"}}},
+                }},
+            }},
+        },
+        {
+            {"name", "lemonade_omni"},
+            {"description",
+             "Multimodal turn against a Lemonade Omni collection (one tool "
+             "call -> text + images + speech in the same response). The "
+             "server runs an internal tool-calling loop against the "
+             "collection's planner LLM and executes its image / image-edit / "
+             "TTS tools by routing to the bundled component models; the "
+             "result comes back as a text block plus native MCP `image` / "
+             "`audio` content blocks (one per artifact). `model` is "
+             "optional — defaults to `LMX-Omni-5.5B-Lite` (smaller, faster). "
+             "Pass `model='LMX-Omni-52B-Halo'` (or any other "
+             "recipe='collection.omni' model from `lemonade_list_models`) "
+             "to opt into a larger collection; that model is downloaded on "
+             "first use and may be multi-GB. Same-machine deployment: PREFER "
+             "`output_dir` to write artifacts to disk and avoid expensive "
+             "inline base64 blobs. For plain text chat against a regular "
+             "LLM, use `lemonade_chat` instead."},
+            {"inputSchema", {
+                {"type", "object"},
+                {"required", json::array({"messages"})},
+                {"properties", {
+                    {"model",       {{"type", "string"},
+                                     {"description", "Optional. Omni collection name (recipe='collection.omni'). Defaults to LMX-Omni-5.5B-Lite."}}},
+                    {"messages",    {{"type", "array"}, {"items", {{"type", "object"}}}}},
+                    {"output_dir",  {{"type", "string"},
+                                     {"description", "Absolute path of a directory to write produced artifacts (omni_0.png, omni_1.mp3, ...) into. PREFER this to inline base64."}}},
+                    {"temperature", {{"type", "number"}}},
+                    {"top_p",       {{"type", "number"}}},
+                    {"max_tokens",  {{"type", "integer"}}},
+                    {"stop",        {{"description", "stop sequences (string or array)"}}},
+                    {"seed",        {{"type", "integer"}}},
+                    {"tools",       {{"type", "array"}, {"items", {{"type", "object"}}}}},
+                    {"tool_choice", {{"description", "auto | none | required | {type: function, ...}"}}},
+                    {"response_format", {{"type", "object"}}},
+                    {"chat_template_kwargs", {{"type", "object"}}},
                 }},
             }},
         },
