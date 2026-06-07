@@ -9,7 +9,7 @@ The gateway implements the **MCP "Streamable HTTP" transport** (spec version `20
 | `POST /mcp` | Supported | JSON-RPC 2.0 envelope. Accepts a single message or a batch array. |
 | `GET /mcp` | `405 Method Not Allowed` | Server-initiated SSE channel is not supported. |
 
-> **Why a single path?** The MCP specification mandates one endpoint URL per server, so `/mcp` is an intentional exception to Lemonade's quad-prefix convention. The same precedent applies to Ollama (`/api/*`) and Anthropic (`POST /v1/messages`).
+> **Why a single path?** The MCP specification mandates one endpoint URL per server, so `/mcp` is an intentional exception to Lemonade's quad-prefix convention.
 
 ## Authentication
 

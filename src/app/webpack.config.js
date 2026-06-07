@@ -58,14 +58,6 @@ module.exports = (env, argv) => ({
     static: {
       directory: __dirname,
       publicPath: '/',
-      watch: {
-        ignored: ['**/src-tauri/target/**'],
-      },
-    },
-    watchFiles: {
-      options: {
-        ignored: ['**/src-tauri/target/**'],
-      },
     },
   },
   plugins: [
