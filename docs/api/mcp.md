@@ -60,7 +60,7 @@ Chat completion against any LLM in the registry.
 {
   "name": "lemonade_chat",
   "arguments": {
-    "model": "Qwen3-8B-Hybrid",
+    "model": "Qwen3-1.7B-Hybrid",
     "messages": [
       {"role": "system", "content": "You are concise."},
       {"role": "user", "content": "Summarize MCP in one line."}
@@ -83,7 +83,7 @@ Transcribe a local audio file with a Whisper-class model. Prefer `audio_path` (t
 {
   "name": "lemonade_transcribe_audio",
   "arguments": {
-    "model": "Whisper-Large-v3",
+    "model": "Whisper-Large-v3-Turbo",
     "audio_path": "C:/clips/meeting.wav",
     "response_format": "verbose_json"
   }
@@ -143,5 +143,5 @@ curl -s http://localhost:13305/mcp -H "Content-Type: application/json" \
 
 # 3. Call lemonade_chat
 curl -s http://localhost:13305/mcp -H "Content-Type: application/json" \
-    -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lemonade_chat","arguments":{"model":"Qwen3-8B-Hybrid","messages":[{"role":"user","content":"hi"}],"max_tokens":16}}}'
+    -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lemonade_chat","arguments":{"model":"Qwen3-1.7B-Hybrid","messages":[{"role":"user","content":"hi"}],"max_tokens":16}}}'
 ```
