@@ -51,7 +51,7 @@ All core endpoints are registered under **4 path prefixes**:
 
 **Ollama-compatible endpoints** (under `/api/` without version prefix): `chat`, `generate`, `tags`, `show`, `delete`, `pull`, `embed`, `embeddings`, `ps`, `version`
 
-**Anthropic-compatible endpoint:** `POST /v1/messages` — supports message completion, tool use, and SSE streaming.
+**Anthropic-compatible endpoint:** `POST /api/messages` — supports message completion, tool use, and SSE streaming.
 
 **MCP gateway endpoint:** `POST /mcp` — Model Context Protocol (Streamable HTTP transport, spec `2025-06-18`). Single JSON-RPC 2.0 endpoint exposing 4 tools (`lemonade_list_models`, `lemonade_chat`, `lemonade_transcribe_audio`, `lemonade_generate_image`). GET returns 405.
 
