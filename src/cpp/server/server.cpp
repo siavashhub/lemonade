@@ -561,7 +561,7 @@ void Server::setup_routes(httplib::Server &web_server) {
     // Register MCP gateway (POST /mcp). NOTE: /mcp is an INTENTIONAL EXCEPTION
     // to the quad-prefix invariant (AGENTS.md #1) — the MCP spec mandates a
     // single endpoint URL. Same precedent as Ollama (/api/*) and Anthropic
-    // (POST /api/messages).
+    // (POST /v1/messages).
     auto mcp_server = std::make_shared<McpServer>(
         router_.get(),
         model_manager_.get(),

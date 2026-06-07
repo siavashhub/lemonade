@@ -51,7 +51,7 @@ All core endpoints are registered under **4 path prefixes**:
 
 **Ollama-compatible endpoints** (under `/api/` without version prefix): `chat`, `generate`, `tags`, `show`, `delete`, `pull`, `embed`, `embeddings`, `ps`, `version`
 
-**Anthropic-compatible endpoint:** `POST /api/messages` — supports message completion, tool use, and SSE streaming.
+**Anthropic-compatible endpoint:** `POST /v1/messages` — supports message completion, tool use, and SSE streaming.
 
 **MCP gateway endpoint:** `POST /mcp` — Model Context Protocol (Streamable HTTP transport, spec `2025-06-18`). Single JSON-RPC 2.0 endpoint exposing 4 tools (`lemonade_list_models`, `lemonade_chat`, `lemonade_transcribe_audio`, `lemonade_generate_image`). GET returns 405.
 
@@ -181,7 +181,7 @@ Test utilities in `test/utils/` with `server_base.py` as the base class. Test de
 
 These MUST be maintained in all changes:
 
-1. **Quad-prefix registration** — Every new endpoint MUST be registered under `/api/v0/`, `/api/v1/`, `/v0/`, AND `/v1/`. Documented exceptions: Ollama (`/api/*` without version prefix), Anthropic (`POST /api/messages`), and MCP (`POST /mcp`) — each of those protocols mandates a fixed URL shape that conflicts with the quad-prefix scheme.
+1. **Quad-prefix registration** — Every new endpoint MUST be registered under `/api/v0/`, `/api/v1/`, `/v0/`, AND `/v1/`. Documented exceptions: Ollama (`/api/*` without version prefix), Anthropic (`POST /v1/messages` only), and MCP (`POST /mcp`) — each of those protocols mandates a fixed URL shape that conflicts with the quad-prefix scheme.
 2. **NPU exclusivity** — Exclusive-NPU recipes (`ryzenai-llm`, `whispercpp` on NPU) evict ALL other NPU models before loading. FastFlowLM (`flm`) can coexist with other FLM types (max 1 per FLM type) but not with exclusive-NPU recipes.
 3. **WrappedServer contract** — New backends MUST implement all core virtual methods: `load()`, `unload()`, `chat_completion()`, `completion()`, `responses()`.
 4. **Subprocess model** — Backends run as subprocesses (llama-server, whisper-server, sd-server, koko, flm, ryzenai-server). They must NOT run in-process.
