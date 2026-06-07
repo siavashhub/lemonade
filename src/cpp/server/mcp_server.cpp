@@ -5,7 +5,6 @@
 #include <fstream>
 #include <sstream>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -18,23 +17,16 @@ namespace lemon {
 
 namespace {
 
-// JSON-RPC 2.0 error codes (https://www.jsonrpc.org/specification#error_object).
 constexpr int kJsonRpcParseError      = -32700;
 constexpr int kJsonRpcInvalidRequest  = -32600;
 constexpr int kJsonRpcMethodNotFound  = -32601;
 constexpr int kJsonRpcInvalidParams   = -32602;
 constexpr int kJsonRpcInternalError   = -32603;
 
-// MCP protocol version implemented by this server (the "Streamable HTTP"
-// transport, JSON-RPC 2.0 framing, tools capability only).
 constexpr const char* kMcpProtocolVersion = "2025-06-18";
-
-// Identity reported in the `initialize` response's `serverInfo`.
 constexpr const char* kServerName = "lemonade-mcp";
 
 bool is_notification(const json& message) {
-    // A JSON-RPC message is a notification if it has no `id` field. (A null
-    // id is still a valid request, but the spec discourages it.)
     return !message.contains("id");
 }
 
@@ -45,12 +37,10 @@ std::string extract_string_arg(const json& args, const char* key) {
     return args[key].get<std::string>();
 }
 
-// Some MCP clients (notably Claude Desktop) emit chat messages in
-// Anthropic's content-block form — `content: [{type:"text", text:"..."}]` —
-// instead of OpenAI's plain-string form. llama.cpp's chat endpoint silently
-// returns empty content when it sees the array form, which surfaces to the
-// user as a tool that "runs without errors but returns no output". Flatten
-// any text blocks back into a single string before forwarding.
+// Some MCP clients (notably Claude Desktop) emit chat messages in Anthropic's
+// content-block form — `content: [{type:"text", text:"..."}]` — instead of
+// OpenAI's plain-string form. llama.cpp silently returns empty content when it
+// sees the array form. Flatten any text blocks back into a single string.
 json normalize_messages(const json& messages) {
     if (!messages.is_array()) return messages;
     json out = json::array();
@@ -68,9 +58,6 @@ json normalize_messages(const json& messages) {
                        block.contains("text") && block["text"].is_string()) {
                 text += block["text"].get<std::string>();
             }
-            // Non-text blocks (image, tool_use, tool_result, ...) are dropped:
-            // local LLM backends here don't accept multimodal/tool-call inputs
-            // anyway, and leaving them in produces the empty-response failure.
         }
         normalized["content"] = text;
         out.push_back(std::move(normalized));
@@ -84,10 +71,6 @@ McpServer::McpServer(Router* router, ModelManager* model_manager, EnsureLoadedFn
     : router_(router),
       model_manager_(model_manager),
       ensure_loaded_(std::move(ensure_loaded)) {}
-
-// =============================================================================
-// HTTP route registration
-// =============================================================================
 
 void McpServer::register_routes(httplib::Server& server) {
     auto self = shared_from_this();
@@ -105,9 +88,7 @@ void McpServer::register_routes(httplib::Server& server) {
         }
 
         if (response_body.empty()) {
-            // All messages in the batch were notifications — JSON-RPC says no
-            // response body should be returned. MCP's Streamable HTTP transport
-            // expects 202 Accepted in that case.
+            // All messages were notifications — Streamable HTTP expects 202.
             res.status = 202;
             return;
         }
@@ -117,9 +98,7 @@ void McpServer::register_routes(httplib::Server& server) {
     });
 
     server.Get("/mcp", [](const httplib::Request&, httplib::Response& res) {
-        // The Streamable HTTP transport allows GET for opening an SSE channel
-        // for server-initiated messages. This MVP gateway is request/response
-        // only, so we explicitly refuse GET to make the limitation visible.
+        // No SSE channel in this MVP; refuse GET explicitly.
         res.status = 405;
         res.set_header("Allow", "POST");
         res.set_content(
@@ -129,10 +108,6 @@ void McpServer::register_routes(httplib::Server& server) {
             "application/json");
     });
 }
-
-// =============================================================================
-// Top-level JSON-RPC envelope handling
-// =============================================================================
 
 std::string McpServer::handle_request_body(const std::string& body) {
     json parsed;
@@ -144,7 +119,6 @@ std::string McpServer::handle_request_body(const std::string& body) {
         return err.dump();
     }
 
-    // Batch request: array of messages.
     if (parsed.is_array()) {
         if (parsed.empty()) {
             json err = make_error_response(nullptr, kJsonRpcInvalidRequest,
@@ -158,27 +132,21 @@ std::string McpServer::handle_request_body(const std::string& body) {
                 responses.push_back(std::move(reply));
             }
         }
-        if (responses.empty()) {
-            return "";  // All notifications.
-        }
+        if (responses.empty()) return "";
         return responses.dump();
     }
 
-    // Single message.
     if (!parsed.is_object()) {
         json err = make_error_response(nullptr, kJsonRpcInvalidRequest,
                                        "Request must be a JSON object or array");
         return err.dump();
     }
     json reply = dispatch_message(parsed);
-    if (reply.is_null()) {
-        return "";
-    }
+    if (reply.is_null()) return "";
     return reply.dump();
 }
 
 json McpServer::dispatch_message(const json& message) {
-    // Validate envelope shape.
     if (!message.is_object()) {
         return make_error_response(nullptr, kJsonRpcInvalidRequest,
                                    "Request must be a JSON object");
@@ -212,8 +180,6 @@ json McpServer::dispatch_message(const json& message) {
             if (notification) return json(nullptr);
             return handle_ping(id);
         }
-        // `notifications/initialized` and `notifications/cancelled` arrive as
-        // notifications. We acknowledge them silently — no state to update.
         if (method == "notifications/initialized" ||
             method == "notifications/cancelled") {
             return json(nullptr);
@@ -229,15 +195,11 @@ json McpServer::dispatch_message(const json& message) {
     }
 }
 
-// =============================================================================
-// MCP method handlers
-// =============================================================================
-
 json McpServer::handle_initialize(const json& /*params*/, const json& id) {
     json result = {
         {"protocolVersion", kMcpProtocolVersion},
         {"capabilities", {
-            {"tools", json::object()},  // Tools capability with no extra options.
+            {"tools", json::object()},
         }},
         {"serverInfo", {
             {"name", kServerName},
@@ -270,20 +232,14 @@ json McpServer::handle_tools_call(const json& params, const json& id) {
     try {
         if (tool_name == "lemonade_chat") {
             result = tool_chat(arguments);
-        } else if (tool_name == "lemonade_embed") {
-            result = tool_embed(arguments);
         } else if (tool_name == "lemonade_transcribe_audio") {
             result = tool_transcribe_audio(arguments);
-        } else if (tool_name == "lemonade_generate_speech") {
-            result = tool_generate_speech(arguments);
         } else if (tool_name == "lemonade_generate_image") {
             result = tool_generate_image(arguments);
         } else if (tool_name == "lemonade_list_models") {
             result = tool_list_models(arguments);
         } else {
-            // Per MCP spec, unknown-tool errors are returned as a successful
-            // result with isError=true (so the client model can recover),
-            // *not* as a JSON-RPC method-not-found error.
+            // Per MCP spec, unknown-tool errors are isError=true results, not JSON-RPC errors.
             result = {
                 {"content", json::array({text_content_block("Unknown tool: " + tool_name)})},
                 {"isError", true},
@@ -304,10 +260,6 @@ json McpServer::handle_ping(const json& id) {
     return make_success_response(id, json::object());
 }
 
-// =============================================================================
-// Tool implementations
-// =============================================================================
-
 json McpServer::tool_chat(const json& arguments) {
     const std::string model = extract_string_arg(arguments, "model");
     if (!arguments.contains("messages") || !arguments["messages"].is_array()) {
@@ -316,16 +268,12 @@ json McpServer::tool_chat(const json& arguments) {
 
     ensure_loaded_(model);
 
-    // Translate MCP tool args → OpenAI chat completion request. We
-    // deliberately do NOT enable streaming: MCP tool calls are
-    // request/response, and any streaming output would be wasted.
     json openai_request = {
         {"model", model},
         {"messages", normalize_messages(arguments["messages"])},
         {"stream", false},
     };
 
-    // Forward common optional knobs verbatim.
     for (const char* key : {"temperature", "top_p", "max_tokens", "stop",
                             "seed", "presence_penalty", "frequency_penalty",
                             "tools", "tool_choice", "response_format",
@@ -335,12 +283,9 @@ json McpServer::tool_chat(const json& arguments) {
         }
     }
 
-    // Reasoning models (Qwen3, DeepSeek-R1, ...) emit a <think> block by
-    // default. For MCP tool calls this is doubly bad: clients send small
-    // max_tokens budgets that get consumed by the think block (leaving
-    // `content` empty), and the reasoning trace is discarded by the caller
-    // anyway. Disable thinking by default; allow callers to opt back in via
-    // chat_template_kwargs.enable_thinking=true.
+    // Reasoning models (Qwen3, DeepSeek-R1) burn small max_tokens budgets on
+    // <think> blocks, leaving content empty. Disable thinking by default;
+    // callers can opt back in via chat_template_kwargs.enable_thinking=true.
     if (!openai_request.contains("chat_template_kwargs")) {
         openai_request["chat_template_kwargs"] = {{"enable_thinking", false}};
     }
@@ -350,17 +295,8 @@ json McpServer::tool_chat(const json& arguments) {
         throw std::runtime_error(response["error"].value("message", "chat completion failed"));
     }
 
-    // Surface assistant content as a text block. If the model emitted tool
-    // calls, attach them as a second text block (JSON-stringified) so MCP
-    // clients can see them — MCP doesn't have a first-class tool_call content
-    // type, so embedding as JSON text is the standard convention.
-    //
-    // Reasoning-model fallback: Qwen3 and similar models split output into
-    // `content` (final answer) and `reasoning_content` (the <think> block).
-    // When a small max_tokens budget is exhausted before the model exits the
-    // thinking phase, `content` is empty. Returning empty text to the MCP
-    // client looks like a broken server, so fall back to reasoning_content
-    // (with a marker) instead of silently dropping the output.
+    // Reasoning-model fallback: if `content` is empty but `reasoning_content`
+    // is not, surface the reasoning rather than returning an empty string.
     std::string assistant_text;
     std::string reasoning_text;
     std::string finish_reason;
@@ -384,8 +320,6 @@ json McpServer::tool_chat(const json& arguments) {
 
     json content = json::array();
     if (assistant_text.empty() && !reasoning_text.empty()) {
-        // No final answer — surface the reasoning so the client sees something
-        // useful (and a hint that max_tokens was likely too small).
         std::string note = "[reasoning only";
         if (finish_reason == "length") note += "; finish_reason=length";
         note += "]\n";
@@ -404,52 +338,12 @@ json McpServer::tool_chat(const json& arguments) {
     };
 }
 
-json McpServer::tool_embed(const json& arguments) {
-    const std::string model = extract_string_arg(arguments, "model");
-    if (!arguments.contains("input")) {
-        throw std::runtime_error("Missing argument: input");
-    }
-
-    ensure_loaded_(model);
-
-    json openai_request = {
-        {"model", model},
-        {"input", arguments["input"]},
-    };
-    if (arguments.contains("encoding_format")) {
-        openai_request["encoding_format"] = arguments["encoding_format"];
-    }
-
-    json response = router_->embeddings(openai_request);
-    if (response.contains("error")) {
-        throw std::runtime_error(response["error"].value("message", "embeddings failed"));
-    }
-
-    // MCP has no embedding content type, so we return the embedding vectors
-    // as a JSON-stringified text block. Callers parse the text as JSON to
-    // get the array of vectors.
-    json out = json::object();
-    out["model"] = response.value("model", model);
-    out["data"] = response.value("data", json::array());
-    if (response.contains("usage")) {
-        out["usage"] = response["usage"];
-    }
-
-    return json{
-        {"content", json::array({text_content_block(out.dump())})},
-        {"isError", false},
-    };
-}
-
 json McpServer::tool_transcribe_audio(const json& arguments) {
     const std::string model = extract_string_arg(arguments, "model");
 
-    // Accept either a local file path (preferred — this server only ever runs
-    // on the same machine as the caller, so shipping multi-MB WAVs through a
-    // base64-encoded JSON-RPC argument is wasteful) or inline base64. Agents
-    // overwhelmingly reach for `audio_path` first; if we only accepted
-    // `audio_base64`, the typical first attempt was to jam the path string
-    // into that field and get an "Empty audio data" failure downstream.
+    // Same-machine deployment: prefer `audio_path` over base64 to avoid
+    // multi-MB blobs through JSON-RPC. Agents reach for `audio_path` first;
+    // accepting only base64 led to path-in-base64 errors.
     std::string audio_data;
     std::string filename = arguments.value("filename", std::string());
     const bool has_path = arguments.contains("audio_path") && arguments["audio_path"].is_string();
@@ -492,8 +386,6 @@ json McpServer::tool_transcribe_audio(const json& arguments) {
 
     ensure_loaded_(model);
 
-    // The router's audio_transcriptions expects raw bytes in `file_data`
-    // (matching how handle_audio_transcriptions stuffs the multipart upload).
     json router_request = {
         {"model", model},
         {"file_data", std::move(audio_data)},
@@ -510,9 +402,6 @@ json McpServer::tool_transcribe_audio(const json& arguments) {
         throw std::runtime_error(response["error"].value("message", "transcription failed"));
     }
 
-    // The OpenAI-shaped response carries the transcript under `text`. Surface
-    // it as a text block; attach the full structured response as JSON for
-    // callers that need timestamps / segments.
     std::string transcript = response.value("text", std::string());
     json content = json::array();
     content.push_back(text_content_block(transcript));
@@ -524,73 +413,14 @@ json McpServer::tool_transcribe_audio(const json& arguments) {
     };
 }
 
-json McpServer::tool_generate_speech(const json& arguments) {
-    const std::string model = extract_string_arg(arguments, "model");
-    const std::string input = extract_string_arg(arguments, "input");
-    const std::string voice = arguments.value("voice", std::string("af_heart"));
-    const std::string response_format = arguments.value("response_format", std::string("mp3"));
-
-    ensure_loaded_(model);
-
-    json router_request = {
-        {"model", model},
-        {"input", input},
-        {"voice", voice},
-        {"response_format", response_format},
-    };
-
-    // Capture the streamed audio into an in-memory buffer. All three callbacks
-    // must be wired — the streaming proxy calls done() at end-of-stream, and
-    // a default-constructed std::function would throw bad_function_call.
-    // (Pattern mirrors collection_orchestrator.cpp.)
-    std::string buffer;
-    httplib::DataSink sink;
-    sink.write = [&buffer](const char* data, size_t len) {
-        buffer.append(data, len);
-        return true;
-    };
-    sink.is_writable = []() { return true; };
-    sink.done = []() {};
-    router_->audio_speech(router_request, sink);
-
-    if (buffer.empty()) {
-        throw std::runtime_error("Text-to-speech produced no audio");
-    }
-
-    // MCP's audio content block: { type: "audio", data: <base64>, mimeType: <string> }.
-    static const std::unordered_map<std::string, std::string> kMimeTypes = {
-        {"mp3", "audio/mpeg"},
-        {"wav", "audio/wav"},
-        {"opus", "audio/opus"},
-        {"flac", "audio/flac"},
-        {"pcm", "audio/pcm"},
-        {"aac", "audio/aac"},
-    };
-    auto mime_it = kMimeTypes.find(response_format);
-    const std::string mime_type = (mime_it != kMimeTypes.end()) ? mime_it->second : "audio/mpeg";
-
-    json audio_block = {
-        {"type", "audio"},
-        {"data", utils::JsonUtils::base64_encode(buffer)},
-        {"mimeType", mime_type},
-    };
-
-    return json{
-        {"content", json::array({std::move(audio_block)})},
-        {"isError", false},
-    };
-}
-
 json McpServer::tool_generate_image(const json& arguments) {
     const std::string model = extract_string_arg(arguments, "model");
     const std::string prompt = extract_string_arg(arguments, "prompt");
 
-    // Optional disk-output mode. The MCP server is documented as same-machine
-    // only, and MCP image content blocks (inline base64 PNGs) cost tens of
-    // thousands of tokens per image and surface as opaque resource URIs in
-    // some clients (e.g. VS Code) that the agent then has to round-trip back
-    // out to disk. Letting the caller name the destination skips both
-    // problems — symmetric with `lemonade_transcribe_audio`'s `audio_path`.
+    // Disk-output mode: MCP image content blocks cost tens of thousands of
+    // tokens per image and some clients surface them as opaque resource URIs
+    // the agent has to round-trip back to disk. Letting the caller name the
+    // destination avoids both. Symmetric with `audio_path`.
     const bool has_output_path = arguments.contains("output_path") &&
                                  arguments["output_path"].is_string();
     const bool has_output_dir  = arguments.contains("output_dir") &&
@@ -628,8 +458,6 @@ json McpServer::tool_generate_image(const json& arguments) {
             router_request[key] = arguments[key];
         }
     }
-    // Force base64 output — MCP image content blocks carry inline base64,
-    // not URLs, and Lemonade's image backends already default to b64_json.
     router_request["response_format"] = "b64_json";
 
     json response = router_->image_generations(router_request);
@@ -648,8 +476,6 @@ json McpServer::tool_generate_image(const json& arguments) {
         throw std::runtime_error("Image generation returned no images");
     }
 
-    // Inline mode (no path requested): original behavior — return MCP image
-    // content blocks with inline base64.
     if (!has_output_path && !has_output_dir) {
         json content = json::array();
         for (const auto& b64 : b64_images) {
@@ -665,7 +491,6 @@ json McpServer::tool_generate_image(const json& arguments) {
         };
     }
 
-    // Disk mode: decode and write the PNG(s), then return path(s) as text.
     if (has_output_path && b64_images.size() > 1) {
         throw std::runtime_error(
             "`output_path` only supports a single image; use `output_dir` "
@@ -709,7 +534,7 @@ json McpServer::tool_generate_image(const json& arguments) {
             throw std::runtime_error("Failed to write: " + dest.string());
         }
         written.push_back(std::filesystem::absolute(dest, ec));
-        if (ec) written.back() = dest;  // Fall back to as-given.
+        if (ec) written.back() = dest;
     }
 
     std::string summary = (written.size() == 1)
@@ -722,7 +547,6 @@ json McpServer::tool_generate_image(const json& arguments) {
             content.push_back(text_content_block(p.string()));
         }
     }
-    // Structured payload for programmatic callers.
     json paths = json::array();
     for (const auto& p : written) paths.push_back(p.string());
     content.push_back(text_content_block(json{{"paths", std::move(paths)}}.dump()));
@@ -734,22 +558,15 @@ json McpServer::tool_generate_image(const json& arguments) {
 }
 
 json McpServer::tool_list_models(const json& arguments) {
-    // Returns a structured catalogue so the client model can pick the right
-    // name to pass to `lemonade_chat` / `lemonade_embed` / etc. without
-    // guessing. The `loaded` array lists what is in memory RIGHT NOW (which
-    // is what a model wants to discover first, to avoid triggering downloads
-    // or evictions of unrelated models).
     const bool include_available = arguments.value("include_available", true);
     const bool include_suggested = arguments.value("include_suggested", true);
 
     json loaded = router_->get_all_loaded_models();
-
     auto downloaded = model_manager_->get_downloaded_models();
 
     json available = json::array();
     if (include_available) {
-        // Only list downloaded models by default — listing the full registry
-        // (hundreds of entries) would blow up context for the client model.
+        // Only downloaded models — the full registry would blow up client context.
         for (const auto& [model_id, info] : downloaded) {
             json entry = {
                 {"model_name", model_id},
@@ -763,14 +580,11 @@ json McpServer::tool_list_models(const json& arguments) {
         }
     }
 
-    // Suggested-but-not-downloaded: what the user is invited to `pull` next.
-    // Distinct from `available` so the client can clearly tell the user
-    // "you don't have a good model loaded yet; consider pulling X".
     json suggested_to_pull = json::array();
     if (include_suggested) {
         for (const auto& [model_id, info] : model_manager_->get_supported_models()) {
             if (!info.suggested) continue;
-            if (downloaded.count(model_id)) continue;  // Already in `available`.
+            if (downloaded.count(model_id)) continue;
             json entry = {
                 {"model_name", model_id},
                 {"recipe", info.recipe},
@@ -781,9 +595,7 @@ json McpServer::tool_list_models(const json& arguments) {
         }
     }
 
-    // Pick a recommended default: an LLM that's already loaded if possible,
-    // otherwise the most recently loaded model of any type. This is what the
-    // client should pass to `lemonade_chat` if it has no other preference.
+    // Prefer a loaded LLM; fall back to the most recently loaded model of any type.
     std::string recommended;
     for (const auto& m : loaded) {
         if (m.value("type", std::string()) == "llm") {
@@ -802,8 +614,6 @@ json McpServer::tool_list_models(const json& arguments) {
         {"recommended_chat_model", recommended},
     };
 
-    // Lead with a human-readable summary so the client model can act on it
-    // without parsing JSON; follow with the full structured payload.
     std::string summary;
     if (payload["loaded"].empty()) {
         summary = "No models are currently loaded. ";
@@ -840,10 +650,6 @@ json McpServer::tool_list_models(const json& arguments) {
     };
 }
 
-// =============================================================================
-// Tool catalogue (consumed by tools/list)
-// =============================================================================
-
 json McpServer::tools_descriptor() {
     return json::array({
         {
@@ -851,22 +657,15 @@ json McpServer::tools_descriptor() {
             {"description",
              "List models known to the Lemonade server. ALWAYS call this "
              "first if you don't already know the exact model name to use "
-             "for chat/embed/transcribe/etc — passing a wrong name to the "
-             "other tools may trigger a multi-GB download. Returns a summary "
-             "text block plus a JSON block with `{loaded: [...], available: "
-             "[...], suggested_to_pull: [...], recommended_chat_model: "
-             "\"...\"}`. `loaded` is models currently in memory; `available` "
-             "is models already downloaded to disk (each entry includes a "
-             "`suggested` boolean); `suggested_to_pull` is curated models "
-             "the user could download next; `recommended_chat_model` is the "
-             "best loaded LLM to use for `lemonade_chat`."},
+             "for chat/transcribe/image — passing a wrong name may trigger a "
+             "multi-GB download. Returns a summary text block plus a JSON "
+             "block with `{loaded, available, suggested_to_pull, "
+             "recommended_chat_model}`."},
             {"inputSchema", {
                 {"type", "object"},
                 {"properties", {
-                    {"include_available", {{"type", "boolean"},
-                                           {"description", "Include downloaded-but-not-loaded models in the response. Default true."}}},
-                    {"include_suggested", {{"type", "boolean"},
-                                           {"description", "Include the curated `suggested_to_pull` list of recommended models not yet downloaded. Default true."}}},
+                    {"include_available", {{"type", "boolean"}}},
+                    {"include_suggested", {{"type", "boolean"}}},
                 }},
             }},
         },
@@ -874,48 +673,26 @@ json McpServer::tools_descriptor() {
             {"name", "lemonade_chat"},
             {"description",
              "Chat completion against a locally hosted LLM. Pass a `messages` "
-             "array (OpenAI chat format) and the model name. Returns the "
-             "assistant text response. If you don't know which model name to "
-             "use, call `lemonade_list_models` first — passing a model that "
-             "isn't loaded may trigger a multi-GB download."},
+             "array (OpenAI chat format) and the model name. If you don't "
+             "know which model name to use, call `lemonade_list_models` "
+             "first — passing a model that isn't loaded may trigger a "
+             "multi-GB download."},
             {"inputSchema", {
                 {"type", "object"},
                 {"required", json::array({"model", "messages"})},
                 {"properties", {
-                    {"model",       {{"type", "string"},
-                                     {"description", "Lemonade model name. Call `lemonade_list_models` to see what is loaded."}}},
-                    {"messages",    {{"type", "array"},
-                                     {"description", "OpenAI-format chat messages"},
-                                     {"items", {{"type", "object"}}}}},
+                    {"model",       {{"type", "string"}}},
+                    {"messages",    {{"type", "array"}, {"items", {{"type", "object"}}}}},
                     {"temperature", {{"type", "number"}}},
                     {"top_p",       {{"type", "number"}}},
                     {"max_tokens",  {{"type", "integer"}}},
                     {"stop",        {{"description", "stop sequences (string or array)"}}},
                     {"seed",        {{"type", "integer"}}},
-                    {"tools",       {{"type", "array"},
-                                     {"description", "OpenAI-format tool definitions"},
-                                     {"items", {{"type", "object"}}}}},
+                    {"tools",       {{"type", "array"}, {"items", {{"type", "object"}}}}},
                     {"tool_choice", {{"description", "auto | none | required | {type: function, ...}"}}},
                     {"response_format", {{"type", "object"}}},
                     {"chat_template_kwargs", {{"type", "object"},
-                                              {"description", "Pass-through kwargs for the model's chat template (e.g. {\"enable_thinking\": true} to enable reasoning blocks; disabled by default for MCP)"}}},
-                }},
-            }},
-        },
-        {
-            {"name", "lemonade_embed"},
-            {"description",
-             "Generate an embedding vector for one or more input strings using "
-             "a locally hosted embedding model. Returns a JSON-encoded text "
-             "block with `{model, data: [{embedding, index, object}], usage}`."},
-            {"inputSchema", {
-                {"type", "object"},
-                {"required", json::array({"model", "input"})},
-                {"properties", {
-                    {"model", {{"type", "string"}}},
-                    {"input", {{"description", "string OR array of strings"}}},
-                    {"encoding_format", {{"type", "string"},
-                                         {"enum", json::array({"float", "base64"})}}},
+                                              {"description", "e.g. {\"enable_thinking\": true} to enable reasoning blocks; disabled by default"}}},
                 }},
             }},
         },
@@ -927,9 +704,7 @@ json McpServer::tools_descriptor() {
              "caller, so prefer `audio_path` (an absolute path to a local "
              "audio file: wav, mp3, m4a, ogg, flac, webm). Use "
              "`audio_base64` only when you genuinely have audio bytes in "
-             "memory and no path on disk. Exactly one of the two must be "
-             "provided. Returns the transcript as the first text block, "
-             "followed by the full OpenAI-shaped JSON response."},
+             "memory. Exactly one of the two must be provided."},
             {"inputSchema", {
                 {"type", "object"},
                 {"required", json::array({"model"})},
@@ -937,10 +712,8 @@ json McpServer::tools_descriptor() {
                     {"model",         {{"type", "string"}}},
                     {"audio_path",    {{"type", "string"},
                                        {"description", "Absolute path to a local audio file. Preferred over audio_base64."}}},
-                    {"audio_base64",  {{"type", "string"},
-                                       {"description", "Audio file bytes, base64-encoded. Only use when you already have raw bytes in memory."}}},
-                    {"filename",      {{"type", "string"},
-                                       {"description", "Optional override for the upload filename; used to infer content type. Defaults to the basename of audio_path."}}},
+                    {"audio_base64",  {{"type", "string"}}},
+                    {"filename",      {{"type", "string"}}},
                     {"language",      {{"type", "string"}}},
                     {"prompt",        {{"type", "string"}}},
                     {"response_format", {{"type", "string"},
@@ -950,36 +723,15 @@ json McpServer::tools_descriptor() {
             }},
         },
         {
-            {"name", "lemonade_generate_speech"},
-            {"description",
-             "Synthesize speech from text with a locally hosted TTS model. "
-             "Returns a single audio content block with base64-encoded audio."},
-            {"inputSchema", {
-                {"type", "object"},
-                {"required", json::array({"model", "input"})},
-                {"properties", {
-                    {"model",  {{"type", "string"}}},
-                    {"input",  {{"type", "string"}, {"description", "Text to speak"}}},
-                    {"voice",  {{"type", "string"}, {"description", "Voice name (e.g. af_heart)"}}},
-                    {"response_format", {{"type", "string"},
-                                         {"enum", json::array({"mp3", "wav", "opus", "flac", "pcm", "aac"})}}},
-                }},
-            }},
-        },
-        {
             {"name", "lemonade_generate_image"},
             {"description",
-             "Generate one or more images from a text prompt with a locally "
-             "hosted image model. The Lemonade MCP server always runs on the "
-             "same machine as the caller, so PREFER writing the result "
-             "directly to disk by passing `output_path` (single image) or "
-             "`output_dir` (one or more). When you do, the tool returns the "
-             "absolute file path(s) as text — no base64 round-trip, no "
-             "client-specific resource URIs, and dramatically fewer tokens. "
-             "Only omit both arguments when you genuinely need the image "
-             "inline (e.g. to render it to the user in a chat UI); in that "
-             "case the tool returns MCP image content blocks with "
-             "base64-encoded PNGs."},
+             "Generate one or more images from a text prompt. The Lemonade "
+             "MCP server always runs on the same machine as the caller, so "
+             "PREFER writing the result directly to disk by passing "
+             "`output_path` (single image) or `output_dir` (one or more). "
+             "When you do, the tool returns absolute file path(s) as text — "
+             "no base64 round-trip and dramatically fewer tokens. Only omit "
+             "both arguments when you genuinely need the image inline."},
             {"inputSchema", {
                 {"type", "object"},
                 {"required", json::array({"model", "prompt"})},
@@ -987,11 +739,10 @@ json McpServer::tools_descriptor() {
                     {"model",  {{"type", "string"}}},
                     {"prompt", {{"type", "string"}}},
                     {"output_path", {{"type", "string"},
-                                     {"description", "Absolute path of the PNG file to write. Only valid when n == 1. Parent directory is created if needed. Preferred over inline base64."}}},
+                                     {"description", "Absolute path of the PNG file to write. Only valid when n == 1."}}},
                     {"output_dir",  {{"type", "string"},
-                                     {"description", "Absolute path of a directory to write image_0.png, image_1.png, ... into. Use this when n > 1. Directory is created if needed."}}},
-                    {"size",   {{"type", "string"},
-                                {"description", "e.g. 512x512, 1024x1024"}}},
+                                     {"description", "Absolute path of a directory to write image_0.png, image_1.png, ... into."}}},
+                    {"size",   {{"type", "string"}}},
                     {"n",      {{"type", "integer"}, {"minimum", 1}}},
                     {"negative_prompt", {{"type", "string"}}},
                     {"seed",   {{"type", "integer"}}},
@@ -1002,10 +753,6 @@ json McpServer::tools_descriptor() {
         },
     });
 }
-
-// =============================================================================
-// JSON-RPC envelope helpers
-// =============================================================================
 
 json McpServer::make_error_response(const json& id, int code, const std::string& message) {
     return {

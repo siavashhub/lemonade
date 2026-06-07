@@ -3,14 +3,13 @@ Integration tests for the MCP gateway endpoint (POST /mcp).
 
 Requires a Lemonade server to already be running on port 13305.
 
-Covers the JSON-RPC 2.0 envelope plus the five tools exposed by the gateway:
+Covers the JSON-RPC 2.0 envelope plus the four tools exposed by the gateway:
+- lemonade_list_models
 - lemonade_chat
-- lemonade_embed
 - lemonade_transcribe_audio   (smoke-tested via schema only; needs Whisper)
-- lemonade_generate_speech    (smoke-tested via schema only; needs Kokoro)
 - lemonade_generate_image     (smoke-tested via schema only; needs SD)
 
-The "live" tools (chat + embed) use small models so the suite stays fast.
+The "live" chat tool uses a small model so the suite stays fast.
 
 Usage:
     python test/server_mcp.py
@@ -162,16 +161,15 @@ class McpGatewayTests(ServerTestBase):
         self.assertEqual(body["result"], {})
 
     def test_012_tools_list(self):
-        """tools/list must include the five gateway tools, each with a schema."""
+        """tools/list must include the four gateway tools, each with a schema."""
         response = _post({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
         body = response.json()
         tools = body["result"]["tools"]
         names = {tool["name"] for tool in tools}
         expected = {
+            "lemonade_list_models",
             "lemonade_chat",
-            "lemonade_embed",
             "lemonade_transcribe_audio",
-            "lemonade_generate_speech",
             "lemonade_generate_image",
         }
         self.assertTrue(expected.issubset(names), f"missing tools: {expected - names}")
@@ -179,7 +177,6 @@ class McpGatewayTests(ServerTestBase):
             self.assertIn("description", tool)
             self.assertIn("inputSchema", tool)
             self.assertEqual(tool["inputSchema"]["type"], "object")
-            self.assertIn("required", tool["inputSchema"])
 
     # ---------------------------------------------------------------------
     # tools/call error paths

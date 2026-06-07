@@ -1,6 +1,6 @@
 # MCP Gateway
 
-Lemonade exposes its inference capabilities as a Model Context Protocol (MCP) server, so any MCP-compatible client (Claude Desktop, MCP Inspector, Cursor, the `mcp` Python client, etc.) can call your locally running models as tools.
+Lemonade exposes its inference capabilities as a Model Context Protocol (MCP) server, so any MCP-compatible client (GitHub Copilot, Claude Desktop, MCP Inspector, Cursor, the `mcp` Python client, etc.) can call your locally running models as tools.
 
 The gateway implements the **MCP "Streamable HTTP" transport** (spec version `2025-06-18`) with the `tools` capability only. All traffic flows through a single endpoint:
 
@@ -36,6 +36,22 @@ curl -s http://localhost:13305/mcp \
 
 All tools auto-load (and download, if missing) the requested model on first call, exactly like `POST /v1/chat/completions`. Errors are returned as MCP results with `"isError": true` rather than JSON-RPC errors, matching the spec's guidance for tool failures.
 
+### `lemonade_list_models`
+
+Discover what's loaded, what's downloaded, and what's recommended. Call this first if you don't already know the exact model name to pass to the other tools — passing a wrong name may trigger a multi-GB download.
+
+```json
+{
+  "name": "lemonade_list_models",
+  "arguments": {
+    "include_available": true,
+    "include_suggested": true
+  }
+}
+```
+
+Returns a summary text block plus a JSON-stringified text block with `{loaded, available, suggested_to_pull, recommended_chat_model}`.
+
 ### `lemonade_chat`
 
 Chat completion against any LLM in the registry.
@@ -44,48 +60,31 @@ Chat completion against any LLM in the registry.
 {
   "name": "lemonade_chat",
   "arguments": {
-    "model": "Qwen3-0.6B-GGUF",
+    "model": "Qwen3-8B-Hybrid",
     "messages": [
       {"role": "system", "content": "You are concise."},
       {"role": "user", "content": "Summarize MCP in one line."}
     ],
     "max_tokens": 64,
-    "temperature": 0.2,
-    "tools": [],
-    "tool_choice": "auto"
+    "temperature": 0.2
   }
 }
 ```
 
 Returns one text block with the assistant content. If the model emits tool calls, a second text block containing `tool_calls: <json>` is appended.
 
-### `lemonade_embed`
-
-Generate embedding vectors for one or more strings.
-
-```json
-{
-  "name": "lemonade_embed",
-  "arguments": {
-    "model": "Qwen3-Embedding-0.6B-GGUF",
-    "input": ["hello world", "another sentence"]
-  }
-}
-```
-
-Returns a single text block whose payload is a JSON-stringified `{model, data: [{embedding, index, object}], usage}` (MCP has no first-class embedding content type, so the structured payload is embedded as text).
+Reasoning models (Qwen3, DeepSeek-R1, ...) have the `<think>` block disabled by default to keep small `max_tokens` budgets from being consumed by reasoning. Pass `"chat_template_kwargs": {"enable_thinking": true}` to opt back in.
 
 ### `lemonade_transcribe_audio`
 
-Transcribe a base64-encoded audio clip with a Whisper-class model.
+Transcribe a local audio file with a Whisper-class model. Prefer `audio_path` (the server runs on the same machine as the caller); use `audio_base64` only when you genuinely have bytes in memory.
 
 ```json
 {
   "name": "lemonade_transcribe_audio",
   "arguments": {
-    "model": "Whisper-Tiny",
-    "audio_base64": "UklGR…",
-    "filename": "clip.wav",
+    "model": "Whisper-Large-v3",
+    "audio_path": "C:/clips/meeting.wav",
     "response_format": "verbose_json"
   }
 }
@@ -93,41 +92,23 @@ Transcribe a base64-encoded audio clip with a Whisper-class model.
 
 Returns two text blocks: the bare transcript, followed by the full OpenAI-shaped response (for callers that need timestamps or segments).
 
-### `lemonade_generate_speech`
-
-Synthesize speech from text. Audio is returned inline as base64.
-
-```json
-{
-  "name": "lemonade_generate_speech",
-  "arguments": {
-    "model": "Kokoro-82M",
-    "input": "Hello from Lemonade.",
-    "voice": "af_heart",
-    "response_format": "mp3"
-  }
-}
-```
-
-Returns one audio content block (`{"type":"audio", "data":"<base64>", "mimeType":"audio/mpeg"}`).
-
 ### `lemonade_generate_image`
 
-Generate one or more PNGs from a prompt. Always returns inline base64 (the gateway forces `response_format=b64_json`).
+Generate one or more PNGs from a prompt. **Prefer writing to disk** via `output_path` (single image) or `output_dir` (one or more) — base64 image content blocks cost tens of thousands of tokens per image and some clients surface them as opaque resource URIs.
 
 ```json
 {
   "name": "lemonade_generate_image",
   "arguments": {
-    "model": "Stable-Diffusion-1.5",
+    "model": "SDXL-Turbo",
     "prompt": "a lemon-shaped car driving across the moon",
     "size": "512x512",
-    "n": 1
+    "output_path": "C:/out/lemon-car.png"
   }
 }
 ```
 
-Returns one image content block per generated image (`{"type":"image", "data":"<base64>", "mimeType":"image/png"}`).
+When disk paths are provided, returns text block(s) with the absolute path(s). Otherwise, returns one inline image content block per image (`{"type":"image", "data":"<base64>", "mimeType":"image/png"}`).
 
 ## Error model
 
@@ -147,6 +128,7 @@ Tool-level failures (bad arguments, model load errors, backend exceptions) are r
 - No session resumption (`Mcp-Session-Id` header is not issued).
 - `resources/*` and `prompts/*` capabilities are not implemented.
 - Streaming chat output is not exposed via MCP — `stream=true` is ignored. Use `POST /v1/chat/completions` directly for streamed tokens.
+- Embeddings and text-to-speech are not currently exposed as MCP tools; use the OpenAI-compatible endpoints (`/v1/embeddings`, `/v1/audio/speech`) for those.
 
 ## Quick test with curl
 
@@ -161,5 +143,5 @@ curl -s http://localhost:13305/mcp -H "Content-Type: application/json" \
 
 # 3. Call lemonade_chat
 curl -s http://localhost:13305/mcp -H "Content-Type: application/json" \
-    -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lemonade_chat","arguments":{"model":"Qwen3-0.6B-GGUF","messages":[{"role":"user","content":"hi"}],"max_tokens":16}}}'
+    -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lemonade_chat","arguments":{"model":"Qwen3-8B-Hybrid","messages":[{"role":"user","content":"hi"}],"max_tokens":16}}}'
 ```
