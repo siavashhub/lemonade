@@ -36,6 +36,34 @@ curl -s http://localhost:13305/mcp \
 
 All tools auto-load (and download, if missing) the requested model on first call, exactly like `POST /v1/chat/completions`. Errors are returned as MCP results with `"isError": true` rather than JSON-RPC errors, matching the spec's guidance for tool failures.
 
+### Asynchronous model preparation
+
+Downloads of multi-GB models can take many minutes. The original implementation kept the MCP HTTP request open for the full duration, which caused MCP clients to time out, retry against the same blocking download, and eventually give up while the server was still working.
+
+Every model-loading tool (`lemonade_chat`, `lemonade_transcribe_audio`, `lemonade_generate_image`, `lemonade_omni`) now uses an **async preparation pattern**:
+
+1. **First call** with an unloaded model — the tool kicks off the download + load on a background thread, then waits up to **10 seconds** for it to complete inline (so already-downloaded models still resolve in a single round-trip). If preparation finishes within that window, the tool proceeds to its normal work and returns the real output.
+
+2. **Slow preparation** (multi-GB download or otherwise > 10s) — the tool returns *immediately* with `isError: true` and a status block:
+
+    ```json
+    {
+      "content": [
+        {"type": "text", "text": "Model 'X' is being prepared … ACTION: wait ~30 seconds, then call this same tool again …"},
+        {"type": "text", "text": "{\"status\":\"preparing\",\"model\":\"X\",\"elapsed_seconds\":0,\"retry_after_seconds\":30}"}
+      ],
+      "isError": true
+    }
+    ```
+
+3. **Subsequent calls** with the same model name return the same shape, with an updated `elapsed_seconds`, as long as preparation is still in flight. The download is **not** restarted — only one background preparation runs per model at a time.
+
+4. **Once preparation completes**, the next call proceeds normally and returns the real tool output. The agent should keep retrying with the same arguments at the rate hinted by `retry_after_seconds`.
+
+5. **If preparation fails** (e.g. the model name is unknown or the download errors out), the next call returns `isError: true` with a plain text description of the failure and the tracker is cleared so a later call can try again.
+
+The status JSON is intentionally machine-readable so agent harnesses can implement custom backoff. The natural-language summary in the first text block is written to nudge LLM-based agents to retry rather than abandon the task — multi-GB downloads can take 10+ minutes and the server continues working even if the agent stops polling.
+
 ### `lemonade_list_models`
 
 Discover what's loaded, what's downloaded, and what's recommended. Call this first if you don't already know the exact model name to pass to the other tools — passing a wrong name may trigger a multi-GB download.
