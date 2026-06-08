@@ -88,7 +88,7 @@ Chat completion against any LLM in the registry.
 {
   "name": "lemonade_chat",
   "arguments": {
-    "model": "Qwen3-1.7B-Hybrid",
+    "model": "Qwen3-1.7B-GGUF",
     "messages": [
       {"role": "system", "content": "You are concise."},
       {"role": "user", "content": "Summarize MCP in one line."}
@@ -102,6 +102,8 @@ Chat completion against any LLM in the registry.
 Returns one text block with the assistant content. If the model emits tool calls, a second text block containing `tool_calls: <json>` is appended.
 
 Reasoning models (Qwen3, DeepSeek-R1, ...) have the `<think>` block disabled by default to keep small `max_tokens` budgets from being consumed by reasoning. Pass `"chat_template_kwargs": {"enable_thinking": true}` to opt back in.
+
+> **Picking a portable model.** The example above uses `Qwen3-1.7B-GGUF` because GGUF (llama.cpp) runs everywhere lemonade does — Windows, Linux/Docker, macOS, CPU and Vulkan/ROCm/Metal GPUs. Hybrid/NPU variants such as `*-Hybrid` (recipe `ryzenai-llm`, **Windows + AMD RyzenAI** only) or `*-FLM` (recipe `flm`, **AMD Ryzen AI NPU** only) are faster on supported hardware but unavailable on others. If your client picks one that isn't supported, the tool returns a structured error suggesting a portable alternative — prefer `lemonade_list_models` to discover what's actually available on the running server.
 
 ### `lemonade_transcribe_audio`
 
@@ -199,5 +201,5 @@ curl -s http://localhost:13305/mcp -H "Content-Type: application/json" \
 
 # 3. Call lemonade_chat
 curl -s http://localhost:13305/mcp -H "Content-Type: application/json" \
-    -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lemonade_chat","arguments":{"model":"Qwen3-1.7B-Hybrid","messages":[{"role":"user","content":"hi"}],"max_tokens":16}}}'
+    -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lemonade_chat","arguments":{"model":"Qwen3-1.7B-GGUF","messages":[{"role":"user","content":"hi"}],"max_tokens":16}}}'
 ```

@@ -117,6 +117,65 @@ std::string disk_path_error(const char* arg_name, const std::string& value) {
     return msg;
 }
 
+// If `model` exists in the raw registry but was filtered out on this system
+// (e.g. a `*-Hybrid` (ryzenai-llm) model on Linux/Docker, or a `*-FLM` model
+// on a machine without an AMD Ryzen AI NPU), return a tool-call error JSON
+// naming the reason and suggesting a portable alternative. Returns nullopt
+// when the model is supported here, or when it's not in the registry at all
+// — downstream handlers produce their normal errors in those cases.
+//
+// `tool_label` is the human-facing tool noun used in the suggestion sentence
+// (e.g. "chat"). `recipe_substrings` lists recipe-name substrings that mark
+// a candidate suitable for this tool kind; the first supported, suggested
+// model whose recipe matches any substring wins. Pass an empty list to skip
+// the suggestion (the filter reason alone is still returned).
+std::optional<json> unsupported_model_error(
+        ModelManager* model_manager,
+        const std::string& model,
+        const char* tool_label,
+        std::initializer_list<const char*> recipe_substrings) {
+    if (model_manager->model_exists(model)) return std::nullopt;
+    if (!model_manager->model_exists_unfiltered(model)) return std::nullopt;
+
+    std::string reason = model_manager->get_model_filter_reason(model);
+    if (reason.empty()) {
+        reason = "This model is not available on the running lemonade server.";
+    }
+
+    std::string msg = "Model '" + model + "' is not available on this lemonade server. " +
+                      reason;
+
+    // Suggest the first supported, `suggested`-flagged model whose recipe
+    // matches one of the requested families.
+    if (recipe_substrings.size() > 0) {
+        std::string suggestion;
+        for (const auto& [name, info] : model_manager->get_supported_models()) {
+            if (!info.suggested) continue;
+            bool matches = false;
+            for (const char* needle : recipe_substrings) {
+                if (info.recipe.find(needle) != std::string::npos) {
+                    matches = true;
+                    break;
+                }
+            }
+            if (!matches) continue;
+            suggestion = name;
+            break;
+        }
+        if (!suggestion.empty()) {
+            msg += " Try '" + suggestion + "' for portable " + tool_label +
+                   ", or call `lemonade_list_models` to see what's available.";
+        } else {
+            msg += " Call `lemonade_list_models` to discover what's available.";
+        }
+    }
+
+    return json{
+        {"content", json::array({json{{"type", "text"}, {"text", msg}}})},
+        {"isError", true},
+    };
+}
+
 }  // namespace
 
 McpServer::McpServer(Router* router, ModelManager* model_manager, EnsureLoadedFn ensure_loaded)
@@ -124,198 +183,7 @@ McpServer::McpServer(Router* router, ModelManager* model_manager, EnsureLoadedFn
       model_manager_(model_manager),
       ensure_loaded_(std::move(ensure_loaded)) {}
 
-McpServer::~McpServer() {
-    // Detach any preparation threads still running at shutdown. They hold a
-    // shared_ptr to their own ModelPreparation entry (not to this McpServer)
-    // and only call into router_/model_manager_ via the ensure_loaded_
-    // std::function — which captures the Server, whose lifetime matches the
-    // process. Detaching is safer than blocking shutdown on a multi-minute
-    // download.
-    std::lock_guard<std::mutex> lock(preparations_mutex_);
-    for (auto& kv : preparations_) {
-        if (kv.second->worker.joinable()) {
-            kv.second->worker.detach();
-        }
-    }
-}
-
-std::optional<json> McpServer::begin_or_check_preparation(const std::string& model) {
-    // Collection recipes (e.g. collection.omni) never register a server
-    // under the collection name itself — only their components do. So a
-    // plain `router_->is_model_loaded(collection_name)` always returns false
-    // and we have to walk the components instead. Returns true if the model
-    // is ready to use right now.
-    auto is_ready = [this](const std::string& name) -> bool {
-        if (router_->is_model_loaded(name)) return true;
-        if (!model_manager_->model_exists(name)) return false;
-        try {
-            auto info = model_manager_->get_model_info(name);
-            if (!is_collection_recipe(info.recipe) || info.components.empty()) {
-                return false;
-            }
-            for (const auto& component : info.components) {
-                if (!router_->is_model_loaded(component)) return false;
-            }
-            return true;
-        } catch (...) {
-            return false;
-        }
-    };
-
-    // Fast path: the model is already loaded. Clean up any stale tracker
-    // (e.g. from a previous preparation that succeeded) and let the caller
-    // proceed synchronously.
-    auto try_proceed_if_loaded = [this, &model, &is_ready]() -> bool {
-        if (!is_ready(model)) return false;
-        std::shared_ptr<ModelPreparation> stale;
-        {
-            std::lock_guard<std::mutex> lock(preparations_mutex_);
-            auto it = preparations_.find(model);
-            if (it != preparations_.end()) {
-                stale = it->second;
-                preparations_.erase(it);
-            }
-        }
-        if (stale && stale->worker.joinable()) {
-            stale->worker.join();
-        }
-        return true;
-    };
-
-    if (try_proceed_if_loaded()) return std::nullopt;
-
-    std::shared_ptr<ModelPreparation> prep;
-    bool just_started = false;
-    {
-        std::lock_guard<std::mutex> lock(preparations_mutex_);
-        auto it = preparations_.find(model);
-        if (it == preparations_.end()) {
-            prep = std::make_shared<ModelPreparation>();
-            prep->started_at = std::chrono::steady_clock::now();
-
-            // Capture ensure_loaded_ (a std::function copy) and the prep
-            // shared_ptr — no `this` capture, so the worker is safe even if
-            // the McpServer is torn down before it finishes.
-            EnsureLoadedFn ensure_loaded = ensure_loaded_;
-            prep->worker = std::thread([prep, ensure_loaded, model]() {
-                bool ok = false;
-                try {
-                    ensure_loaded(model);
-                    ok = true;
-                } catch (const std::exception& e) {
-                    prep->error_message = e.what();
-                } catch (...) {
-                    prep->error_message = "Unknown error during model preparation";
-                }
-                prep->succeeded.store(ok);
-                {
-                    // Lock-then-store ensures any thread that has just
-                    // released cv_mutex inside wait_for cannot miss the
-                    // notification (classic cv handshake).
-                    std::lock_guard<std::mutex> notify_lock(prep->cv_mutex);
-                    prep->done.store(true);
-                }
-                prep->cv.notify_all();
-            });
-
-            preparations_[model] = prep;
-            just_started = true;
-        } else {
-            prep = it->second;
-        }
-    }
-
-    if (just_started) {
-        LOG(INFO, "McpServer") << "Started background preparation for model: " << model << std::endl;
-    }
-
-    // Give a fast preparation (cached weights, small subprocess startup) a
-    // chance to complete in this same HTTP round-trip so callers don't have
-    // to do a pointless "preparing → retry" hop for already-downloaded
-    // models. The 10s budget is well above typical load latencies for small
-    // models and negligible compared to a multi-GB download where we'll
-    // return the "preparing" placeholder regardless.
-    if (!prep->done.load()) {
-        constexpr auto kSyncWaitTimeout = std::chrono::seconds(10);
-        std::unique_lock<std::mutex> wait_lock(prep->cv_mutex);
-        prep->cv.wait_for(wait_lock, kSyncWaitTimeout,
-                          [&prep]() { return prep->done.load(); });
-    }
-
-    // Preparation finished. Surface success/failure and drop the tracker so
-    // the next call can start fresh if needed.
-    if (prep->done.load()) {
-        const bool ok = prep->succeeded.load();
-        const std::string err = prep->error_message;
-        {
-            std::lock_guard<std::mutex> lock(preparations_mutex_);
-            auto it = preparations_.find(model);
-            if (it != preparations_.end() && it->second.get() == prep.get()) {
-                preparations_.erase(it);
-            }
-        }
-        if (prep->worker.joinable()) {
-            prep->worker.join();
-        }
-
-        if (!ok) {
-            std::string msg = "Failed to prepare model '" + model + "': " + err;
-            LOG(ERROR, "McpServer") << msg << std::endl;
-            return json{
-                {"content", json::array({text_content_block(msg)})},
-                {"isError", true},
-            };
-        }
-
-        // ensure_loaded() returned without throwing. Trust it and let the
-        // caller proceed. (An earlier version of this code re-checked
-        // router_->is_model_loaded(model) here to catch a rare eviction
-        // race, but that always failed for collection recipes — whose
-        // collection name never has a server of its own — and trapped
-        // collection tools like lemonade_omni in a permanent retry loop.
-        // If the model really does get evicted before the downstream call
-        // runs, that call will surface its own error.)
-        return std::nullopt;
-    }
-
-    // Still preparing after the sync wait. Return a clearly actionable
-    // retry hint so the agent doesn't burn its retry budget on tight-loop
-    // polling.
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
-                         now - prep->started_at)
-                         .count();
-    constexpr int kRetryAfterSeconds = 30;
-
-    std::ostringstream summary;
-    summary << "Model '" << model << "' is being prepared in the background "
-            << "(downloading from Hugging Face if needed, then loading into "
-            << "memory). This typically takes anywhere from a few seconds "
-            << "for cached models to several minutes for multi-GB downloads. "
-            << "Preparation started " << elapsed_s
-            << " second(s) ago and is still in progress.\n\n"
-            << "ACTION: wait ~" << kRetryAfterSeconds
-            << " seconds, then call this same tool again with the same "
-            << "arguments. The call returns immediately while preparation "
-            << "continues in the background, and will succeed as soon as the "
-            << "model is ready. Do NOT abandon the task — the download is "
-            << "still running on the server even if you stop calling.";
-
-    json status = {
-        {"status", "preparing"},
-        {"model", model},
-        {"elapsed_seconds", static_cast<int>(elapsed_s)},
-        {"retry_after_seconds", kRetryAfterSeconds},
-    };
-
-    return json{
-        {"content", json::array({
-            text_content_block(summary.str()),
-            text_content_block(status.dump()),
-        })},
-        {"isError", true},
-    };
-}
+McpServer::~McpServer() = default;
 
 void McpServer::register_routes(httplib::Server& server) {
     auto self = shared_from_this();
@@ -513,9 +381,11 @@ json McpServer::tool_chat(const json& arguments) {
         throw std::runtime_error("Missing or non-array argument: messages");
     }
 
-    if (auto pending = begin_or_check_preparation(model); pending) {
-        return *pending;
+    if (auto err = unsupported_model_error(model_manager_, model, "chat", {"llamacpp"})) {
+        return *err;
     }
+
+    ensure_loaded_(model);
 
     json openai_request = {
         {"model", model},
@@ -602,15 +472,6 @@ json McpServer::tool_transcribe_audio(const json& arguments) {
             "Provide either `audio_path` (path to a local audio file) or "
             "`audio_base64` (base64-encoded audio bytes).");
     }
-
-    // Kick off (or poll) model preparation BEFORE reading the audio bytes
-    // from disk — for big WAVs that read is itself non-trivial, and the
-    // model download is the dominant cost we want to overlap with the
-    // caller's retry interval.
-    if (auto pending = begin_or_check_preparation(model); pending) {
-        return *pending;
-    }
-
     if (has_path) {
         const std::string path = arguments["audio_path"].get<std::string>();
         std::error_code ec;
@@ -641,6 +502,12 @@ json McpServer::tool_transcribe_audio(const json& arguments) {
             filename = "audio.wav";
         }
     }
+
+    if (auto err = unsupported_model_error(model_manager_, model, "transcription", {"whispercpp"})) {
+        return *err;
+    }
+
+    ensure_loaded_(model);
 
     json router_request = {
         {"model", model},
@@ -700,9 +567,11 @@ json McpServer::tool_generate_image(const json& arguments) {
         }
     }
 
-    if (auto pending = begin_or_check_preparation(model); pending) {
-        return *pending;
+    if (auto err = unsupported_model_error(model_manager_, model, "image generation", {"sd-cpp"})) {
+        return *err;
     }
+
+    ensure_loaded_(model);
 
     json router_request = {
         {"model", model},
@@ -825,6 +694,10 @@ json McpServer::tool_omni(const json& arguments) {
         throw std::runtime_error("Missing or non-array argument: messages");
     }
 
+    if (auto err = unsupported_model_error(model_manager_, model, "Omni", {"collection.omni"})) {
+        return *err;
+    }
+
     if (!model_manager_->model_exists(model)) {
         return json{
             {"content", json::array({text_content_block(
@@ -862,16 +735,6 @@ json McpServer::tool_omni(const json& arguments) {
         }
     }
 
-    // Preparation runs OUTSIDE the omni_serial_mutex below so concurrent
-    // callers each get a fast "preparing" response instead of stacking up
-    // behind the mutex while the (potentially multi-GB) collection downloads.
-    // `ensure_loaded_` dispatches to ensure_collection_loaded() for
-    // collection recipes, which pulls and loads every component (planner LLM,
-    // image model, TTS voice, ...).
-    if (auto pending = begin_or_check_preparation(model); pending) {
-        return *pending;
-    }
-
     // Serialize concurrent lemonade_omni invocations process-wide. The
     // planner emits jinja-templated chat completions with a long system
     // prompt + multiple tool definitions; llama-server (Vulkan + MTP draft
@@ -883,6 +746,11 @@ json McpServer::tool_omni(const json& arguments) {
     // backends and are unaffected.
     static std::mutex omni_serial_mutex;
     std::lock_guard<std::mutex> omni_lock(omni_serial_mutex);
+
+    // ensure_loaded_ dispatches to ensure_collection_loaded() under the hood
+    // when the recipe is `collection.omni`, so this pulls down + loads every
+    // component (planner LLM, image model, TTS voice, ...).
+    ensure_loaded_(model);
 
     json openai_request = {
         {"model", model},
@@ -1155,17 +1023,7 @@ json McpServer::tools_descriptor() {
              "array (OpenAI chat format) and the model name. If you don't "
              "know which model name to use, call `lemonade_list_models` "
              "first — passing a model that isn't loaded may trigger a "
-             "multi-GB download.\n\n"
-             "ASYNC MODEL PREP: when the requested model isn't ready, this "
-             "tool returns immediately with `isError=true` and a status "
-             "text block whose JSON contains "
-             "`{\"status\":\"preparing\",\"retry_after_seconds\":N}`. "
-             "The download/load continues on the server — wait the "
-             "indicated seconds and call this tool again with the SAME "
-             "arguments. Repeat until you get a real response. DO NOT give "
-             "up after a few retries; multi-GB downloads can take 10+ "
-             "minutes and the server keeps working even if you stop "
-             "calling."},
+             "multi-GB download."},
             {"inputSchema", {
                 {"type", "object"},
                 {"required", json::array({"model", "messages"})},
@@ -1193,12 +1051,7 @@ json McpServer::tools_descriptor() {
              "caller, so prefer `audio_path` (an absolute path to a local "
              "audio file: wav, mp3, m4a, ogg, flac, webm). Use "
              "`audio_base64` only when you genuinely have audio bytes in "
-             "memory. Exactly one of the two must be provided.\n\n"
-             "ASYNC MODEL PREP: see `lemonade_chat` — if the model isn't "
-             "ready this returns `isError=true` with a `status=preparing` "
-             "JSON block. Wait the indicated `retry_after_seconds` and "
-             "call again with the same arguments; the download continues "
-             "on the server."},
+             "memory. Exactly one of the two must be provided."},
             {"inputSchema", {
                 {"type", "object"},
                 {"required", json::array({"model"})},
@@ -1225,12 +1078,7 @@ json McpServer::tools_descriptor() {
              "`output_path` (single image) or `output_dir` (one or more). "
              "When you do, the tool returns absolute file path(s) as text — "
              "no base64 round-trip and dramatically fewer tokens. Only omit "
-             "both arguments when you genuinely need the image inline.\n\n"
-             "ASYNC MODEL PREP: see `lemonade_chat` — if the model isn't "
-             "ready this returns `isError=true` with a `status=preparing` "
-             "JSON block. Wait the indicated `retry_after_seconds` and "
-             "call again with the same arguments; the download continues "
-             "on the server."},
+             "both arguments when you genuinely need the image inline."},
             {"inputSchema", {
                 {"type", "object"},
                 {"required", json::array({"model", "prompt"})},
@@ -1267,14 +1115,7 @@ json McpServer::tools_descriptor() {
              "first use and may be multi-GB. Same-machine deployment: PREFER "
              "`output_dir` to write artifacts to disk and avoid expensive "
              "inline base64 blobs. For plain text chat against a regular "
-             "LLM, use `lemonade_chat` instead.\n\n"
-             "ASYNC MODEL PREP: see `lemonade_chat` — if the collection "
-             "isn't ready (downloading or loading any of its component "
-             "models) this returns `isError=true` with a `status=preparing` "
-             "JSON block. Wait the indicated `retry_after_seconds` and call "
-             "again with the same arguments; the download continues on the "
-             "server. Omni collections are bundles of several models so the "
-             "first preparation often takes many minutes."},
+             "LLM, use `lemonade_chat` instead."},
             {"inputSchema", {
                 {"type", "object"},
                 {"required", json::array({"messages"})},
