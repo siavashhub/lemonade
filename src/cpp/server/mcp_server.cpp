@@ -1,5 +1,6 @@
 #include "lemon/mcp_server.h"
 
+#include <cctype>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -71,6 +72,49 @@ json normalize_messages(const json& messages) {
         out.push_back(std::move(normalized));
     }
     return out;
+}
+
+// Build a prescriptive error message for rejected disk-output paths. The path
+// is interpreted by std::filesystem running on the *server*, so a host-side
+// Windows path looks non-absolute to a Linux server (e.g. lemonade in Docker)
+// and vice versa. The plain "must be an absolute path" message sent planner
+// LLMs into a long retry loop trying drive-letter / slash variations; tell
+// them up front to switch to inline mode when host and server differ.
+std::string disk_path_error(const char* arg_name, const std::string& value) {
+    std::string msg;
+    msg += "`";
+    msg += arg_name;
+    msg += "` must be an absolute path on the lemonade server's filesystem (got: '";
+    msg += value;
+    msg += "').";
+
+#ifdef _WIN32
+    constexpr bool server_is_windows = true;
+#else
+    constexpr bool server_is_windows = false;
+#endif
+    const bool looks_like_windows_path =
+        value.size() >= 2 &&
+        std::isalpha(static_cast<unsigned char>(value[0])) &&
+        value[1] == ':';
+    const bool looks_like_posix_path = !value.empty() && value[0] == '/';
+
+    if (server_is_windows && looks_like_posix_path) {
+        msg += " The lemonade server is running on Windows; use a Windows absolute path"
+               " (e.g. C:\\out\\demo).";
+    } else if (!server_is_windows && looks_like_windows_path) {
+        msg += " The lemonade server is running on a POSIX system (Linux/Docker/macOS);"
+               " the path you gave is a host-side Windows path the server cannot see."
+               " Use a POSIX absolute path (e.g. /tmp/demo), or — recommended when the"
+               " caller and server are on different machines or containers — omit `";
+        msg += arg_name;
+        msg += "` to receive artifacts inline as MCP content blocks.";
+    } else {
+        msg += " Use an absolute path on the server, or omit `";
+        msg += arg_name;
+        msg += "` to receive artifacts inline.";
+    }
+    return msg;
 }
 
 }  // namespace
@@ -444,15 +488,13 @@ json McpServer::tool_generate_image(const json& arguments) {
     if (has_output_path) {
         output_path = arguments["output_path"].get<std::string>();
         if (!output_path.is_absolute()) {
-            throw std::runtime_error(
-                "`output_path` must be an absolute path: " + output_path.string());
+            throw std::runtime_error(disk_path_error("output_path", output_path.string()));
         }
     }
     if (has_output_dir) {
         output_dir = arguments["output_dir"].get<std::string>();
         if (!output_dir.is_absolute()) {
-            throw std::runtime_error(
-                "`output_dir` must be an absolute path: " + output_dir.string());
+            throw std::runtime_error(disk_path_error("output_dir", output_dir.string()));
         }
     }
 
@@ -612,8 +654,7 @@ json McpServer::tool_omni(const json& arguments) {
     if (has_output_dir) {
         output_dir = arguments["output_dir"].get<std::string>();
         if (!output_dir.is_absolute()) {
-            throw std::runtime_error(
-                "`output_dir` must be an absolute path: " + output_dir.string());
+            throw std::runtime_error(disk_path_error("output_dir", output_dir.string()));
         }
     }
 
@@ -968,9 +1009,9 @@ json McpServer::tools_descriptor() {
                     {"model",  {{"type", "string"}}},
                     {"prompt", {{"type", "string"}}},
                     {"output_path", {{"type", "string"},
-                                     {"description", "Absolute path of the PNG file to write. Only valid when n == 1."}}},
+                                     {"description", "Absolute path (on the lemonade server's filesystem) of the PNG file to write. Only valid when n == 1. Omit if the caller and server are on different machines/containers and you cannot name a path the server can write to."}}},
                     {"output_dir",  {{"type", "string"},
-                                     {"description", "Absolute path of a directory to write image_0.png, image_1.png, ... into."}}},
+                                     {"description", "Absolute path (on the lemonade server's filesystem) of a directory to write image_0.png, image_1.png, ... into. Omit if the caller and server are on different machines/containers and you cannot name a path the server can write to."}}},
                     {"size",   {{"type", "string"}}},
                     {"n",      {{"type", "integer"}, {"minimum", 1}}},
                     {"negative_prompt", {{"type", "string"}}},
@@ -1006,7 +1047,7 @@ json McpServer::tools_descriptor() {
                                      {"description", "Optional. Omni collection name (recipe='collection.omni'). Defaults to LMX-Omni-5.5B-Lite."}}},
                     {"messages",    {{"type", "array"}, {"items", {{"type", "object"}}}}},
                     {"output_dir",  {{"type", "string"},
-                                     {"description", "Absolute path of a directory to write produced artifacts (omni_0.png, omni_1.mp3, ...) into. PREFER this to inline base64."}}},
+                                     {"description", "Absolute path (on the lemonade server's filesystem) of a directory to write produced artifacts (omni_0.png, omni_1.mp3, ...) into. PREFER this to inline base64 when caller and server share a filesystem. Omit when the caller and server are on different machines or containers (e.g. lemonade in Docker, or accessed over the network) — artifacts then come back inline as MCP content blocks."}}},
                     {"temperature", {{"type", "number"}}},
                     {"top_p",       {{"type", "number"}}},
                     {"max_tokens",  {{"type", "integer"}}},
