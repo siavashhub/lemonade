@@ -67,7 +67,3 @@ Use `/think` to control whether the model reasons at all:
 | `Esc` / `Ctrl-U` | Clear the current line |
 | `Ctrl-C` | Stop a streaming response, cancel a multi-line buffer, or exit at an empty prompt |
 | `Ctrl-D` / `Ctrl-Z` | Exit (EOF) |
-
-## When to use something else
-
-The REPL is intentionally minimal — chat in, chat out. If you want a coding agent that reads files, runs shell commands, or edits code, use [`lemonade launch`](../guide/cli.md#options-for-launch) pointed at your local Lemonade server.
