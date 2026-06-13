@@ -15,6 +15,7 @@
 #include "lemon/collection_orchestrator.h"
 #include "lemon/model_types.h"
 #include "lemon/utils/json_utils.h"
+#include "lemon/utils/path_utils.h"
 #include "lemon/version.h"
 
 namespace lemon {
@@ -74,49 +75,6 @@ json normalize_messages(const json& messages) {
     return out;
 }
 
-// Build a prescriptive error message for rejected disk-output paths. The path
-// is interpreted by std::filesystem running on the *server*, so a host-side
-// Windows path looks non-absolute to a Linux server (e.g. lemonade in Docker)
-// and vice versa. The plain "must be an absolute path" message sent planner
-// LLMs into a long retry loop trying drive-letter / slash variations; tell
-// them up front to switch to inline mode when host and server differ.
-std::string disk_path_error(const char* arg_name, const std::string& value) {
-    std::string msg;
-    msg += "`";
-    msg += arg_name;
-    msg += "` must be an absolute path on the lemonade server's filesystem (got: '";
-    msg += value;
-    msg += "').";
-
-#ifdef _WIN32
-    constexpr bool server_is_windows = true;
-#else
-    constexpr bool server_is_windows = false;
-#endif
-    const bool looks_like_windows_path =
-        value.size() >= 2 &&
-        std::isalpha(static_cast<unsigned char>(value[0])) &&
-        value[1] == ':';
-    const bool looks_like_posix_path = !value.empty() && value[0] == '/';
-
-    if (server_is_windows && looks_like_posix_path) {
-        msg += " The lemonade server is running on Windows; use a Windows absolute path"
-               " (e.g. C:\\out\\demo).";
-    } else if (!server_is_windows && looks_like_windows_path) {
-        msg += " The lemonade server is running on a POSIX system (Linux/Docker/macOS);"
-               " the path you gave is a host-side Windows path the server cannot see."
-               " Use a POSIX absolute path (e.g. /tmp/demo), or — recommended when the"
-               " caller and server are on different machines or containers — omit `";
-        msg += arg_name;
-        msg += "` to receive artifacts inline as MCP content blocks.";
-    } else {
-        msg += " Use an absolute path on the server, or omit `";
-        msg += arg_name;
-        msg += "` to receive artifacts inline.";
-    }
-    return msg;
-}
-
 // If `model` exists in the raw registry but was filtered out on this system
 // (e.g. a `*-Hybrid` (ryzenai-llm) model on Linux/Docker, or a `*-FLM` model
 // on a machine without an AMD Ryzen AI NPU), return a tool-call error JSON
@@ -174,6 +132,55 @@ std::optional<json> unsupported_model_error(
         {"content", json::array({json{{"type", "text"}, {"text", msg}}})},
         {"isError", true},
     };
+}
+
+// Root directory that MCP image writes are confined to. Defaults to
+// <cache_dir>/mcp-images; override with the LEMONADE_MCP_IMAGE_DIR environment
+// variable (must be an absolute path). Created on demand. weakly_canonical
+// resolves symlinks in the existing prefix so containment checks below cannot
+// be fooled by a symlinked sandbox root.
+std::filesystem::path mcp_image_sandbox_root() {
+    const std::string override_dir =
+        utils::get_environment_variable_utf8("LEMONADE_MCP_IMAGE_DIR");
+    std::filesystem::path root =
+        override_dir.empty()
+            ? utils::path_from_utf8(utils::get_cache_dir()) / "mcp-images"
+            : utils::path_from_utf8(override_dir);
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    std::filesystem::path canonical = std::filesystem::weakly_canonical(root, ec);
+    return ec ? root.lexically_normal() : canonical;
+}
+
+// Resolve a caller-supplied path and confine it to `root`. Relative paths are
+// taken relative to `root`; absolute paths must already live inside it. Rejects
+// `..` traversal and symlink escapes by resolving with weakly_canonical and
+// verifying the result is still a descendant of `root`. `label` names the
+// argument for error messages.
+std::filesystem::path sanitize_sandboxed_path(const std::string& raw,
+                                              const std::filesystem::path& root,
+                                              const char* label) {
+    if (raw.empty()) {
+        throw std::runtime_error(std::string("`") + label + "` must not be empty.");
+    }
+    const std::filesystem::path requested = utils::path_from_utf8(raw);
+    const std::filesystem::path combined =
+        requested.is_absolute() ? requested : (root / requested);
+    std::error_code ec;
+    std::filesystem::path resolved = std::filesystem::weakly_canonical(combined, ec);
+    if (ec) resolved = combined.lexically_normal();
+
+    const std::filesystem::path rel = resolved.lexically_relative(root);
+    const bool inside = !rel.empty() && rel.begin()->string() != "..";
+    if (!inside) {
+        throw std::runtime_error(
+            std::string("`") + label +
+            "` must resolve to a location inside the MCP image sandbox (" +
+            utils::path_to_utf8(root) +
+            "). Set LEMONADE_MCP_IMAGE_DIR to change the sandbox root. Rejected: " +
+            raw);
+    }
+    return resolved;
 }
 
 }  // namespace
@@ -544,6 +551,10 @@ json McpServer::tool_generate_image(const json& arguments) {
     // tokens per image and some clients surface them as opaque resource URIs
     // the agent has to round-trip back to disk. Letting the caller name the
     // destination avoids both. Symmetric with `audio_path`.
+    //
+    // SECURITY: writes are confined to a sandbox directory (see
+    // mcp_image_sandbox_root) so a cross-origin/unauthenticated caller cannot
+    // overwrite arbitrary files (e.g. ~/.bashrc) via output_path/output_dir.
     const bool has_output_path = arguments.contains("output_path") &&
                                  arguments["output_path"].is_string();
     const bool has_output_dir  = arguments.contains("output_dir") &&
@@ -552,19 +563,17 @@ json McpServer::tool_generate_image(const json& arguments) {
         throw std::runtime_error(
             "Provide at most one of `output_path` or `output_dir`, not both.");
     }
+    const bool overwrite = arguments.value("overwrite", false);
+    const std::filesystem::path sandbox_root = mcp_image_sandbox_root();
     std::filesystem::path output_path;
     std::filesystem::path output_dir;
     if (has_output_path) {
-        output_path = arguments["output_path"].get<std::string>();
-        if (!output_path.is_absolute()) {
-            throw std::runtime_error(disk_path_error("output_path", output_path.string()));
-        }
+        output_path = sanitize_sandboxed_path(
+            arguments["output_path"].get<std::string>(), sandbox_root, "output_path");
     }
     if (has_output_dir) {
-        output_dir = arguments["output_dir"].get<std::string>();
-        if (!output_dir.is_absolute()) {
-            throw std::runtime_error(disk_path_error("output_dir", output_dir.string()));
-        }
+        output_dir = sanitize_sandboxed_path(
+            arguments["output_dir"].get<std::string>(), sandbox_root, "output_dir");
     }
 
     if (auto err = unsupported_model_error(model_manager_, model, "image generation", {"sd-cpp"})) {
@@ -646,6 +655,11 @@ json McpServer::tool_generate_image(const json& arguments) {
         std::filesystem::path dest = has_output_path
             ? output_path
             : output_dir / ("image_" + std::to_string(i) + ".png");
+        if (!overwrite && std::filesystem::exists(dest, ec)) {
+            throw std::runtime_error(
+                "Refusing to overwrite existing file (pass overwrite=true to "
+                "allow): " + dest.string());
+        }
         std::string bytes = utils::JsonUtils::base64_decode(b64_images[i]);
         if (bytes.empty()) {
             throw std::runtime_error("Decoded image is empty (index " + std::to_string(i) + ")");
@@ -725,14 +739,18 @@ json McpServer::tool_omni(const json& arguments) {
     // thousands of tokens per artifact; the same disk-mode reasoning as
     // `lemonade_generate_image` applies, plus a single Omni turn can emit
     // mixed media (one image + one TTS clip), so we only accept `output_dir`.
+    //
+    // SECURITY: like lemonade_generate_image, writes are confined to the MCP
+    // image sandbox so an unauthenticated cross-origin caller cannot overwrite
+    // arbitrary files via output_dir.
     const bool has_output_dir = arguments.contains("output_dir") &&
                                 arguments["output_dir"].is_string();
+    const bool overwrite = arguments.value("overwrite", false);
     std::filesystem::path output_dir;
     if (has_output_dir) {
-        output_dir = arguments["output_dir"].get<std::string>();
-        if (!output_dir.is_absolute()) {
-            throw std::runtime_error(disk_path_error("output_dir", output_dir.string()));
-        }
+        output_dir = sanitize_sandboxed_path(
+            arguments["output_dir"].get<std::string>(), mcp_image_sandbox_root(),
+            "output_dir");
     }
 
     // Serialize concurrent lemonade_omni invocations process-wide. The
@@ -842,6 +860,12 @@ json McpServer::tool_omni(const json& arguments) {
         if (has_output_dir) {
             std::filesystem::path dest =
                 output_dir / ("omni_" + std::to_string(i) + extension_for(artifact.mime));
+            std::error_code exists_ec;
+            if (!overwrite && std::filesystem::exists(dest, exists_ec)) {
+                throw std::runtime_error(
+                    "Refusing to overwrite existing file (pass overwrite=true to "
+                    "allow): " + dest.string());
+            }
             std::string bytes = utils::JsonUtils::base64_decode(artifact.data);
             if (bytes.empty()) {
                 throw std::runtime_error(
@@ -1078,7 +1102,11 @@ json McpServer::tools_descriptor() {
              "`output_path` (single image) or `output_dir` (one or more). "
              "When you do, the tool returns absolute file path(s) as text — "
              "no base64 round-trip and dramatically fewer tokens. Only omit "
-             "both arguments when you genuinely need the image inline."},
+             "both arguments when you genuinely need the image inline. For "
+             "safety, disk writes are confined to a sandbox directory "
+             "(<cache_dir>/mcp-images, or LEMONADE_MCP_IMAGE_DIR if set); "
+             "paths outside it, and overwrites of existing files, are "
+             "rejected unless `overwrite` is true."},
             {"inputSchema", {
                 {"type", "object"},
                 {"required", json::array({"model", "prompt"})},
@@ -1086,9 +1114,11 @@ json McpServer::tools_descriptor() {
                     {"model",  {{"type", "string"}}},
                     {"prompt", {{"type", "string"}}},
                     {"output_path", {{"type", "string"},
-                                     {"description", "Absolute path (on the lemonade server's filesystem) of the PNG file to write. Only valid when n == 1. Omit if the caller and server are on different machines/containers and you cannot name a path the server can write to."}}},
+                                     {"description", "Path of the PNG file to write, inside the MCP image sandbox (<cache_dir>/mcp-images or LEMONADE_MCP_IMAGE_DIR). Relative paths resolve against the sandbox root; absolute paths must stay within it. Only valid when n == 1."}}},
                     {"output_dir",  {{"type", "string"},
-                                     {"description", "Absolute path (on the lemonade server's filesystem) of a directory to write image_0.png, image_1.png, ... into. Omit if the caller and server are on different machines/containers and you cannot name a path the server can write to."}}},
+                                     {"description", "Directory to write image_0.png, image_1.png, ... into, inside the MCP image sandbox. Relative paths resolve against the sandbox root; absolute paths must stay within it."}}},
+                    {"overwrite", {{"type", "boolean"},
+                                   {"description", "Allow overwriting existing files at the destination. Defaults to false."}}},
                     {"size",   {{"type", "string"}}},
                     {"n",      {{"type", "integer"}, {"minimum", 1}}},
                     {"negative_prompt", {{"type", "string"}}},
@@ -1124,7 +1154,9 @@ json McpServer::tools_descriptor() {
                                      {"description", "Optional. Omni collection name (recipe='collection.omni'). Defaults to LMX-Omni-5.5B-Lite."}}},
                     {"messages",    {{"type", "array"}, {"items", {{"type", "object"}}}}},
                     {"output_dir",  {{"type", "string"},
-                                     {"description", "Absolute path (on the lemonade server's filesystem) of a directory to write produced artifacts (omni_0.png, omni_1.mp3, ...) into. PREFER this to inline base64 when caller and server share a filesystem. Omit when the caller and server are on different machines or containers (e.g. lemonade in Docker, or accessed over the network) — artifacts then come back inline as MCP content blocks."}}},
+                                     {"description", "Directory to write produced artifacts (omni_0.png, omni_1.mp3, ...) into, inside the MCP image sandbox (<cache_dir>/mcp-images or LEMONADE_MCP_IMAGE_DIR). Relative paths resolve against the sandbox root; absolute paths must stay within it. PREFER this to inline base64 when caller and server share a filesystem. Omit to receive artifacts inline as MCP content blocks."}}},
+                    {"overwrite",   {{"type", "boolean"},
+                                     {"description", "Allow overwriting existing files in output_dir. Defaults to false."}}},
                     {"temperature", {{"type", "number"}}},
                     {"top_p",       {{"type", "number"}}},
                     {"max_tokens",  {{"type", "integer"}}},

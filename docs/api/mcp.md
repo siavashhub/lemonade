@@ -133,12 +133,19 @@ Generate one or more PNGs from a prompt. **Prefer writing to disk** via `output_
     "model": "SDXL-Turbo",
     "prompt": "a lemon-shaped car driving across the moon",
     "size": "512x512",
-    "output_path": "C:/out/lemon-car.png"
+    "output_path": "lemon-car.png"
   }
 }
 ```
 
 When disk paths are provided, returns text block(s) with the absolute path(s). Otherwise, returns one inline image content block per image (`{"type":"image", "data":"<base64>", "mimeType":"image/png"}`).
+
+**Sandboxed disk writes.** To prevent a cross-origin or unauthenticated caller from overwriting arbitrary files, `output_path` and `output_dir` are confined to a sandbox directory:
+
+- Default: `<cache_dir>/mcp-images`.
+- Override with the `LEMONADE_MCP_IMAGE_DIR` environment variable (absolute path).
+- Relative paths resolve against the sandbox root; absolute paths must stay within it. Paths that escape the sandbox (via `..` or symlinks) are rejected.
+- Existing files are **not** overwritten unless you pass `"overwrite": true`.
 
 ### `lemonade_omni`
 
@@ -155,12 +162,12 @@ Use `lemonade_chat` instead when you only need plain-text LLM output and don't w
     "messages": [
       {"role": "user", "content": "Generate an image of a lemon car, then read out a one-line description."}
     ],
-    "output_dir": "C:/out/omni"
+    "output_dir": "omni"
   }
 }
 ```
 
-**Disk vs. inline output.** A single Omni turn can produce both images and audio in arbitrary order. Pass an absolute `output_dir` to write each artifact to disk as `omni_0.<ext>`, `omni_1.<ext>`, ... (the tool returns one text block per artifact with its absolute path, plus a JSON-stringified `paths` array). This is strongly preferred over inline base64 for the same reasons documented under `lemonade_generate_image` — and is the **only** way to get audio out on clients that don't render `audio` content blocks.
+**Disk vs. inline output.** A single Omni turn can produce both images and audio in arbitrary order. Pass an `output_dir` to write each artifact to disk as `omni_0.<ext>`, `omni_1.<ext>`, ... (the tool returns one text block per artifact with its absolute path, plus a JSON-stringified `paths` array). This is strongly preferred over inline base64 for the same reasons documented under `lemonade_generate_image` — and is the **only** way to get audio out on clients that don't render `audio` content blocks. Like `lemonade_generate_image`, `output_dir` is confined to the MCP image sandbox (see **Sandboxed disk writes** above): relative paths resolve against the sandbox root, paths escaping it are rejected, and existing files are not overwritten unless you pass `"overwrite": true`.
 
 When `output_dir` is omitted, artifacts are inlined as MCP content blocks: `{"type":"image", "data":"<base64>", "mimeType":"image/png"}` and `{"type":"audio", "data":"<base64>", "mimeType":"audio/mpeg"}`.
 
