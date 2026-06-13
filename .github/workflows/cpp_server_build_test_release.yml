@@ -1497,8 +1497,8 @@ jobs:
         shell: bash
         run: .venv/bin/python test/server_endpoints.py --cli-binary lemonade
 
-      # The --full flag can be added to run the full test suite, but it would
-      # significantly add to the pipeline runtime.
+      # The full smoke test can be added to a different GPU equipped pipeline
+      # as well if needed, but it would significantly add to the pipeline runtime.
       - name: Test mcp
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         shell: bash

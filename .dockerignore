@@ -1,3 +1,6 @@
+# Local build output
+build
+
 # Git / repo metadata
 .git
 .github
