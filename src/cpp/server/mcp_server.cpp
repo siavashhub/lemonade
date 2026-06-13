@@ -1,8 +1,10 @@
 #include "lemon/mcp_server.h"
 
+#include <cctype>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -10,6 +12,8 @@
 
 #include <lemon/utils/aixlog.hpp>
 
+#include "lemon/collection_orchestrator.h"
+#include "lemon/model_types.h"
 #include "lemon/utils/json_utils.h"
 #include "lemon/version.h"
 
@@ -25,6 +29,11 @@ constexpr int kJsonRpcInternalError   = -32603;
 
 constexpr const char* kMcpProtocolVersion = "2025-06-18";
 constexpr const char* kServerName = "lemonade-mcp";
+
+// Default model for `lemonade_omni`: the smaller of the two stock Omni
+// collections (~5.5B). The 52B "Halo" build is preferable on capable hardware
+// but is a multi-GB download; users opt into it by passing `model` explicitly.
+constexpr const char* kDefaultOmniModel = "LMX-Omni-5.5B-Lite";
 
 bool is_notification(const json& message) {
     return !message.contains("id");
@@ -65,12 +74,116 @@ json normalize_messages(const json& messages) {
     return out;
 }
 
+// Build a prescriptive error message for rejected disk-output paths. The path
+// is interpreted by std::filesystem running on the *server*, so a host-side
+// Windows path looks non-absolute to a Linux server (e.g. lemonade in Docker)
+// and vice versa. The plain "must be an absolute path" message sent planner
+// LLMs into a long retry loop trying drive-letter / slash variations; tell
+// them up front to switch to inline mode when host and server differ.
+std::string disk_path_error(const char* arg_name, const std::string& value) {
+    std::string msg;
+    msg += "`";
+    msg += arg_name;
+    msg += "` must be an absolute path on the lemonade server's filesystem (got: '";
+    msg += value;
+    msg += "').";
+
+#ifdef _WIN32
+    constexpr bool server_is_windows = true;
+#else
+    constexpr bool server_is_windows = false;
+#endif
+    const bool looks_like_windows_path =
+        value.size() >= 2 &&
+        std::isalpha(static_cast<unsigned char>(value[0])) &&
+        value[1] == ':';
+    const bool looks_like_posix_path = !value.empty() && value[0] == '/';
+
+    if (server_is_windows && looks_like_posix_path) {
+        msg += " The lemonade server is running on Windows; use a Windows absolute path"
+               " (e.g. C:\\out\\demo).";
+    } else if (!server_is_windows && looks_like_windows_path) {
+        msg += " The lemonade server is running on a POSIX system (Linux/Docker/macOS);"
+               " the path you gave is a host-side Windows path the server cannot see."
+               " Use a POSIX absolute path (e.g. /tmp/demo), or — recommended when the"
+               " caller and server are on different machines or containers — omit `";
+        msg += arg_name;
+        msg += "` to receive artifacts inline as MCP content blocks.";
+    } else {
+        msg += " Use an absolute path on the server, or omit `";
+        msg += arg_name;
+        msg += "` to receive artifacts inline.";
+    }
+    return msg;
+}
+
+// If `model` exists in the raw registry but was filtered out on this system
+// (e.g. a `*-Hybrid` (ryzenai-llm) model on Linux/Docker, or a `*-FLM` model
+// on a machine without an AMD Ryzen AI NPU), return a tool-call error JSON
+// naming the reason and suggesting a portable alternative. Returns nullopt
+// when the model is supported here, or when it's not in the registry at all
+// — downstream handlers produce their normal errors in those cases.
+//
+// `tool_label` is the human-facing tool noun used in the suggestion sentence
+// (e.g. "chat"). `recipe_substrings` lists recipe-name substrings that mark
+// a candidate suitable for this tool kind; the first supported, suggested
+// model whose recipe matches any substring wins. Pass an empty list to skip
+// the suggestion (the filter reason alone is still returned).
+std::optional<json> unsupported_model_error(
+        ModelManager* model_manager,
+        const std::string& model,
+        const char* tool_label,
+        std::initializer_list<const char*> recipe_substrings) {
+    if (model_manager->model_exists(model)) return std::nullopt;
+    if (!model_manager->model_exists_unfiltered(model)) return std::nullopt;
+
+    std::string reason = model_manager->get_model_filter_reason(model);
+    if (reason.empty()) {
+        reason = "This model is not available on the running lemonade server.";
+    }
+
+    std::string msg = "Model '" + model + "' is not available on this lemonade server. " +
+                      reason;
+
+    // Suggest the first supported, `suggested`-flagged model whose recipe
+    // matches one of the requested families.
+    if (recipe_substrings.size() > 0) {
+        std::string suggestion;
+        for (const auto& [name, info] : model_manager->get_supported_models()) {
+            if (!info.suggested) continue;
+            bool matches = false;
+            for (const char* needle : recipe_substrings) {
+                if (info.recipe.find(needle) != std::string::npos) {
+                    matches = true;
+                    break;
+                }
+            }
+            if (!matches) continue;
+            suggestion = name;
+            break;
+        }
+        if (!suggestion.empty()) {
+            msg += " Try '" + suggestion + "' for portable " + tool_label +
+                   ", or call `lemonade_list_models` to see what's available.";
+        } else {
+            msg += " Call `lemonade_list_models` to discover what's available.";
+        }
+    }
+
+    return json{
+        {"content", json::array({json{{"type", "text"}, {"text", msg}}})},
+        {"isError", true},
+    };
+}
+
 }  // namespace
 
 McpServer::McpServer(Router* router, ModelManager* model_manager, EnsureLoadedFn ensure_loaded)
     : router_(router),
       model_manager_(model_manager),
       ensure_loaded_(std::move(ensure_loaded)) {}
+
+McpServer::~McpServer() = default;
 
 void McpServer::register_routes(httplib::Server& server) {
     auto self = shared_from_this();
@@ -236,6 +349,8 @@ json McpServer::handle_tools_call(const json& params, const json& id) {
             result = tool_transcribe_audio(arguments);
         } else if (tool_name == "lemonade_generate_image") {
             result = tool_generate_image(arguments);
+        } else if (tool_name == "lemonade_omni") {
+            result = tool_omni(arguments);
         } else if (tool_name == "lemonade_list_models") {
             result = tool_list_models(arguments);
         } else {
@@ -264,6 +379,10 @@ json McpServer::tool_chat(const json& arguments) {
     const std::string model = extract_string_arg(arguments, "model");
     if (!arguments.contains("messages") || !arguments["messages"].is_array()) {
         throw std::runtime_error("Missing or non-array argument: messages");
+    }
+
+    if (auto err = unsupported_model_error(model_manager_, model, "chat", {"llamacpp"})) {
+        return *err;
     }
 
     ensure_loaded_(model);
@@ -384,6 +503,10 @@ json McpServer::tool_transcribe_audio(const json& arguments) {
         }
     }
 
+    if (auto err = unsupported_model_error(model_manager_, model, "transcription", {"whispercpp"})) {
+        return *err;
+    }
+
     ensure_loaded_(model);
 
     json router_request = {
@@ -434,16 +557,18 @@ json McpServer::tool_generate_image(const json& arguments) {
     if (has_output_path) {
         output_path = arguments["output_path"].get<std::string>();
         if (!output_path.is_absolute()) {
-            throw std::runtime_error(
-                "`output_path` must be an absolute path: " + output_path.string());
+            throw std::runtime_error(disk_path_error("output_path", output_path.string()));
         }
     }
     if (has_output_dir) {
         output_dir = arguments["output_dir"].get<std::string>();
         if (!output_dir.is_absolute()) {
-            throw std::runtime_error(
-                "`output_dir` must be an absolute path: " + output_dir.string());
+            throw std::runtime_error(disk_path_error("output_dir", output_dir.string()));
         }
+    }
+
+    if (auto err = unsupported_model_error(model_manager_, model, "image generation", {"sd-cpp"})) {
+        return *err;
     }
 
     ensure_loaded_(model);
@@ -550,6 +675,228 @@ json McpServer::tool_generate_image(const json& arguments) {
     json paths = json::array();
     for (const auto& p : written) paths.push_back(p.string());
     content.push_back(text_content_block(json{{"paths", std::move(paths)}}.dump()));
+
+    return json{
+        {"content", std::move(content)},
+        {"isError", false},
+    };
+}
+
+json McpServer::tool_omni(const json& arguments) {
+    // `model` is optional — default to LMX-Omni-5.5B-Lite. The 52B "Halo"
+    // build is preferable on capable hardware but is a multi-GB download,
+    // so users opt into it (or any other collection) explicitly.
+    const std::string model = arguments.contains("model") && arguments["model"].is_string()
+                                  ? arguments["model"].get<std::string>()
+                                  : std::string(kDefaultOmniModel);
+
+    if (!arguments.contains("messages") || !arguments["messages"].is_array()) {
+        throw std::runtime_error("Missing or non-array argument: messages");
+    }
+
+    if (auto err = unsupported_model_error(model_manager_, model, "Omni", {"collection.omni"})) {
+        return *err;
+    }
+
+    if (!model_manager_->model_exists(model)) {
+        return json{
+            {"content", json::array({text_content_block(
+                "Unknown model '" + model +
+                "'. Call `lemonade_list_models` to discover available Omni "
+                "collections (recipe = collection.omni), or omit `model` to "
+                "use the default (" + std::string(kDefaultOmniModel) + ").")})},
+            {"isError", true},
+        };
+    }
+
+    ModelInfo info = model_manager_->get_model_info(model);
+    if (!is_collection_recipe(info.recipe)) {
+        return json{
+            {"content", json::array({text_content_block(
+                "Model '" + model + "' is not an Omni collection (recipe='" +
+                info.recipe + "'). Use `lemonade_chat` for plain LLMs, or "
+                "pass an Omni collection name (e.g. " +
+                std::string(kDefaultOmniModel) + ").")})},
+            {"isError", true},
+        };
+    }
+
+    // Optional disk-output mode. MCP image/audio content blocks cost tens of
+    // thousands of tokens per artifact; the same disk-mode reasoning as
+    // `lemonade_generate_image` applies, plus a single Omni turn can emit
+    // mixed media (one image + one TTS clip), so we only accept `output_dir`.
+    const bool has_output_dir = arguments.contains("output_dir") &&
+                                arguments["output_dir"].is_string();
+    std::filesystem::path output_dir;
+    if (has_output_dir) {
+        output_dir = arguments["output_dir"].get<std::string>();
+        if (!output_dir.is_absolute()) {
+            throw std::runtime_error(disk_path_error("output_dir", output_dir.string()));
+        }
+    }
+
+    // Serialize concurrent lemonade_omni invocations process-wide. The
+    // planner emits jinja-templated chat completions with a long system
+    // prompt + multiple tool definitions; llama-server (Vulkan + MTP draft
+    // + mmproj) can crash when several such requests land on it in
+    // parallel. The crash is silent and lemond doesn't notice the dead
+    // child, so follow-up calls surface as `CURL error: Couldn't connect
+    // to server`. A function-local mutex keeps a single planner in flight
+    // and avoids the trigger entirely; other MCP tools fan out to separate
+    // backends and are unaffected.
+    static std::mutex omni_serial_mutex;
+    std::lock_guard<std::mutex> omni_lock(omni_serial_mutex);
+
+    // ensure_loaded_ dispatches to ensure_collection_loaded() under the hood
+    // when the recipe is `collection.omni`, so this pulls down + loads every
+    // component (planner LLM, image model, TTS voice, ...).
+    ensure_loaded_(model);
+
+    json openai_request = {
+        {"model", model},
+        {"messages", normalize_messages(arguments["messages"])},
+        {"stream", false},
+    };
+    for (const char* key : {"temperature", "top_p", "max_tokens", "stop",
+                            "seed", "presence_penalty", "frequency_penalty",
+                            "tools", "tool_choice", "response_format",
+                            "chat_template_kwargs"}) {
+        if (arguments.contains(key)) {
+            openai_request[key] = arguments[key];
+        }
+    }
+
+    CollectionOrchestrator orchestrator(*router_, *model_manager_, ensure_loaded_);
+    CollectionOrchestrator::ChatParts parts =
+        orchestrator.chat_completion_parts(openai_request, info);
+
+    // Recover from a backend that died between requests. The router's
+    // liveness check is handle-presence only, so a crashed subprocess stays
+    // registered as loaded and `forward_request` hits a closed port. If we
+    // see a transport-level failure, evict the collection's components and
+    // retry the orchestrator once.
+    auto looks_like_backend_died = [](const std::string& msg) {
+        static constexpr const char* kMarkers[] = {
+            "CURL error",
+            "Network error",
+            "Couldn't connect",
+            "Failure when receiving",
+        };
+        for (const char* marker : kMarkers) {
+            if (msg.find(marker) != std::string::npos) return true;
+        }
+        return false;
+    };
+    if (!parts.ok && looks_like_backend_died(parts.error_message)) {
+        LOG(WARNING, "McpServer")
+            << "Omni: backend looks dead (" << parts.error_message
+            << "); evicting components and retrying once" << std::endl;
+        for (const auto& component : info.components) {
+            try {
+                router_->unload_model(component);
+            } catch (const std::exception&) {
+                // Not loaded -> nothing to evict, fine.
+            }
+        }
+        ensure_loaded_(model);
+        parts = orchestrator.chat_completion_parts(openai_request, info);
+    }
+
+    if (!parts.ok) {
+        return json{
+            {"content", json::array({text_content_block(
+                std::string("Omni run failed: ") + parts.error_message)})},
+            {"isError", true},
+        };
+    }
+
+    // Disk mode: create the directory once, up front, so artifact writes
+    // below get a clean error if it's invalid.
+    if (has_output_dir && !parts.artifacts.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(output_dir, ec);
+        if (ec) {
+            throw std::runtime_error(
+                "Failed to create output_dir " + output_dir.string() + ": " + ec.message());
+        }
+    }
+
+    json content = json::array();
+
+    // Text first — always emit a block (possibly empty) so clients that index
+    // by position see a consistent shape.
+    content.push_back(text_content_block(parts.final_text));
+
+    auto extension_for = [](const std::string& mime) -> std::string {
+        if (mime == "image/png")  return ".png";
+        if (mime == "image/jpeg") return ".jpg";
+        if (mime == "audio/mpeg") return ".mp3";
+        if (mime == "audio/wav")  return ".wav";
+        return ".bin";
+    };
+
+    json written_paths = json::array();
+    for (size_t i = 0; i < parts.artifacts.size(); ++i) {
+        const auto& artifact = parts.artifacts[i];
+
+        if (has_output_dir) {
+            std::filesystem::path dest =
+                output_dir / ("omni_" + std::to_string(i) + extension_for(artifact.mime));
+            std::string bytes = utils::JsonUtils::base64_decode(artifact.data);
+            if (bytes.empty()) {
+                throw std::runtime_error(
+                    "Decoded artifact is empty (index " + std::to_string(i) + ")");
+            }
+            std::ofstream out(dest, std::ios::binary);
+            if (!out) {
+                throw std::runtime_error("Failed to open for writing: " + dest.string());
+            }
+            out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            if (!out) {
+                throw std::runtime_error("Failed to write: " + dest.string());
+            }
+            std::error_code ec;
+            auto abs = std::filesystem::absolute(dest, ec);
+            if (ec) abs = dest;
+            content.push_back(text_content_block(
+                artifact.type + " -> " + abs.string()));
+            written_paths.push_back(abs.string());
+            continue;
+        }
+
+        // Inline mode: native MCP image/audio content blocks. Non-Open-WebUI
+        // clients (Claude Desktop, Inspector, ...) cannot render markdown
+        // data URIs, so these blocks — not the orchestrator's rendered
+        // chat.completion content — are the right transport.
+        if (artifact.type == "image") {
+            content.push_back({
+                {"type", "image"},
+                {"data", artifact.data},
+                {"mimeType", artifact.mime},
+            });
+        } else if (artifact.type == "audio") {
+            content.push_back({
+                {"type", "audio"},
+                {"data", artifact.data},
+                {"mimeType", artifact.mime},
+            });
+        } else {
+            // Unknown artifact kind — fall back to text rather than dropping it.
+            content.push_back(text_content_block(
+                "[unrenderable artifact type=" + artifact.type +
+                " mime=" + artifact.mime + "]"));
+        }
+    }
+
+    if (has_output_dir) {
+        content.push_back(text_content_block(
+            json{{"paths", std::move(written_paths)}}.dump()));
+    }
+
+    if (parts.app_tool_calls.is_array() && !parts.app_tool_calls.empty()) {
+        content.push_back(text_content_block(
+            std::string("tool_calls: ") + parts.app_tool_calls.dump()));
+    }
 
     return json{
         {"content", std::move(content)},
@@ -739,15 +1086,54 @@ json McpServer::tools_descriptor() {
                     {"model",  {{"type", "string"}}},
                     {"prompt", {{"type", "string"}}},
                     {"output_path", {{"type", "string"},
-                                     {"description", "Absolute path of the PNG file to write. Only valid when n == 1."}}},
+                                     {"description", "Absolute path (on the lemonade server's filesystem) of the PNG file to write. Only valid when n == 1. Omit if the caller and server are on different machines/containers and you cannot name a path the server can write to."}}},
                     {"output_dir",  {{"type", "string"},
-                                     {"description", "Absolute path of a directory to write image_0.png, image_1.png, ... into."}}},
+                                     {"description", "Absolute path (on the lemonade server's filesystem) of a directory to write image_0.png, image_1.png, ... into. Omit if the caller and server are on different machines/containers and you cannot name a path the server can write to."}}},
                     {"size",   {{"type", "string"}}},
                     {"n",      {{"type", "integer"}, {"minimum", 1}}},
                     {"negative_prompt", {{"type", "string"}}},
                     {"seed",   {{"type", "integer"}}},
                     {"steps",  {{"type", "integer"}}},
                     {"cfg_scale", {{"type", "number"}}},
+                }},
+            }},
+        },
+        {
+            {"name", "lemonade_omni"},
+            {"description",
+             "Multimodal turn against a Lemonade Omni collection (one tool "
+             "call -> text + images + speech in the same response). The "
+             "server runs an internal tool-calling loop against the "
+             "collection's planner LLM and executes its image / image-edit / "
+             "TTS tools by routing to the bundled component models; the "
+             "result comes back as a text block plus native MCP `image` / "
+             "`audio` content blocks (one per artifact). `model` is "
+             "optional — defaults to `LMX-Omni-5.5B-Lite` (smaller, faster). "
+             "Pass `model='LMX-Omni-52B-Halo'` (or any other "
+             "recipe='collection.omni' model from `lemonade_list_models`) "
+             "to opt into a larger collection; that model is downloaded on "
+             "first use and may be multi-GB. Same-machine deployment: PREFER "
+             "`output_dir` to write artifacts to disk and avoid expensive "
+             "inline base64 blobs. For plain text chat against a regular "
+             "LLM, use `lemonade_chat` instead."},
+            {"inputSchema", {
+                {"type", "object"},
+                {"required", json::array({"messages"})},
+                {"properties", {
+                    {"model",       {{"type", "string"},
+                                     {"description", "Optional. Omni collection name (recipe='collection.omni'). Defaults to LMX-Omni-5.5B-Lite."}}},
+                    {"messages",    {{"type", "array"}, {"items", {{"type", "object"}}}}},
+                    {"output_dir",  {{"type", "string"},
+                                     {"description", "Absolute path (on the lemonade server's filesystem) of a directory to write produced artifacts (omni_0.png, omni_1.mp3, ...) into. PREFER this to inline base64 when caller and server share a filesystem. Omit when the caller and server are on different machines or containers (e.g. lemonade in Docker, or accessed over the network) — artifacts then come back inline as MCP content blocks."}}},
+                    {"temperature", {{"type", "number"}}},
+                    {"top_p",       {{"type", "number"}}},
+                    {"max_tokens",  {{"type", "integer"}}},
+                    {"stop",        {{"description", "stop sequences (string or array)"}}},
+                    {"seed",        {{"type", "integer"}}},
+                    {"tools",       {{"type", "array"}, {"items", {{"type", "object"}}}}},
+                    {"tool_choice", {{"description", "auto | none | required | {type: function, ...}"}}},
+                    {"response_format", {{"type", "object"}}},
+                    {"chat_template_kwargs", {{"type", "object"}}},
                 }},
             }},
         },

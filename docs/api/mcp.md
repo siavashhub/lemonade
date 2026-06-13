@@ -36,6 +36,34 @@ curl -s http://localhost:13305/mcp \
 
 All tools auto-load (and download, if missing) the requested model on first call, exactly like `POST /v1/chat/completions`. Errors are returned as MCP results with `"isError": true` rather than JSON-RPC errors, matching the spec's guidance for tool failures.
 
+### Asynchronous model preparation
+
+Downloads of multi-GB models can take many minutes. The original implementation kept the MCP HTTP request open for the full duration, which caused MCP clients to time out, retry against the same blocking download, and eventually give up while the server was still working.
+
+Every model-loading tool (`lemonade_chat`, `lemonade_transcribe_audio`, `lemonade_generate_image`, `lemonade_omni`) now uses an **async preparation pattern**:
+
+1. **First call** with an unloaded model — the tool kicks off the download + load on a background thread, then waits up to **10 seconds** for it to complete inline (so already-downloaded models still resolve in a single round-trip). If preparation finishes within that window, the tool proceeds to its normal work and returns the real output.
+
+2. **Slow preparation** (multi-GB download or otherwise > 10s) — the tool returns *immediately* with `isError: true` and a status block:
+
+    ```json
+    {
+      "content": [
+        {"type": "text", "text": "Model 'X' is being prepared … ACTION: wait ~30 seconds, then call this same tool again …"},
+        {"type": "text", "text": "{\"status\":\"preparing\",\"model\":\"X\",\"elapsed_seconds\":0,\"retry_after_seconds\":30}"}
+      ],
+      "isError": true
+    }
+    ```
+
+3. **Subsequent calls** with the same model name return the same shape, with an updated `elapsed_seconds`, as long as preparation is still in flight. The download is **not** restarted — only one background preparation runs per model at a time.
+
+4. **Once preparation completes**, the next call proceeds normally and returns the real tool output. The agent should keep retrying with the same arguments at the rate hinted by `retry_after_seconds`.
+
+5. **If preparation fails** (e.g. the model name is unknown or the download errors out), the next call returns `isError: true` with a plain text description of the failure and the tracker is cleared so a later call can try again.
+
+The status JSON is intentionally machine-readable so agent harnesses can implement custom backoff. The natural-language summary in the first text block is written to nudge LLM-based agents to retry rather than abandon the task — multi-GB downloads can take 10+ minutes and the server continues working even if the agent stops polling.
+
 ### `lemonade_list_models`
 
 Discover what's loaded, what's downloaded, and what's recommended. Call this first if you don't already know the exact model name to pass to the other tools — passing a wrong name may trigger a multi-GB download.
@@ -60,7 +88,7 @@ Chat completion against any LLM in the registry.
 {
   "name": "lemonade_chat",
   "arguments": {
-    "model": "Qwen3-1.7B-Hybrid",
+    "model": "Qwen3-1.7B-GGUF",
     "messages": [
       {"role": "system", "content": "You are concise."},
       {"role": "user", "content": "Summarize MCP in one line."}
@@ -74,6 +102,8 @@ Chat completion against any LLM in the registry.
 Returns one text block with the assistant content. If the model emits tool calls, a second text block containing `tool_calls: <json>` is appended.
 
 Reasoning models (Qwen3, DeepSeek-R1, ...) have the `<think>` block disabled by default to keep small `max_tokens` budgets from being consumed by reasoning. Pass `"chat_template_kwargs": {"enable_thinking": true}` to opt back in.
+
+> **Picking a portable model.** The example above uses `Qwen3-1.7B-GGUF` because GGUF (llama.cpp) runs everywhere lemonade does — Windows, Linux/Docker, macOS, CPU and Vulkan/ROCm/Metal GPUs. Hybrid/NPU variants such as `*-Hybrid` (recipe `ryzenai-llm`, **Windows + AMD RyzenAI** only) or `*-FLM` (recipe `flm`, **AMD Ryzen AI NPU** only) are faster on supported hardware but unavailable on others. If your client picks one that isn't supported, the tool returns a structured error suggesting a portable alternative — prefer `lemonade_list_models` to discover what's actually available on the running server.
 
 ### `lemonade_transcribe_audio`
 
@@ -110,6 +140,34 @@ Generate one or more PNGs from a prompt. **Prefer writing to disk** via `output_
 
 When disk paths are provided, returns text block(s) with the absolute path(s). Otherwise, returns one inline image content block per image (`{"type":"image", "data":"<base64>", "mimeType":"image/png"}`).
 
+### `lemonade_omni`
+
+One-shot multimodal turn against a **Lemonade Omni collection** (a model bundle that pairs a planner LLM with an image model, an image-edit model, and a TTS voice under a single `collection.omni` recipe — see [the Omni docs](../dev/lemonade-omni.md)). The server runs the orchestrator's internal tool-calling loop, executes the collection's `generate_image` / `edit_image` / `text_to_speech` tools by routing to the bundled components, and returns the result as a text block plus native MCP `image` / `audio` content blocks — one per artifact, in the order they were produced.
+
+`model` is **optional** and defaults to `LMX-Omni-5.5B-Lite` (smaller and faster). Pass `model` explicitly to opt into a larger collection (e.g. `LMX-Omni-52B-Halo` on capable hardware) or any other `collection.omni` model surfaced by `lemonade_list_models`. The collection is downloaded on first use and may be multi-GB.
+
+Use `lemonade_chat` instead when you only need plain-text LLM output and don't want the planner-loop overhead.
+
+```json
+{
+  "name": "lemonade_omni",
+  "arguments": {
+    "messages": [
+      {"role": "user", "content": "Generate an image of a lemon car, then read out a one-line description."}
+    ],
+    "output_dir": "C:/out/omni"
+  }
+}
+```
+
+**Disk vs. inline output.** A single Omni turn can produce both images and audio in arbitrary order. Pass an absolute `output_dir` to write each artifact to disk as `omni_0.<ext>`, `omni_1.<ext>`, ... (the tool returns one text block per artifact with its absolute path, plus a JSON-stringified `paths` array). This is strongly preferred over inline base64 for the same reasons documented under `lemonade_generate_image` — and is the **only** way to get audio out on clients that don't render `audio` content blocks.
+
+When `output_dir` is omitted, artifacts are inlined as MCP content blocks: `{"type":"image", "data":"<base64>", "mimeType":"image/png"}` and `{"type":"audio", "data":"<base64>", "mimeType":"audio/mpeg"}`.
+
+If the planner emits app-defined tool calls (those you passed in via `tools`/`tool_choice`), an extra text block `tool_calls: <json>` is appended, matching `lemonade_chat`'s passthrough semantics.
+
+Passing a non-collection model (e.g. a plain LLM) returns `isError: true` with a hint to use `lemonade_chat`.
+
 ## Error model
 
 | Code | Meaning |
@@ -143,5 +201,5 @@ curl -s http://localhost:13305/mcp -H "Content-Type: application/json" \
 
 # 3. Call lemonade_chat
 curl -s http://localhost:13305/mcp -H "Content-Type: application/json" \
-    -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lemonade_chat","arguments":{"model":"Qwen3-1.7B-Hybrid","messages":[{"role":"user","content":"hi"}],"max_tokens":16}}}'
+    -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lemonade_chat","arguments":{"model":"Qwen3-1.7B-GGUF","messages":[{"role":"user","content":"hi"}],"max_tokens":16}}}'
 ```
