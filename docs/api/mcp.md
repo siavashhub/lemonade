@@ -145,7 +145,7 @@ When disk paths are provided, returns text block(s) with the absolute path(s). O
 - Default: `<cache_dir>/mcp-images`.
 - Override with the `LEMONADE_MCP_IMAGE_DIR` environment variable (absolute path).
 - Relative paths resolve against the sandbox root; absolute paths must stay within it. Paths that escape the sandbox (via `..` or symlinks) are rejected.
-- Existing files are **not** overwritten unless you pass `"overwrite": true`.
+- `output_dir` writes use auto-generated, unique filenames (`image_<token>_<i>.png`), so concurrent callers never clobber one another's images — the returned `paths` tell you the exact names. Use `output_path` when you need an exact, caller-chosen filename (it is written as named, replacing any existing file at that path).
 
 ### `lemonade_omni`
 
@@ -167,7 +167,7 @@ Use `lemonade_chat` instead when you only need plain-text LLM output and don't w
 }
 ```
 
-**Disk vs. inline output.** A single Omni turn can produce both images and audio in arbitrary order. Pass an `output_dir` to write each artifact to disk as `omni_0.<ext>`, `omni_1.<ext>`, ... (the tool returns one text block per artifact with its absolute path, plus a JSON-stringified `paths` array). This is strongly preferred over inline base64 for the same reasons documented under `lemonade_generate_image` — and is the **only** way to get audio out on clients that don't render `audio` content blocks. Like `lemonade_generate_image`, `output_dir` is confined to the MCP image sandbox (see **Sandboxed disk writes** above): relative paths resolve against the sandbox root, paths escaping it are rejected, and existing files are not overwritten unless you pass `"overwrite": true`.
+**Disk vs. inline output.** A single Omni turn can produce both images and audio in arbitrary order. Pass an `output_dir` to write each artifact to disk under a unique auto-generated name (`omni_<token>_<i>.<ext>`) — the tool returns one text block per artifact with its absolute path, plus a JSON-stringified `paths` array. This is strongly preferred over inline base64 for the same reasons documented under `lemonade_generate_image` — and is the **only** way to get audio out on clients that don't render `audio` content blocks. Like `lemonade_generate_image`, `output_dir` is confined to the MCP image sandbox (see **Sandboxed disk writes** above): relative paths resolve against the sandbox root, paths escaping it are rejected, and unique filenames mean concurrent callers never clobber each other.
 
 When `output_dir` is omitted, artifacts are inlined as MCP content blocks: `{"type":"image", "data":"<base64>", "mimeType":"image/png"}` and `{"type":"audio", "data":"<base64>", "mimeType":"audio/mpeg"}`.
 

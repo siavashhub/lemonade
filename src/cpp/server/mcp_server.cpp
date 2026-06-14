@@ -1,9 +1,12 @@
 #include "lemon/mcp_server.h"
 
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -191,6 +194,23 @@ std::filesystem::path sanitize_sandboxed_path(const std::string& raw,
             raw);
     }
     return resolved;
+}
+
+// Collision-resistant token for auto-generated artifact filenames. A single
+// lemond serves multiple concurrent clients (AGENTS.md invariant 11), so the
+// old deterministic names (image_0.png, omni_0.png) silently clobbered each
+// other across calls. A millisecond timestamp plus a process-wide atomic
+// counter makes every generated file land on a fresh name — no overwrite, and
+// no need to error/regenerate on a clash. Callers that want an exact name use
+// `output_path` instead.
+std::string unique_token() {
+    static std::atomic<std::uint64_t> counter{0};
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::ostringstream oss;
+    oss << std::hex << ms << "-" << std::setw(4) << std::setfill('0')
+        << (counter.fetch_add(1, std::memory_order_relaxed) & 0xffff);
+    return oss.str();
 }
 
 }  // namespace
@@ -648,7 +668,6 @@ json McpServer::tool_generate_image(const json& arguments) {
         throw std::runtime_error(
             "Provide at most one of `output_path` or `output_dir`, not both.");
     }
-    const bool overwrite = arguments.value("overwrite", false);
     const std::filesystem::path sandbox_root = mcp_image_sandbox_root();
     std::filesystem::path output_path;
     std::filesystem::path output_dir;
@@ -737,14 +756,12 @@ json McpServer::tool_generate_image(const json& arguments) {
     }
 
     for (size_t i = 0; i < b64_images.size(); ++i) {
+        // output_path: caller named the file explicitly, write exactly there.
+        // output_dir: auto-generate a unique name so concurrent clients never
+        // clobber one another (and we never have to error/regenerate).
         std::filesystem::path dest = has_output_path
             ? output_path
-            : output_dir / ("image_" + std::to_string(i) + ".png");
-        if (!overwrite && std::filesystem::exists(dest, ec)) {
-            throw std::runtime_error(
-                "Refusing to overwrite existing file (pass overwrite=true to "
-                "allow): " + dest.string());
-        }
+            : output_dir / ("image_" + unique_token() + "_" + std::to_string(i) + ".png");
         std::string bytes = utils::JsonUtils::base64_decode(b64_images[i]);
         if (bytes.empty()) {
             throw std::runtime_error("Decoded image is empty (index " + std::to_string(i) + ")");
@@ -855,7 +872,6 @@ json McpServer::tool_omni(const json& arguments) {
     // arbitrary files via output_dir.
     const bool has_output_dir = arguments.contains("output_dir") &&
                                 arguments["output_dir"].is_string();
-    const bool overwrite = arguments.value("overwrite", false);
     std::filesystem::path output_dir;
     if (has_output_dir) {
         output_dir = sanitize_sandboxed_path(
@@ -968,14 +984,11 @@ json McpServer::tool_omni(const json& arguments) {
         const auto& artifact = parts.artifacts[i];
 
         if (has_output_dir) {
+            // Unique name so concurrent clients never clobber each other's
+            // artifacts (and we never have to error/regenerate on a clash).
             std::filesystem::path dest =
-                output_dir / ("omni_" + std::to_string(i) + extension_for(artifact.mime));
-            std::error_code exists_ec;
-            if (!overwrite && std::filesystem::exists(dest, exists_ec)) {
-                throw std::runtime_error(
-                    "Refusing to overwrite existing file (pass overwrite=true to "
-                    "allow): " + dest.string());
-            }
+                output_dir / ("omni_" + unique_token() + "_" + std::to_string(i) +
+                              extension_for(artifact.mime));
             std::string bytes = utils::JsonUtils::base64_decode(artifact.data);
             if (bytes.empty()) {
                 throw std::runtime_error(
@@ -1227,8 +1240,10 @@ json McpServer::tools_descriptor() {
              "both arguments when you genuinely need the image inline. For "
              "safety, disk writes are confined to a sandbox directory "
              "(<cache_dir>/mcp-images, or LEMONADE_MCP_IMAGE_DIR if set); "
-             "paths outside it, and overwrites of existing files, are "
-             "rejected unless `overwrite` is true. `model` is OPTIONAL: when "
+             "paths outside it are rejected. `output_dir` writes get unique "
+             "auto-generated filenames (so concurrent callers never clobber "
+             "each other); use `output_path` when you need an exact name. "
+             "`model` is OPTIONAL: when "
              "omitted, the server reuses an already-loaded image model, else "
              "an already-downloaded one; if neither exists it asks you to pass "
              "a `model` or `allow_download: true` (which downloads the "
@@ -1243,11 +1258,9 @@ json McpServer::tools_descriptor() {
                                         {"description", "Permit downloading the default model when none is loaded or downloaded. Defaults to false."}}},
                     {"prompt", {{"type", "string"}}},
                     {"output_path", {{"type", "string"},
-                                     {"description", "Path of the PNG file to write, inside the MCP image sandbox (<cache_dir>/mcp-images or LEMONADE_MCP_IMAGE_DIR). Relative paths resolve against the sandbox root; absolute paths must stay within it. Only valid when n == 1."}}},
+                                     {"description", "Exact path of the PNG file to write, inside the MCP image sandbox (<cache_dir>/mcp-images or LEMONADE_MCP_IMAGE_DIR). Relative paths resolve against the sandbox root; absolute paths must stay within it. Written as named (overwrites if it already exists). Only valid when n == 1."}}},
                     {"output_dir",  {{"type", "string"},
-                                     {"description", "Directory to write image_0.png, image_1.png, ... into, inside the MCP image sandbox. Relative paths resolve against the sandbox root; absolute paths must stay within it."}}},
-                    {"overwrite", {{"type", "boolean"},
-                                   {"description", "Allow overwriting existing files at the destination. Defaults to false."}}},
+                                     {"description", "Directory to write generated images into, inside the MCP image sandbox. Filenames are auto-generated and unique (image_<token>_<i>.png); the returned paths tell you the exact names. Relative paths resolve against the sandbox root; absolute paths must stay within it."}}},
                     {"size",   {{"type", "string"}}},
                     {"n",      {{"type", "integer"}, {"minimum", 1}}},
                     {"negative_prompt", {{"type", "string"}}},
@@ -1286,9 +1299,7 @@ json McpServer::tools_descriptor() {
                                         {"description", "Permit downloading the default collection when none is downloaded. Defaults to false."}}},
                     {"messages",    {{"type", "array"}, {"items", {{"type", "object"}}}}},
                     {"output_dir",  {{"type", "string"},
-                                     {"description", "Directory to write produced artifacts (omni_0.png, omni_1.mp3, ...) into, inside the MCP image sandbox (<cache_dir>/mcp-images or LEMONADE_MCP_IMAGE_DIR). Relative paths resolve against the sandbox root; absolute paths must stay within it. PREFER this to inline base64 when caller and server share a filesystem. Omit to receive artifacts inline as MCP content blocks."}}},
-                    {"overwrite",   {{"type", "boolean"},
-                                     {"description", "Allow overwriting existing files in output_dir. Defaults to false."}}},
+                                     {"description", "Directory to write produced artifacts into, inside the MCP image sandbox (<cache_dir>/mcp-images or LEMONADE_MCP_IMAGE_DIR). Filenames are auto-generated and unique (omni_<token>_<i>.<ext>); the returned paths tell you the exact names. Relative paths resolve against the sandbox root; absolute paths must stay within it. PREFER this to inline base64 when caller and server share a filesystem. Omit to receive artifacts inline as MCP content blocks."}}},
                     {"temperature", {{"type", "number"}}},
                     {"top_p",       {{"type", "number"}}},
                     {"max_tokens",  {{"type", "integer"}}},
