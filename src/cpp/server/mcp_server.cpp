@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <lemon/utils/aixlog.hpp>
@@ -35,6 +36,15 @@ constexpr const char* kServerName = "lemonade-mcp";
 // collections (~5.5B). The 52B "Halo" build is preferable on capable hardware
 // but is a multi-GB download; users opt into it by passing `model` explicitly.
 constexpr const char* kDefaultOmniModel = "LMX-Omni-5.5B-Lite";
+
+// Per-tool default models, used by resolve_model_for_tool() only as a last
+// resort — when no model of the right type is already loaded or downloaded AND
+// the caller passed `allow_download: true`. They are deliberately small/fast
+// so an unattended download stays cheap; callers wanting something larger pass
+// `model` explicitly.
+constexpr const char* kDefaultChatModel       = "Qwen3.5-4B-MTP-GGUF";
+constexpr const char* kDefaultTranscribeModel = "Whisper-Tiny";
+constexpr const char* kDefaultImageModel      = "SD-Turbo";
 
 bool is_notification(const json& message) {
     return !message.contains("id");
@@ -382,11 +392,76 @@ json McpServer::handle_ping(const json& id) {
     return make_success_response(id, json::object());
 }
 
+json McpServer::make_needs_model_result(const char* type_str,
+                                        const char* default_model,
+                                        const std::string& name_hint) {
+    json status = {
+        {"status", "needs_model"},
+        {"tool_type", type_str},
+        {"default_model", default_model},
+        {"retry_with", json{
+            {"model", name_hint},
+            {"allow_download", true},
+        }},
+    };
+    std::string msg =
+        std::string("No ") + type_str + " model is currently loaded or "
+        "downloaded on this lemonade server. Re-call this tool with an "
+        "explicit `model` (" + name_hint + "; call `lemonade_list_models` to "
+        "see what's available), or pass `allow_download: true` to download and "
+        "load the default (" + default_model + "), which may be a multi-GB "
+        "download.";
+    return json{
+        {"content", json::array({
+            text_content_block(msg),
+            text_content_block(status.dump()),
+        })},
+        {"isError", true},
+    };
+}
+
+std::variant<std::string, json> McpServer::resolve_model_for_tool(
+        const json& arguments,
+        ModelType want_type,
+        const char* type_str,
+        const char* default_model,
+        bool allow_download) {
+    // 1. Explicit model argument always wins.
+    if (arguments.contains("model") && arguments["model"].is_string() &&
+        !arguments["model"].get<std::string>().empty()) {
+        return arguments["model"].get<std::string>();
+    }
+
+    // 2. Reuse a model of the right type that's already loaded \u2014 zero cost.
+    for (const auto& m : router_->get_all_loaded_models()) {
+        if (m.value("type", std::string()) == type_str) {
+            std::string name = m.value("model_name", std::string());
+            if (!name.empty()) return name;
+        }
+    }
+
+    // 3. Load a model of the right type that's already downloaded \u2014 no network.
+    for (const auto& [name, info] : model_manager_->get_downloaded_models()) {
+        if (info.type == want_type) return name;
+    }
+
+    // 4. Nothing local. Only fetch the default if the caller opted in;
+    //    otherwise ask the agent to confirm a download or name a model.
+    if (allow_download) return std::string(default_model);
+    return make_needs_model_result(
+        type_str, default_model, "an explicit model name");
+}
+
 json McpServer::tool_chat(const json& arguments) {
-    const std::string model = extract_string_arg(arguments, "model");
     if (!arguments.contains("messages") || !arguments["messages"].is_array()) {
         throw std::runtime_error("Missing or non-array argument: messages");
     }
+
+    const bool allow_download = arguments.value("allow_download", false);
+    auto resolved = resolve_model_for_tool(arguments, ModelType::LLM, "llm",
+                                           kDefaultChatModel, allow_download);
+    if (std::holds_alternative<json>(resolved)) return std::get<json>(resolved);
+    const std::string model = std::get<std::string>(resolved);
 
     if (auto err = unsupported_model_error(model_manager_, model, "chat", {"llamacpp"})) {
         return *err;
@@ -465,7 +540,12 @@ json McpServer::tool_chat(const json& arguments) {
 }
 
 json McpServer::tool_transcribe_audio(const json& arguments) {
-    const std::string model = extract_string_arg(arguments, "model");
+    const bool allow_download = arguments.value("allow_download", false);
+    auto resolved = resolve_model_for_tool(arguments, ModelType::TRANSCRIPTION,
+                                           "transcription", kDefaultTranscribeModel,
+                                           allow_download);
+    if (std::holds_alternative<json>(resolved)) return std::get<json>(resolved);
+    const std::string model = std::get<std::string>(resolved);
 
     // Same-machine deployment: prefer `audio_path` over base64 to avoid
     // multi-MB blobs through JSON-RPC. Agents reach for `audio_path` first;
@@ -544,8 +624,13 @@ json McpServer::tool_transcribe_audio(const json& arguments) {
 }
 
 json McpServer::tool_generate_image(const json& arguments) {
-    const std::string model = extract_string_arg(arguments, "model");
     const std::string prompt = extract_string_arg(arguments, "prompt");
+
+    const bool allow_download = arguments.value("allow_download", false);
+    auto resolved = resolve_model_for_tool(arguments, ModelType::IMAGE, "image",
+                                           kDefaultImageModel, allow_download);
+    if (std::holds_alternative<json>(resolved)) return std::get<json>(resolved);
+    const std::string model = std::get<std::string>(resolved);
 
     // Disk-output mode: MCP image content blocks cost tens of thousands of
     // tokens per image and some clients surface them as opaque resource URIs
@@ -697,15 +782,40 @@ json McpServer::tool_generate_image(const json& arguments) {
 }
 
 json McpServer::tool_omni(const json& arguments) {
-    // `model` is optional — default to LMX-Omni-5.5B-Lite. The 52B "Halo"
-    // build is preferable on capable hardware but is a multi-GB download,
-    // so users opt into it (or any other collection) explicitly.
-    const std::string model = arguments.contains("model") && arguments["model"].is_string()
-                                  ? arguments["model"].get<std::string>()
-                                  : std::string(kDefaultOmniModel);
-
     if (!arguments.contains("messages") || !arguments["messages"].is_array()) {
         throw std::runtime_error("Missing or non-array argument: messages");
+    }
+
+    // Resolve which Omni collection to run. Collections are matched by recipe
+    // (`collection.omni`) rather than ModelType, so this mirrors
+    // resolve_model_for_tool's precedence inline:
+    //   1. explicit `model` wins;
+    //   2. an already-downloaded collection (no network);
+    //   3. the default collection, but only when `allow_download` is set.
+    // There is no "already loaded" step: a collection's components register as
+    // their individual ModelTypes, so there is no single loaded "omni" entry to
+    // detect; step 2 already avoids a download when one is on disk.
+    std::string model;
+    if (arguments.contains("model") && arguments["model"].is_string() &&
+        !arguments["model"].get<std::string>().empty()) {
+        model = arguments["model"].get<std::string>();
+    } else {
+        for (const auto& [name, info] : model_manager_->get_downloaded_models()) {
+            if (is_collection_recipe(info.recipe)) {
+                model = name;
+                break;
+            }
+        }
+        if (model.empty()) {
+            const bool allow_download = arguments.value("allow_download", false);
+            if (allow_download) {
+                model = kDefaultOmniModel;
+            } else {
+                return make_needs_model_result(
+                    "omni", kDefaultOmniModel,
+                    "an Omni collection name, recipe=collection.omni");
+            }
+        }
     }
 
     if (auto err = unsupported_model_error(model_manager_, model, "Omni", {"collection.omni"})) {
@@ -1044,15 +1154,21 @@ json McpServer::tools_descriptor() {
             {"name", "lemonade_chat"},
             {"description",
              "Chat completion against a locally hosted LLM. Pass a `messages` "
-             "array (OpenAI chat format) and the model name. If you don't "
-             "know which model name to use, call `lemonade_list_models` "
-             "first — passing a model that isn't loaded may trigger a "
-             "multi-GB download."},
+             "array (OpenAI chat format). `model` is OPTIONAL: when omitted, "
+             "the server reuses an already-loaded LLM, else an already-"
+             "downloaded one; if neither exists it asks you to either pass a "
+             "`model` or `allow_download: true` (which downloads the default, "
+             "Qwen3.5-4B-MTP-GGUF). Call `lemonade_list_models` first if you "
+             "want to choose explicitly — a wrong name may trigger a multi-GB "
+             "download."},
             {"inputSchema", {
                 {"type", "object"},
-                {"required", json::array({"model", "messages"})},
+                {"required", json::array({"messages"})},
                 {"properties", {
-                    {"model",       {{"type", "string"}}},
+                    {"model",       {{"type", "string"},
+                                     {"description", "Optional. Omit to auto-select a loaded/downloaded LLM; defaults to Qwen3.5-4B-MTP-GGUF only with allow_download=true."}}},
+                    {"allow_download", {{"type", "boolean"},
+                                        {"description", "Permit downloading the default model when none is loaded or downloaded. Defaults to false."}}},
                     {"messages",    {{"type", "array"}, {"items", {{"type", "object"}}}}},
                     {"temperature", {{"type", "number"}}},
                     {"top_p",       {{"type", "number"}}},
@@ -1075,12 +1191,18 @@ json McpServer::tools_descriptor() {
              "caller, so prefer `audio_path` (an absolute path to a local "
              "audio file: wav, mp3, m4a, ogg, flac, webm). Use "
              "`audio_base64` only when you genuinely have audio bytes in "
-             "memory. Exactly one of the two must be provided."},
+             "memory. Exactly one of the two must be provided. `model` is "
+             "OPTIONAL: when omitted, the server reuses an already-loaded "
+             "transcription model, else an already-downloaded one; if neither "
+             "exists it asks you to pass a `model` or `allow_download: true` "
+             "(which downloads the default, Whisper-Tiny)."},
             {"inputSchema", {
                 {"type", "object"},
-                {"required", json::array({"model"})},
                 {"properties", {
-                    {"model",         {{"type", "string"}}},
+                    {"model",         {{"type", "string"},
+                                       {"description", "Optional. Omit to auto-select a loaded/downloaded model; defaults to Whisper-Tiny only with allow_download=true."}}},
+                    {"allow_download", {{"type", "boolean"},
+                                        {"description", "Permit downloading the default model when none is loaded or downloaded. Defaults to false."}}},
                     {"audio_path",    {{"type", "string"},
                                        {"description", "Absolute path to a local audio file. Preferred over audio_base64."}}},
                     {"audio_base64",  {{"type", "string"}}},
@@ -1106,12 +1228,19 @@ json McpServer::tools_descriptor() {
              "safety, disk writes are confined to a sandbox directory "
              "(<cache_dir>/mcp-images, or LEMONADE_MCP_IMAGE_DIR if set); "
              "paths outside it, and overwrites of existing files, are "
-             "rejected unless `overwrite` is true."},
+             "rejected unless `overwrite` is true. `model` is OPTIONAL: when "
+             "omitted, the server reuses an already-loaded image model, else "
+             "an already-downloaded one; if neither exists it asks you to pass "
+             "a `model` or `allow_download: true` (which downloads the "
+             "default, SD-Turbo)."},
             {"inputSchema", {
                 {"type", "object"},
-                {"required", json::array({"model", "prompt"})},
+                {"required", json::array({"prompt"})},
                 {"properties", {
-                    {"model",  {{"type", "string"}}},
+                    {"model",  {{"type", "string"},
+                                {"description", "Optional. Omit to auto-select a loaded/downloaded image model; defaults to SD-Turbo only with allow_download=true."}}},
+                    {"allow_download", {{"type", "boolean"},
+                                        {"description", "Permit downloading the default model when none is loaded or downloaded. Defaults to false."}}},
                     {"prompt", {{"type", "string"}}},
                     {"output_path", {{"type", "string"},
                                      {"description", "Path of the PNG file to write, inside the MCP image sandbox (<cache_dir>/mcp-images or LEMONADE_MCP_IMAGE_DIR). Relative paths resolve against the sandbox root; absolute paths must stay within it. Only valid when n == 1."}}},
@@ -1138,20 +1267,23 @@ json McpServer::tools_descriptor() {
              "TTS tools by routing to the bundled component models; the "
              "result comes back as a text block plus native MCP `image` / "
              "`audio` content blocks (one per artifact). `model` is "
-             "optional — defaults to `LMX-Omni-5.5B-Lite` (smaller, faster). "
-             "Pass `model='LMX-Omni-52B-Halo'` (or any other "
-             "recipe='collection.omni' model from `lemonade_list_models`) "
-             "to opt into a larger collection; that model is downloaded on "
-             "first use and may be multi-GB. Same-machine deployment: PREFER "
-             "`output_dir` to write artifacts to disk and avoid expensive "
-             "inline base64 blobs. For plain text chat against a regular "
-             "LLM, use `lemonade_chat` instead."},
+             "OPTIONAL: when omitted, the server reuses an already-downloaded "
+             "Omni collection; if none is downloaded it asks you to pass a "
+             "`model` or `allow_download: true` (which downloads the default, "
+             "`LMX-Omni-5.5B-Lite`). Pass `model='LMX-Omni-52B-Halo'` (or any "
+             "other recipe='collection.omni' model from `lemonade_list_models`) "
+             "to opt into a larger collection; that model may be multi-GB. "
+             "Same-machine deployment: PREFER `output_dir` to write artifacts "
+             "to disk and avoid expensive inline base64 blobs. For plain text "
+             "chat against a regular LLM, use `lemonade_chat` instead."},
             {"inputSchema", {
                 {"type", "object"},
                 {"required", json::array({"messages"})},
                 {"properties", {
                     {"model",       {{"type", "string"},
-                                     {"description", "Optional. Omni collection name (recipe='collection.omni'). Defaults to LMX-Omni-5.5B-Lite."}}},
+                                     {"description", "Optional. Omni collection name (recipe='collection.omni'). Omit to reuse a downloaded collection; defaults to LMX-Omni-5.5B-Lite only with allow_download=true."}}},
+                    {"allow_download", {{"type", "boolean"},
+                                        {"description", "Permit downloading the default collection when none is downloaded. Defaults to false."}}},
                     {"messages",    {{"type", "array"}, {"items", {{"type", "object"}}}}},
                     {"output_dir",  {{"type", "string"},
                                      {"description", "Directory to write produced artifacts (omni_0.png, omni_1.mp3, ...) into, inside the MCP image sandbox (<cache_dir>/mcp-images or LEMONADE_MCP_IMAGE_DIR). Relative paths resolve against the sandbox root; absolute paths must stay within it. PREFER this to inline base64 when caller and server share a filesystem. Omit to receive artifacts inline as MCP content blocks."}}},

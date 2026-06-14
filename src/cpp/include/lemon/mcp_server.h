@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <variant>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -51,6 +52,22 @@ private:
     json tool_omni(const json& arguments);
     json tool_list_models(const json& arguments);
 
+    // Resolve which model a tool should use when `model` is omitted. Precedence:
+    //   1. an explicit `model` argument always wins;
+    //   2. a model of the right type that's already LOADED (zero cost);
+    //   3. a model of the right type that's already DOWNLOADED (no network);
+    //   4. the tool's hard-coded default, but only when the caller passed
+    //      `allow_download: true` (the default may be a multi-GB download).
+    // Returns the resolved model name, or — when nothing local exists and the
+    // caller did not opt into a download — a tool-result JSON (isError=true)
+    // asking the agent to supply a `model` or pass `allow_download: true`.
+    std::variant<std::string, json> resolve_model_for_tool(
+        const json& arguments,
+        ModelType want_type,
+        const char* type_str,
+        const char* default_model,
+        bool allow_download);
+
     // Background model preparation. The original design called ensure_loaded_
     // synchronously inside each tool handler, so the HTTP request blocked for
     // the full multi-minute download of large models. MCP clients time out
@@ -79,6 +96,13 @@ private:
     static json text_content_block(const std::string& text);
     static json make_error_response(const json& id, int code, const std::string& message);
     static json make_success_response(const json& id, json result);
+    // Build the isError=true "no model available, confirm a download" result
+    // returned by resolve_model_for_tool (and the Omni handler) when nothing
+    // local can satisfy a tool call. `name_hint` describes what kind of model
+    // name the agent should supply.
+    static json make_needs_model_result(const char* type_str,
+                                         const char* default_model,
+                                         const std::string& name_hint);
     static json tools_descriptor();
 
     Router* router_;
