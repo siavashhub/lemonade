@@ -78,12 +78,6 @@ public:
                                 httplib::DataSink& sink);
 
 private:
-    struct Artifact {
-        std::string type;  // "image" | "audio"
-        std::string data;
-        std::string mime;
-    };
-
     struct ToolSet {
         json tools = json::array();
         std::string system_prompt;
