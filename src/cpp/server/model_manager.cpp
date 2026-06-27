@@ -108,7 +108,7 @@ static constexpr auto safe_dir_options = fs::directory_options::none;
 namespace lemon {
 
 // Properties which are defined by the user for model registration.
-static const std::vector<std::string> USER_DEFINED_MODEL_PROPS = std::vector<std::string>{"checkpoints", "checkpoint", "recipe", "mmproj", "size", "image_defaults", "components", "recipe_options"};
+static const std::vector<std::string> USER_DEFINED_MODEL_PROPS = std::vector<std::string>{"checkpoints", "checkpoint", "recipe", "mmproj", "size", "image_defaults", "components", "recipe_options", "system_prompt"};
 
 // Helper functions for string operations — use shared implementations from gguf_reader_detail
 
@@ -1821,6 +1821,7 @@ void ModelManager::build_cache() {
         info.size = JsonUtils::get_or_default<double>(value, "size", 0.0);
         info.cloud_provider = JsonUtils::get_or_default<std::string>(value, "cloud_provider", "");
         info.moonshine_arch = JsonUtils::get_or_default<int>(value, "moonshine_arch", -1);
+        info.system_prompt = JsonUtils::get_or_default<std::string>(value, "system_prompt", "");
 
         // HF-backed collections store their components on Hugging Face — the
         // cached manifest is the single source of truth. Rebuild the component
@@ -1875,6 +1876,7 @@ void ModelManager::build_cache() {
         info.size = JsonUtils::get_or_default<double>(value, "size", 0.0);
         info.cloud_provider = JsonUtils::get_or_default<std::string>(value, "cloud_provider", "");
         info.moonshine_arch = JsonUtils::get_or_default<int>(value, "moonshine_arch", -1);
+        info.system_prompt = JsonUtils::get_or_default<std::string>(value, "system_prompt", "");
 
         // HF-backed user collections (created by `lemonade pull <org>/<repo>`)
         // keep only a repo pointer in user_models.json; their components live in
@@ -1956,6 +1958,14 @@ void ModelManager::build_cache() {
                                            << rec.name << "': no API key resolvable"
                                            << " (set " << CloudProviderRegistry::env_var_name(rec.name)
                                            << " or POST /v1/cloud/auth)" << std::endl;
+                continue;
+            }
+            if (CloudProviderRegistry::is_http_base_url(rec.base_url) &&
+                !rec.allow_insecure_http) {
+                LOG(WARNING, "ModelManager") << "Skipping cloud discovery for '"
+                                             << rec.name << "': http:// with API key "
+                                             << "requires allow_insecure_http=true"
+                                             << std::endl;
                 continue;
             }
             std::vector<ModelInfo> discovered;
@@ -2075,6 +2085,7 @@ void ModelManager::add_model_to_cache(const std::string& model_name) {
     info.suggested = JsonUtils::get_or_default<bool>(*model_json, "suggested", is_user_model);
     info.hf_load = JsonUtils::get_or_default<bool>(*model_json, "hf_load", false);
     info.source = JsonUtils::get_or_default<std::string>(*model_json, "source", "");
+    info.system_prompt = JsonUtils::get_or_default<std::string>(*model_json, "system_prompt", "");
 
     if (model_json->contains("labels") && (*model_json)["labels"].is_array()) {
         for (const auto& label : (*model_json)["labels"]) {
@@ -2517,6 +2528,15 @@ size_t ModelManager::refresh_cloud_models(const std::string& provider) {
         // Drop any stale entries for this provider but don't try to discover —
         // there's nothing to discover with. The contract is "models present
         // after refresh", so return 0 (not the evicted count).
+        evict_cloud_models(provider);
+        return 0;
+    }
+    if (CloudProviderRegistry::is_http_base_url(base_url) &&
+        !cloud_registry_->allow_insecure_http_for(provider)) {
+        LOG(WARNING, "ModelManager") << "Skipping cloud discovery for provider '"
+                                      << provider << "': http:// with API key "
+                                      << "requires allow_insecure_http=true"
+                                      << std::endl;
         evict_cloud_models(provider);
         return 0;
     }
@@ -3249,6 +3269,14 @@ void ModelManager::populate_collection_components_from_cache_locked(ModelInfo& i
     // omits it.
     if (info.size == 0.0 && manifest.contains("size") && manifest["size"].is_number()) {
         info.size = manifest["size"].get<double>();
+    }
+
+    // Same lift-from-manifest pattern for the optional per-collection system
+    // prompt: the registry entry wins when it sets one, otherwise the published
+    // HF JSON acts as the source of truth.
+    if (info.system_prompt.empty() && manifest.contains("system_prompt") &&
+        manifest["system_prompt"].is_string()) {
+        info.system_prompt = manifest["system_prompt"].get<std::string>();
     }
 }
 
@@ -5199,6 +5227,7 @@ ModelInfo ModelManager::get_model_info_unfiltered(const std::string& model_name)
     info.suggested = JsonUtils::get_or_default<bool>(*model_json, "suggested", false);
     info.hf_load = JsonUtils::get_or_default<bool>(*model_json, "hf_load", false);
     info.source = JsonUtils::get_or_default<std::string>(*model_json, "source", "");
+    info.system_prompt = JsonUtils::get_or_default<std::string>(*model_json, "system_prompt", "");
 
     // Parse labels array
     if (model_json->contains("labels") && (*model_json)["labels"].is_array()) {
