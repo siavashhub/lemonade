@@ -281,6 +281,10 @@ struct EvalContext {
     // Per-condition trace; appended only when want_trace, surfaced verbatim as
     // Decision::trace.
     std::vector<TraceEntry> trace;
+
+    // ASCII-lowered copy of request.input, memoized so keyword leaves fold the
+    // input at most once per request (the input is constant within a request).
+    std::optional<std::string> lowered_input;
 };
 
 // A node in a rule's compiled match tree. Both composites (all/any/not) and
@@ -335,6 +339,13 @@ std::map<std::string, ClassifierPtr> make_classifiers(const json& classifiers_js
 // resolved here; deterministic leaf types are supplied by later issues.
 LeafFactory make_leaf_factory(const std::map<std::string, ClassifierPtr>& classifiers,
                               NamedLeafFactories deterministic_factories = {});
+
+// Deterministic leaf conditions (#2380): keywords_any/keywords_all, regex,
+// min_chars/max_chars, has_tools/has_images, metadata. Pure CPU, no model, no
+// tokenizer; each implements the frozen v1 semantics pinned in
+// route_policy.schema.json. Pass the result as make_leaf_factory's
+// deterministic_factories so rules can use these ops.
+NamedLeafFactories make_deterministic_leaf_factories();
 
 // ---------------------------------------------------------------------------
 // Policy + engine (constructor signature only here)
