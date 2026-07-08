@@ -3466,6 +3466,7 @@ input::-webkit-calendar-picker-indicator {
     box-sizing: border-box;
 }
 
+.model3d-source-toggle {
 .tts-openmoss-controls {
     display: flex;
     align-items: center;
@@ -3483,6 +3484,14 @@ input::-webkit-calendar-picker-indicator {
     background: var(--bg-primary);
     border-radius: 6px;
     padding: 3px;
+    align-self: flex-start;
+}
+
+.model3d-source-toggle .toggle-button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
     flex: 0 0 auto;
 }
 

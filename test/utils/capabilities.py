@@ -203,6 +203,17 @@ CAPABILITIES = {
             },
         },
     },
+    "model3d": {
+        "trellis": {
+            "backends": ["vulkan", "rocm", "cuda"],
+            "supports": {
+                "model_3d_generation": True,
+            },
+            "test_models": {
+                "model3d": "TRELLIS-3D",
+            },
+        },
+    },
     "tts": {
         "openmoss": {
             "backends": ["vulkan", "rocm", "cuda"],

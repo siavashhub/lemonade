@@ -1647,6 +1647,15 @@
         ],
         "size": 10.5
     },
+    "TRELLIS-3D": {
+        "checkpoint": "ilintar/trellis2-gguf",
+        "recipe": "trellis",
+        "suggested": true,
+        "labels": [
+            "3d"
+        ],
+        "size": 15.4
+    },
     "OpenMOSS-TTS": {
         "checkpoint": "ilintar/moss-tts-gguf:moss-tts-1.5-q8_0.gguf",
         "recipe": "openmoss",

@@ -389,6 +389,12 @@ The following options are available depending on the recipe being used:
 |--------|-------------|---------|
 | `--acestep BACKEND` | ACE-Step backend to use | Auto-detected |
 
+#### TRELLIS.2 (`trellis` recipe)
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--trellis BACKEND` | Trellis backend to use | Auto-detected |
+
 #### OpenMOSS TTS (`openmoss` recipe)
 
 | Option | Description | Default |
